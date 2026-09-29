@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libdrm-dev \
+            libavformat-dev libavcodec-dev libavutil-dev shellcheck
+      - name: Unit tests
+        run: make test
+      - name: ShellCheck
+        run: |
+          shellcheck install.sh uninstall.sh scripts/*.sh packaging/tarball/install.sh \
+            packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
+
+  build:
+    needs: test
+    # Free arm64 runners exist for public repositories only; a private fork may
+    # not have ubuntu-24.04-arm available.
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        dist: [bookworm, trixie]
+    container: debian:${{ matrix.dist }}
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git \
+            build-essential pkg-config dpkg-dev lintian \
+            libdrm-dev libavformat-dev libavcodec-dev libavutil-dev
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: |
+          make
+          make test
+      - name: Build .deb
+        run: ./scripts/build-deb.sh 0.0.0-ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.dist }}
+          path: dist/*.deb
+          if-no-files-found: error

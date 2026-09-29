@@ -1,0 +1,56 @@
+#!/bin/sh
+# postinst for rpi4-rtsp. Does not enable or start the service and never
+# modifies config.txt.
+set -e
+
+CONF_DIR=/etc/rpi4-rtsp
+CONF=$CONF_DIR/cameras.conf
+EXAMPLE=/usr/share/doc/rpi4-rtsp/examples/cameras.conf
+
+case "$1" in
+    configure)
+        if ! getent passwd rpi4-rtsp >/dev/null; then
+            adduser --system --group --no-create-home --home /nonexistent \
+                --shell /usr/sbin/nologin --quiet rpi4-rtsp
+        fi
+        adduser --quiet rpi4-rtsp video
+        if getent group render >/dev/null; then adduser --quiet rpi4-rtsp render; fi
+
+        install -d -m 0750 -o root -g rpi4-rtsp "$CONF_DIR"
+        if [ -e "$CONF" ]; then
+            chown root:rpi4-rtsp "$CONF"
+            chmod 0640 "$CONF"
+        elif [ -f "$EXAMPLE" ]; then
+            install -m 0640 -o root -g rpi4-rtsp "$EXAMPLE" "$CONF"
+        fi
+
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+            # Upgrade: restart only if it was already running.
+            systemctl try-restart rpi4-rtsp.service || true
+        fi
+
+        gpu=""
+        for f in /boot/firmware/config.txt /boot/config.txt; do
+            if [ -f "$f" ]; then
+                gpu=$(sed -n 's/^gpu_mem=\([0-9]\{1,\}\)[[:space:]]*$/\1/p' "$f" | tail -n1)
+                break
+            fi
+        done
+        if [ -z "$gpu" ] || [ "$gpu" -lt 256 ]; then
+            echo "rpi4-rtsp: WARNING: gpu_mem is ${gpu:-unset (default)} in config.txt." >&2
+            echo "rpi4-rtsp: 4 or more concurrent 1080p decoders need gpu_mem=256." >&2
+            echo "rpi4-rtsp: Add 'gpu_mem=256' to /boot/firmware/config.txt and reboot." >&2
+        fi
+
+        echo "rpi4-rtsp: edit $CONF, run 'sudo rpi4-rtsp --check-config $CONF'," >&2
+        echo "rpi4-rtsp: then 'systemctl enable --now rpi4-rtsp'. It is not started automatically." >&2
+        ;;
+    abort-upgrade | abort-remove | abort-deconfigure) ;;
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

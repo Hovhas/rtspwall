@@ -1,0 +1,15 @@
+# Build artefacts
+src/rpi4-rtsp
+src/test_pacing
+src/test_layout
+src/.version
+src/*.dSYM/
+*.o
+build/
+*.deb
+
+# A local camera config holds credentials — never commit it.
+/cameras.conf
+
+# Package build output (scripts/build-deb.sh)
+dist/

@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Free arm64 runners exist for public repositories only.
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        dist: [bookworm, trixie]
+    container: debian:${{ matrix.dist }}
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git \
+            build-essential pkg-config dpkg-dev lintian \
+            libdrm-dev libavformat-dev libavcodec-dev libavutil-dev
+      - uses: actions/checkout@v4
+      - name: Build, test, package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION=${TAG#v}
+          make VERSION="$VERSION"
+          make test
+          ./scripts/build-deb.sh "$VERSION"
+          ./scripts/build-tarball.sh "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.dist }}
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.tar.gz
+          generate_release_notes: true
