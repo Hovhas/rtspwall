@@ -24,6 +24,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 
+#include "avstream.h"
 #include "rtspwall.h"
 
 /* -------------------------------------------------------- free-index ring */
@@ -464,14 +465,25 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	 * confirmed (see abandon_flip) but made again, and this wait must
 	 * outlast that second attempt. */
 	k->tearing_down = true;
-	struct timespec deadline;
-	clock_gettime(CLOCK_REALTIME, &deadline);
-	deadline.tv_sec += TEARDOWN_WAIT_S;
-	bool gave_up = false;
-	while ((k->plane_attached || k->in_flight != -1) && !quit) {
-		if (pthread_cond_timedwait(&k->detached, &k->lock, &deadline) == ETIMEDOUT) {
-			gave_up = true;
-			break;
+	/* Display disconnected (TV off, cable out): the detach may never be
+	 * confirmed, and waiting TEARDOWN_WAIT_S would only stretch every
+	 * reconnect. Skip the wait and leak what may still be on screen
+	 * instead (below) - as long as the leak list has room for all of it,
+	 * otherwise wait as usual. */
+	int n_protect = (k->shown >= 0) + (k->in_flight >= 0) + k->n_limbo;
+	bool skip_wait = (k->plane_attached || k->in_flight != -1)
+			 && pacing_teardown_skip_wait(atomic_load(&v->display_down), k->n_leaked,
+						      n_protect, MAX_LEAKED);
+	bool gave_up = skip_wait;
+	if (!skip_wait) {
+		struct timespec deadline;
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec += TEARDOWN_WAIT_S;
+		while ((k->plane_attached || k->in_flight != -1) && !quit) {
+			if (pthread_cond_timedwait(&k->detached, &k->lock, &deadline) == ETIMEDOUT) {
+				gave_up = true;
+				break;
+			}
 		}
 	}
 	/* The wait may also have ended because quit was set while we waited
@@ -482,44 +494,59 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	k->tearing_down = false;
 
 	/* If we gave up while the plane may still be live (a commit in flight
-	 * and/or the plane still showing a buffer), those INDICES must never be
-	 * destroyed here — the exact bug class the rest of this function exists
-	 * to close, just in the narrower "compositor stood still for 2 s" case
-	 * (and since all cameras share the same flip gate, the WHOLE wall
-	 * stalls then, not only this camera). k->in_flight and
-	 * k->plane_attached are NOT adjusted based on gave_up — they are reset
-	 * REGARDLESS one line down, but that is harmless: the kernel
-	 * guarantees that a commit already submitted delivers its flip event
-	 * sooner or later, and complete_flip then reads in_flight == -1 and
-	 * becomes a no-op for this camera (neither the -2 nor the >= 0 branch
-	 * matches) — plane_attached stays what it was (conservative: if it is
-	 * still true the plane may still show the leaked buffer, and the NEXT
-	 * teardown cycle for the same camera then attempts a new, harmless
-	 * (possibly redundant) detach). The protected indices are leaked
-	 * DELIBERATELY right here (neither RmFB nor close(dmafd) in this
-	 * function) — rare and visible through the CRITICAL line below, better
-	 * than a use-after-free against the display. The leak is NOT
-	 * permanent though: fb/dmafd are saved in k->leaked (see
-	 * camera_leak_push) and cleaned up by complete_flip on the next
-	 * confirmed flip for the camera, or at program exit — without that the
-	 * fd/GEM handle would be lost for good the next time start_capture
-	 * overwrote the same index. */
-	int keep_a = -1, keep_b = -1;
+	 * and/or the plane still showing a buffer, or indices parked in limbo
+	 * by an abandoned flip), those INDICES must never be destroyed here —
+	 * the exact bug class the rest of this function exists to close, just
+	 * in the narrower "compositor stood still for 2 s" case (and since all
+	 * cameras share the same flip gate, the WHOLE wall stalls then, not
+	 * only this camera). k->in_flight and k->plane_attached are NOT
+	 * adjusted based on gave_up — they are reset REGARDLESS a few lines
+	 * down, but that is harmless: the kernel guarantees that a commit
+	 * already submitted delivers its flip event sooner or later, and
+	 * complete_flip then reads in_flight == -1 and becomes a no-op for this
+	 * camera (neither the -2 nor the >= 0 branch matches) — plane_attached
+	 * stays what it was (conservative: if it is still true the plane may
+	 * still show the leaked buffer, and the NEXT teardown cycle for the
+	 * same camera then attempts a new, harmless (possibly redundant)
+	 * detach). The protected indices are leaked DELIBERATELY right here
+	 * (neither RmFB nor close(dmafd) in this function) — rare and visible
+	 * through the log line below, better than a use-after-free against the
+	 * display. The leak is NOT permanent though: fb/dmafd are saved in
+	 * k->leaked (see camera_leak_push) and cleaned up by complete_flip on
+	 * the next confirmed flip for the camera, or at program exit — without
+	 * that the fd/GEM handle would be lost for good the next time
+	 * start_capture overwrote the same index. Limbo indices count as "may
+	 * be on screen" exactly like shown/in_flight: the abandoned flip that
+	 * parked them was never confirmed. */
+	bool keep[CAPTURE_BUFFERS] = { false };
+	int n_keep = 0;
 	if (gave_up) {
-		if (k->plane_attached)
-			keep_a = k->shown;
+		int cand[2 + MAX_LIMBO];
+		int n_cand = 0;
+		if (k->plane_attached && k->shown >= 0)
+			cand[n_cand++] = k->shown;
 		if (k->in_flight >= 0)
-			keep_b = k->in_flight;
-		if (keep_a >= 0 || keep_b >= 0)
-			log_msg("%s: CRITICAL: teardown gave up (shown=%d in_flight=%d plane_attached=%d) - leaking a live buffer instead of destroying it",
-				k->name, k->shown, k->in_flight, k->plane_attached);
-		/* Save fb/dmafd in the leak list BEFORE k->cap[keep_x] can be
-		 * overwritten by the next start_capture. Done here, still under
-		 * `lock` — the list is shared with complete_flip. */
-		if (keep_a >= 0)
-			camera_leak_push(k, k->cap[keep_a].fb, k->cap[keep_a].dmafd);
-		if (keep_b >= 0 && keep_b != keep_a)
-			camera_leak_push(k, k->cap[keep_b].fb, k->cap[keep_b].dmafd);
+			cand[n_cand++] = k->in_flight;
+		for (int j = 0; j < k->n_limbo && j < MAX_LIMBO; j++)
+			cand[n_cand++] = k->limbo[j];
+		for (int j = 0; j < n_cand; j++) {
+			int c = cand[j];
+			if (c < 0 || c >= CAPTURE_BUFFERS || c >= k->n_cap || keep[c])
+				continue;
+			keep[c] = true;
+			n_keep++;
+			/* Save fb/dmafd in the leak list BEFORE k->cap[c] can be
+			 * overwritten by the next start_capture. Done here, still
+			 * under `lock` — the list is shared with complete_flip. */
+			camera_leak_push(k, k->cap[c].fb, k->cap[c].dmafd);
+		}
+		if (n_keep && skip_wait)
+			log_msg("%s: display disconnected - not waiting for the plane to detach; %d "
+				"buffer(s) that may still be on screen are freed after the next "
+				"confirmed flip", k->name, n_keep);
+		else if (n_keep)
+			log_msg("%s: CRITICAL: teardown gave up (shown=%d in_flight=%d limbo=%d plane_attached=%d) - leaking %d live buffer(s) instead of destroying them",
+				k->name, k->shown, k->in_flight, k->n_limbo, k->plane_attached, n_keep);
 	}
 	k->shown = -1;
 	k->in_flight = -1;
@@ -538,14 +565,14 @@ static void teardown_stream(struct wall *v, struct camera *k)
 		xioctl(k->v4l2fd, VIDIOC_STREAMOFF, &t2);
 	}
 	for (int i = 0; i < k->n_cap; i++) {
-		if (i == keep_a || i == keep_b)
+		if (i < CAPTURE_BUFFERS && keep[i])
 			continue;
 		if (k->cap[i].fb) {
 			drmModeRmFB(v->drmfd, k->cap[i].fb);
 			k->cap[i].fb = 0;
 		}
 	}
-	close_buffers(k, keep_a, keep_b);
+	close_buffers(k, keep);
 	if (k->v4l2fd >= 0) {
 		close(k->v4l2fd);
 		k->v4l2fd = -1;
@@ -574,7 +601,9 @@ static enum pacing_fault fault_from_averror(const struct camera *k, int err)
 		return PACING_FAULT_EOF;
 	if (err == AVERROR_EXIT)
 		return PACING_FAULT_STALL;   /* interrupt callback, not by quit */
-	return PACING_FAULT_OTHER;
+	/* A failed host name lookup comes back as a generic EIO; libavformat's
+	 * error line in this thread says what it was (as in `rtspwall probe`). */
+	return pacing_fault_refine(PACING_FAULT_OTHER, av_last_error());
 }
 
 /* Logs a failure through the camera's log collapse: the first occurrence
@@ -751,6 +780,7 @@ void *camera_thread(void *arg)
 		pacing_pll_init(&k->pll);
 		k->r_prev_frame_us = -1;
 
+		av_last_error_clear();
 		int r = avformat_open_input(&fc, k->url, NULL, &opt);
 		if (r < 0) {
 			/* Only ever log the masked URL — it may carry credentials. */
@@ -772,6 +802,23 @@ void *camera_thread(void *arg)
 		}
 		av_dict_free(&opt);
 
+		/* A local file's other streams (AAC audio, a second video stream
+		 * in another codec) are never used, but avformat_find_stream_info
+		 * would try to open their decoders - and log "Codec (aac) not on
+		 * whitelist" errors on every loop/reconnect. The container already
+		 * names each stream's codec, so pick the stream now (the same
+		 * choice as below), then discard the others and hide their codec:
+		 * probing looks at the chosen stream only (the probe itself stays,
+		 * it is what gives Matroska packets their dts). */
+		if (!live_src) {
+			int pick = av_pick_video_stream(fc);
+			for (unsigned i = 0; i < fc->nb_streams; i++)
+				if ((int)i != pick) {
+					fc->streams[i]->discard = AVDISCARD_ALL;
+					fc->streams[i]->codecpar->codec_id = AV_CODEC_ID_NONE;
+				}
+		}
+		av_last_error_clear();
 		r = avformat_find_stream_info(fc, NULL);
 		if (r < 0) {
 			fault = fault_from_averror(k, r);
@@ -785,21 +832,14 @@ void *camera_thread(void *arg)
 		k->watchdog_limit_us = 5 * 1000000;
 		k->last_packet_us = monotonic_us();
 
-		int other_video = -1;
-		for (unsigned i = 0; i < fc->nb_streams; i++) {
-			const AVCodecParameters *p = fc->streams[i]->codecpar;
-			if (p->codec_type != AVMEDIA_TYPE_VIDEO)
-				continue;
-			if (p->codec_id == AV_CODEC_ID_H264)
-				vstream = (int)i;
-			else if (other_video < 0)
-				other_video = (int)i;
-		}
-		if (vstream < 0) {
-			if (other_video >= 0) {
+		/* The same choice as `rtspwall probe` (avstream.h): the first
+		 * H.264 video stream, else the first video stream. */
+		vstream = av_pick_video_stream(fc);
+		if (vstream < 0 || fc->streams[vstream]->codecpar->codec_id != AV_CODEC_ID_H264) {
+			if (vstream >= 0) {
 				fault = PACING_FAULT_CODEC;
 				snprintf(what, sizeof what, "the stream is %s, not H.264",
-					 avcodec_get_name(fc->streams[other_video]->codecpar->codec_id));
+					 avcodec_get_name(fc->streams[vstream]->codecpar->codec_id));
 			} else {
 				fault = PACING_FAULT_OTHER;
 				snprintf(what, sizeof what, "no video in the stream from %s", masked);

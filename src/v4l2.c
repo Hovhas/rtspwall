@@ -22,11 +22,11 @@
 
 /* ------------------------------------------------------------ V4L2 helpers */
 
-/* `keep_a`/`keep_b` (or -1) are indices that must NOT be touched: the
- * teardown's timeout/quit escape path in teardown_stream may have to leave
- * a live buffer alone (leak it) instead of destroying it, see the comment
- * there. */
-void close_buffers(struct camera *k, int keep_a, int keep_b)
+/* CAPTURE indices marked in `keep` (NULL = none) must NOT be touched: the
+ * teardown's timeout/quit/display-gone escape path in teardown_stream may
+ * have to leave live buffers alone (leak them) instead of destroying them,
+ * see the comment there. */
+void close_buffers(struct camera *k, const bool *keep)
 {
 	for (int i = 0; i < k->n_out; i++)
 		if (k->out[i].map) {
@@ -34,7 +34,7 @@ void close_buffers(struct camera *k, int keep_a, int keep_b)
 			k->out[i].map = NULL;
 		}
 	for (int i = 0; i < k->n_cap; i++) {
-		if (i == keep_a || i == keep_b)
+		if (keep && i < CAPTURE_BUFFERS && keep[i])
 			continue;
 		if (k->cap[i].fb) {
 			/* The fb belongs to the DRM fd and is cleaned up when the

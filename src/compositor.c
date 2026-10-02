@@ -258,6 +258,9 @@ static void abandon_flip(struct wall *v)
 		if (k->in_flight == -2) {
 			k->in_flight = -1;
 		} else if (k->in_flight >= 0) {
+			/* MAX_LIMBO == CAPTURE_BUFFERS: every index can be parked
+			 * at most once, so the bound never drops one (it only
+			 * guards the array). */
 			if (k->shown >= 0 && k->n_limbo < MAX_LIMBO)
 				k->limbo[k->n_limbo++] = k->shown;
 			k->shown = k->in_flight;
@@ -403,6 +406,11 @@ void compositor(struct wall *v)
 	int64_t vblank_fail_since_us = 0;   /* first of a run of refused vblank waits */
 	int     vblank_failures = 0;
 	int64_t last_vblank_warn_us = 0;
+	/* Re-modesets triggered by refused vblank waits back off 1, 2, 4 ...
+	 * 60 s while they do not help (a CRTC that stays off); reset by the
+	 * next vblank or flip event that arrives. */
+	struct pacing_retry vblank_reprobe;
+	pacing_retry_init(&vblank_reprobe, 1000000, 60 * 1000000LL);
 
 	while (!quit) {
 		int64_t loop_us = monotonic_us();
@@ -462,14 +470,19 @@ void compositor(struct wall *v)
 				}
 				vblank_failures++;
 				if (loop_us - vblank_fail_since_us >= 1000000 && v->display_connected
-				    && !v->remodeset_pending) {
+				    && !v->remodeset_pending
+				    && pacing_retry_due(&vblank_reprobe, loop_us)) {
 					if (!last_vblank_warn_us
 					    || loop_us - last_vblank_warn_us >= 60 * 1000000LL) {
 						log_msg("display: vblank wait refused %d times in %lld ms "
-							"(%s) - re-probing %s and setting the mode again",
+							"(%s) - re-probing %s and setting the mode again "
+							"(next attempt in %lld s at the earliest if it "
+							"keeps failing)",
 							vblank_failures,
 							(long long)(loop_us - vblank_fail_since_us) / 1000,
-							strerror(e), v->conn_name);
+							strerror(e), v->conn_name,
+							(long long)((vblank_reprobe.next_us - loop_us)
+								    / 1000000));
 						last_vblank_warn_us = loop_us;
 					}
 					v->remodeset_pending = true;
@@ -492,6 +505,7 @@ void compositor(struct wall *v)
 		if (awaiting_flip) {
 			if (!fl->done)
 				continue;      /* the event was not the flip yet */
+			pacing_retry_reset(&vblank_reprobe);
 			int64_t flip_time_us = v->vblank_ts_monotonic
 				? fl->time_us : monotonic_us();
 
@@ -515,6 +529,7 @@ void compositor(struct wall *v)
 			complete_flip(v, flip_time_us);
 		} else {
 			vblank_pending = false;
+			pacing_retry_reset(&vblank_reprobe);   /* vblank works (again) */
 			/* vblank_handler already set v->last_vblank_us. */
 		}
 

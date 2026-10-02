@@ -1502,3 +1502,63 @@ bool layout_is_display_server(const char *comm)
 			return true;
 	return false;
 }
+
+/* ------------------------------------------------- reserve modes, streams */
+
+bool layout_only_reserve_modes(const struct layout_mode *m, int n)
+{
+	bool large = false, preferred = false;
+	for (int i = 0; m && i < n; i++) {
+		if (m[i].preferred)
+			preferred = true;
+		if (!m[i].interlaced && m[i].width >= 1280 && m[i].height >= 720)
+			large = true;
+	}
+	return !large || !preferred;
+}
+
+int layout_pick_video_stream(const struct layout_stream *s, int n, bool *is_h264)
+{
+	int first_video = -1;
+	if (is_h264)
+		*is_h264 = false;
+	for (int i = 0; s && i < n; i++) {
+		if (!s[i].video)
+			continue;
+		if (s[i].h264) {
+			if (is_h264)
+				*is_h264 = true;
+			return i;
+		}
+		if (first_video < 0)
+			first_video = i;
+	}
+	return first_video;
+}
+
+bool layout_connector_auto_target(const char *type_name)
+{
+	static const char *const ok[] = { "HDMI-A", "HDMI-B", "DVI-I", "DVI-D", "DVI-A", "DP" };
+	if (!type_name)
+		return false;
+	for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++)
+		if (!strcmp(type_name, ok[i]))
+			return true;
+	return false;
+}
+
+int layout_pick_start_connector(const struct layout_conn *c, int n)
+{
+	bool any_auto = false;
+	int first_any = -1;
+	for (int i = 0; c && i < n; i++) {
+		if (c[i].auto_target) {
+			any_auto = true;
+			if (c[i].usable)
+				return i;
+		} else if (c[i].usable && first_any < 0) {
+			first_any = i;
+		}
+	}
+	return any_auto ? -1 : first_any;
+}

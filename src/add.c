@@ -38,6 +38,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -196,6 +197,39 @@ static int take_lock(const char *dir)
 
 /* -------------------------------------------------------------- write */
 
+/* Copies the extended attributes of `path` (the original config) to the
+ * temp file `fd` - an ACL (system.posix_acl_access), a SELinux label or
+ * user.* attributes set on the config survive the rename. A file system
+ * without xattr support (ENOTSUP) is fine; an attribute that cannot be
+ * copied is reported but does not stop the add (owner and mode are kept
+ * either way). */
+static void copy_xattrs(const char *path, int fd)
+{
+	int src = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
+	if (src < 0)
+		return;
+	char names[4096];
+	ssize_t len = flistxattr(src, names, sizeof names);
+	if (len < 0) {
+		if (errno != ENOTSUP && errno != EOPNOTSUPP)
+			fprintf(stderr, "rtspwall: warning: cannot list the extended attributes of "
+				"%s: %s\n", path, strerror(errno));
+		close(src);
+		return;
+	}
+	for (ssize_t off = 0; off < len; off += (ssize_t)strlen(names + off) + 1) {
+		const char *name = names + off;
+		char value[8192];
+		ssize_t n = fgetxattr(src, name, value, sizeof value);
+		if (n < 0 || fsetxattr(fd, name, value, (size_t)n, 0) < 0) {
+			if (errno != ENOTSUP && errno != EOPNOTSUPP)
+				fprintf(stderr, "rtspwall: warning: cannot keep the extended attribute "
+					"%s of %s: %s\n", name, path, strerror(errno));
+		}
+	}
+	close(src);
+}
+
 /* Writes `text` next to `path` and renames it over `path`, keeping the
  * original's mode and owner; aborts if `path` no longer matches `orig`.
  * `checked` is called with the temp file's path before the rename; a
@@ -240,6 +274,10 @@ static int write_atomic(const char *path, const char *text, const struct stat *o
 		fprintf(stderr, "rtspwall: chmod %s: %s\n", tmp, strerror(errno));
 		r = -1;
 	}
+	/* After the chmod: an ACL also carries the group bits (as its mask),
+	 * and copying it sets them back to exactly the original's. */
+	if (!r)
+		copy_xattrs(path, fd);
 	if (!r && fsync(fd) < 0) {
 		fprintf(stderr, "rtspwall: fsync %s: %s\n", tmp, strerror(errno));
 		r = -1;

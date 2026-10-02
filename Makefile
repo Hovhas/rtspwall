@@ -59,7 +59,7 @@ SRCS = src/main.c src/drm.c src/v4l2.c src/camera_thread.c src/compositor.c \
        src/config.c src/layout.c src/pacing.c \
        src/cli.c src/probe.c src/add.c src/doctor.c src/demo.c \
        src/budget.c src/clilogic.c src/sandbox.c
-HDRS = src/rtspwall.h src/layout.h src/pacing.h \
+HDRS = src/rtspwall.h src/layout.h src/pacing.h src/avstream.h \
        src/cli.h src/budget.h src/clilogic.h src/sandbox.h
 
 all: $(BIN)

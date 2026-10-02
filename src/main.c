@@ -160,6 +160,21 @@ int xioctl(int fd, unsigned long req, void *arg)
 	return r;
 }
 
+/* The latest error line libav logged in this thread (masked), even when
+ * FFMPEG_LOGLEVEL hides it: camera_thread.c reads it to tell a failed DNS
+ * lookup from other generic EIO errors (see fault_from_averror). */
+static __thread char av_last_err[256];
+
+const char *av_last_error(void)
+{
+	return av_last_err;
+}
+
+void av_last_error_clear(void)
+{
+	av_last_err[0] = '\0';
+}
+
 /* FFmpeg's own log output goes through here: filtered by FFMPEG_LOGLEVEL
  * (default errors only), every URL in the line masked (libav messages can
  * quote the URL it was given, credentials included), and control
@@ -169,8 +184,9 @@ static void av_log_masked(void *avcl, int level, const char *fmt, va_list vl)
 {
 	char line[1024], masked[1024];
 	int print_prefix = 1;
+	int shown = av_log_get_level();
 
-	if (level > av_log_get_level())
+	if (level > shown && level > AV_LOG_ERROR)
 		return;
 	av_log_format_line2(avcl, level, fmt, vl, line, sizeof line, &print_prefix);
 	layout_mask_urls_in_text(line, masked, sizeof masked);
@@ -180,6 +196,10 @@ static void av_log_masked(void *avcl, int level, const char *fmt, va_list vl)
 		masked[--n] = '\0';
 	layout_sanitize_log_text(masked);
 	if (!n)
+		return;
+	if (level <= AV_LOG_ERROR)
+		snprintf(av_last_err, sizeof av_last_err, "%.255s", masked);
+	if (level > shown)
 		return;
 
 	/* A camera retrying with a wrong password makes FFmpeg repeat the

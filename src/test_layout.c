@@ -1726,6 +1726,136 @@ static void test_url_scheme_whitelist(void)
 	ASSERT(contains(err, "camera cam"));
 }
 
+
+/* qa A10: a TV in standby (or without a readable EDID) offers only the
+ * driver's reserve modes. Treated like a MODE fallback, so the 30 s probe
+ * switches to a real mode once the EDID shows up. */
+static void test_only_reserve_modes(void)
+{
+	struct layout_mode noedid[] = {          /* drm_add_modes_noedid + preferred 1024x768 */
+		{ 1024, 768, 60004, false, true },
+		{ 800, 600, 60317, false, false },
+		{ 640, 480, 59940, false, false },
+	};
+	ASSERT(layout_only_reserve_modes(noedid, 3));
+
+	struct layout_mode tv[] = {
+		{ 1920, 1080, 60000, false, true },
+		{ 1280, 720, 60000, false, false },
+		{ 1024, 768, 60004, false, false },
+	};
+	ASSERT(!layout_only_reserve_modes(tv, 3));
+
+	/* large modes but none flagged preferred: no EDID behind them */
+	struct layout_mode nopref[] = {
+		{ 1920, 1080, 60000, false, false },
+		{ 1280, 720, 60000, false, false },
+	};
+	ASSERT(layout_only_reserve_modes(nopref, 2));
+
+	/* exactly 1280x720 preferred is a real (720p) display */
+	struct layout_mode p720[] = { { 1280, 720, 60000, false, true } };
+	ASSERT(!layout_only_reserve_modes(p720, 1));
+
+	/* interlaced 1080i does not count as a real large mode */
+	struct layout_mode inter[] = {
+		{ 1920, 1080, 60000, true, true },
+		{ 1024, 768, 60004, false, false },
+	};
+	ASSERT(layout_only_reserve_modes(inter, 2));
+
+	ASSERT(layout_only_reserve_modes(NULL, 0));
+}
+
+/* qa item 3: probe and the daemon pick the same stream - the first H.264
+ * video stream, else the first video stream (for the "not H.264" verdict). */
+static void test_pick_video_stream(void)
+{
+	struct layout_stream a[] = {
+		{ .video = false }, { .video = true, .h264 = false }, { .video = true, .h264 = true },
+		{ .video = true, .h264 = true },
+	};
+	bool h264 = false;
+	ASSERT_EQ_I(layout_pick_video_stream(a, 4, &h264), 2);   /* first H.264, not the last */
+	ASSERT(h264);
+
+	struct layout_stream b[] = { { .video = false }, { .video = true }, { .video = true } };
+	ASSERT_EQ_I(layout_pick_video_stream(b, 3, &h264), 1);   /* H.265 only: first video */
+	ASSERT(!h264);
+
+	struct layout_stream c[] = { { .video = false }, { .video = false, .h264 = true } };
+	ASSERT_EQ_I(layout_pick_video_stream(c, 2, &h264), -1);
+	ASSERT(!h264);
+	ASSERT_EQ_I(layout_pick_video_stream(NULL, 0, NULL), -1);
+	ASSERT_EQ_I(layout_pick_video_stream(a, 4, NULL), 2);
+}
+
+
+/* qa B1: only real external monitor connectors are targets of the
+ * automatic move; panels, TV outputs and virtual connectors that always
+ * report "connected" never are. */
+static void test_connector_auto_target(void)
+{
+	ASSERT(layout_connector_auto_target("HDMI-A"));
+	ASSERT(layout_connector_auto_target("HDMI-B"));
+	ASSERT(layout_connector_auto_target("DVI-I"));
+	ASSERT(layout_connector_auto_target("DVI-D"));
+	ASSERT(layout_connector_auto_target("DVI-A"));
+	ASSERT(layout_connector_auto_target("DP"));
+	ASSERT(!layout_connector_auto_target("DSI"));
+	ASSERT(!layout_connector_auto_target("Composite"));
+	ASSERT(!layout_connector_auto_target("TV"));
+	ASSERT(!layout_connector_auto_target("SVIDEO"));
+	ASSERT(!layout_connector_auto_target("Component"));
+	ASSERT(!layout_connector_auto_target("Virtual"));
+	ASSERT(!layout_connector_auto_target("Writeback"));
+	ASSERT(!layout_connector_auto_target("eDP"));
+	ASSERT(!layout_connector_auto_target("VGA"));
+	ASSERT(!layout_connector_auto_target("Unknown"));
+	ASSERT(!layout_connector_auto_target("HDMI"));
+	ASSERT(!layout_connector_auto_target(""));
+	ASSERT(!layout_connector_auto_target(NULL));
+}
+
+
+/* Startup without CONNECTOR: the same type filter as the cable follow -
+ * a TV in standby must not make the wall start on DSI/Composite. */
+static void test_pick_start_connector(void)
+{
+	/* TV in standby (HDMI disconnected), DSI + Composite report connected: wait */
+	struct layout_conn standby[] = {
+		{ .auto_target = true,  .usable = false },   /* HDMI-A-1 */
+		{ .auto_target = true,  .usable = false },   /* HDMI-A-2 */
+		{ .auto_target = false, .usable = true },    /* DSI-1 */
+		{ .auto_target = false, .usable = true },    /* Composite-1 */
+	};
+	ASSERT_EQ_I(layout_pick_start_connector(standby, 4), -1);
+
+	/* HDMI connected: HDMI, even when DSI comes first */
+	struct layout_conn hdmi[] = {
+		{ .auto_target = false, .usable = true },    /* DSI-1 */
+		{ .auto_target = true,  .usable = false },   /* HDMI-A-1 */
+		{ .auto_target = true,  .usable = true },    /* HDMI-A-2 */
+	};
+	ASSERT_EQ_I(layout_pick_start_connector(hdmi, 3), 2);
+
+	/* only a DSI panel on the card: DSI */
+	struct layout_conn dsi[] = { { .auto_target = false, .usable = true } };
+	ASSERT_EQ_I(layout_pick_start_connector(dsi, 1), 0);
+
+	/* no auto-target type, first usable of any type */
+	struct layout_conn other[] = {
+		{ .auto_target = false, .usable = false },
+		{ .auto_target = false, .usable = true },
+	};
+	ASSERT_EQ_I(layout_pick_start_connector(other, 2), 1);
+
+	/* nothing usable at all */
+	struct layout_conn none[] = { { .auto_target = false, .usable = false } };
+	ASSERT_EQ_I(layout_pick_start_connector(none, 1), -1);
+	ASSERT_EQ_I(layout_pick_start_connector(NULL, 0), -1);
+}
+
 int main(void)
 {
 	test_line_empty();
@@ -1827,6 +1957,12 @@ int main(void)
 	qa_final_text_pathless_url_then_at_keeps_text();
 	qa_final_text_password_slash_and_space();
 	test_mask_text_port_vs_password();
+
+	/* qa rc1 "can wait" items */
+	test_only_reserve_modes();
+	test_pick_video_stream();
+	test_connector_auto_target();
+	test_pick_start_connector();
 
 	return test_summary("test_layout");
 }

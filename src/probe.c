@@ -29,7 +29,9 @@
 #include <libavutil/error.h>
 #include <libavutil/log.h>
 
+#include "avstream.h"
 #include "cli.h"
+#include "pacing.h"
 
 /* How long the PLAY fallback may read packets. */
 #define PROBE_FALLBACK_MS 3000
@@ -111,8 +113,9 @@ static enum probe_error classify(int averr, bool interrupted)
 	default:
 		break;
 	}
-	/* Name resolution fails with a generic EIO; libav says why in its log. */
-	if (strstr(last_av_msg, "resolve"))
+	/* Name resolution fails with a generic EIO; libav says why in its log
+	 * (the same test as the wall's, pacing_text_is_dns_failure). */
+	if (pacing_text_is_dns_failure(last_av_msg) || strstr(last_av_msg, "resolve"))
 		return PROBE_ERR_UNREACHABLE;
 	if (strstr(last_av_msg, "401"))
 		return PROBE_ERR_AUTH;
@@ -292,12 +295,9 @@ static void probe_do(const struct probe_target *t, int fd, int timeout_ms, struc
 		return;
 	}
 
-	int vi = -1;
-	for (unsigned i = 0; i < ic->nb_streams; i++)
-		if (ic->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-			vi = (int)i;
-			break;
-		}
+	/* The same choice as the wall (avstream.h): the first H.264 video
+	 * stream, else the first video stream (an H.265 verdict). */
+	int vi = av_pick_video_stream(ic);
 
 	/* The codec comes from the stream description (SDP / container): an
 	 * H.265 stream is recognised here, before any decoder exists. */
@@ -319,11 +319,7 @@ static void probe_do(const struct probe_target *t, int fd, int timeout_ms, struc
 		ic->max_analyze_duration = 2 * AV_TIME_BASE;
 		if (avformat_find_stream_info(ic, NULL) >= 0) {
 			if (vi < 0)
-				for (unsigned i = 0; i < ic->nb_streams; i++)
-					if (ic->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-						vi = (int)i;
-						break;
-					}
+				vi = av_pick_video_stream(ic);
 			if (vi >= 0) {
 				double fps_before = r->s.fps;
 				fill_from_stream(ic->streams[vi], live, r);

@@ -395,6 +395,20 @@ static void list_modes(const char *name, const drmModeConnector *c)
 
 #define MAX_MODES 128
 
+/* The connector's modes as layout_mode (at most MAX_MODES); returns n. */
+static int connector_layout_modes(const drmModeConnector *c, struct layout_mode *lm)
+{
+	int n = c->count_modes < MAX_MODES ? c->count_modes : MAX_MODES;
+	for (int i = 0; i < n; i++)
+		lm[i] = (struct layout_mode){
+			.width = c->modes[i].hdisplay, .height = c->modes[i].vdisplay,
+			.refresh_mhz = mode_refresh_mhz(&c->modes[i]),
+			.interlaced = (c->modes[i].flags & DRM_MODE_FLAG_INTERLACE) != 0,
+			.preferred = (c->modes[i].type & DRM_MODE_TYPE_PREFERRED) != 0,
+		};
+	return n;
+}
+
 /* Picks the mode for connector c according to MODE (see
  * layout_select_mode). If an explicit MODE is not offered: -2 (config
  * error, modes listed) unless fallback is set, then MODE=auto is used with
@@ -403,22 +417,19 @@ static void list_modes(const char *name, const drmModeConnector *c)
  * readable EDID only offers the driver's reserve modes; display_poll
  * checks every 30 s whether MODE is offered again). quiet suppresses the
  * log lines (retries). Returns 0 with *out set, or -1/-2. */
+/* How often a full probe looks for the explicit MODE / the real modes
+ * while running on a fallback (see display_poll). */
+#define FALLBACK_PROBE_S  30
+#define FALLBACK_PROBE_US (FALLBACK_PROBE_S * 1000000LL)
+
 static int pick_mode(struct wall *v, const drmModeConnector *c, bool fallback, bool quiet,
 		     drmModeModeInfo *out)
 {
 	struct layout_mode lm[MAX_MODES];
-	int n = c->count_modes < MAX_MODES ? c->count_modes : MAX_MODES;
+	int n = connector_layout_modes(c, lm);
 	const struct layout_config *cfg = &v->cfg;
 	enum layout_mode_reason why;
 	char want[48] = "auto";
-
-	for (int i = 0; i < n; i++)
-		lm[i] = (struct layout_mode){
-			.width = c->modes[i].hdisplay, .height = c->modes[i].vdisplay,
-			.refresh_mhz = mode_refresh_mhz(&c->modes[i]),
-			.interlaced = (c->modes[i].flags & DRM_MODE_FLAG_INTERLACE) != 0,
-			.preferred = (c->modes[i].type & DRM_MODE_TYPE_PREFERRED) != 0,
-		};
 	if (cfg->mode_w) {
 		if (cfg->mode_mhz)
 			snprintf(want, sizeof want, "%dx%d@%d.%02d", cfg->mode_w, cfg->mode_h,
@@ -428,7 +439,12 @@ static int pick_mode(struct wall *v, const drmModeConnector *c, bool fallback, b
 	}
 
 	int idx = layout_select_mode(lm, n, cfg->mode_w, cfg->mode_h, cfg->mode_mhz, &why);
-	v->mode_fallback = idx < 0 && cfg->mode_w && fallback;
+	/* Only the driver's reserve modes (TV in standby, no EDID yet) count
+	 * as a fallback too when the choice is MODE=auto, so display_poll
+	 * keeps probing for the display's real modes. */
+	bool reserve = layout_only_reserve_modes(lm, n);
+	v->mode_reserve_only = reserve;
+	v->mode_fallback = fallback && ((idx < 0 && cfg->mode_w) || (reserve && (idx < 0 || !cfg->mode_w)));
 	if (idx < 0 && cfg->mode_w) {
 		if (!quiet) {
 			log_msg("MODE=%s: %s does not offer that mode", want, v->conn_name);
@@ -452,6 +468,9 @@ static int pick_mode(struct wall *v, const drmModeConnector *c, bool fallback, b
 	*out = c->modes[idx];
 	if (quiet)
 		return 0;
+	if (v->mode_fallback && reserve)
+		log_msg("display: %s offers only reserve modes (TV in standby or no EDID yet?) - "
+			"checking every %d s for its real modes", v->conn_name, FALLBACK_PROBE_S);
 
 	char chosen[48], pref[48] = "";
 	mode_str(&c->modes[idx], chosen, sizeof chosen);
@@ -496,37 +515,69 @@ static int find_connector(struct wall *v, bool quiet, bool quiet_mode)
 	const char *wanted = v->cfg.connector[0] ? v->cfg.connector : NULL;
 	bool name_matched = false;
 	int result = 1;
+	int n = res->count_connectors;
+	drmModeConnector **cs = calloc(n > 0 ? (size_t)n : 1, sizeof *cs);
+	struct layout_conn *lc = calloc(n > 0 ? (size_t)n : 1, sizeof *lc);
+	uint32_t *crtcs = calloc(n > 0 ? (size_t)n : 1, sizeof *crtcs);
+	if (!cs || !lc || !crtcs) {
+		free(cs);
+		free(lc);
+		free(crtcs);
+		drmModeFreeResources(res);
+		return -1;
+	}
 
-	for (int i = 0; i < res->count_connectors && result == 1; i++) {
+	/* Without CONNECTOR the wall starts on the first connected HDMI/DVI/DP
+	 * connector, and waits for one rather than starting on a DSI panel or
+	 * the composite output that report "connected" with the TV in standby
+	 * (layout_pick_start_connector). With CONNECTOR, only that one. */
+	for (int i = 0; i < n; i++) {
 		drmModeConnector *c = drmModeGetConnector(v->drmfd, res->connectors[i]);
 		char name[32];
+		cs[i] = c;
 		if (!c)
 			continue;
 		connector_name(c, name, sizeof name);
-
-		if (wanted && strcmp(name, wanted)) {
-			drmModeFreeConnector(c);
+		if (wanted && strcmp(name, wanted))
 			continue;
-		}
 		if (wanted)
 			name_matched = true;
-
-		if (c->connection == DRM_MODE_CONNECTED && c->count_modes > 0) {
-			uint32_t crtc = crtc_for_connector(v->drmfd, res, c);
-			if (crtc) {
-				snprintf(v->conn_name, sizeof v->conn_name, "%s", name);
-				result = pick_mode(v, c, true, quiet_mode, &v->mode);
-				if (result == 0) {
-					v->connector_id = c->connector_id;
-					v->crtc_id = crtc;
-					for (int k = 0; k < res->count_crtcs; k++)
-						if (res->crtcs[k] == crtc)
-							v->crtc_pipe = (uint32_t)k;
-				}
-			}
-		}
-		drmModeFreeConnector(c);
+		lc[i].auto_target = wanted
+			|| layout_connector_auto_target(drmModeGetConnectorTypeName(c->connector_type));
+		if (c->connection == DRM_MODE_CONNECTED && c->count_modes > 0)
+			crtcs[i] = crtc_for_connector(v->drmfd, res, c);
+		lc[i].usable = crtcs[i] != 0;
 	}
+	int pick = layout_pick_start_connector(lc, n);
+	bool skipped = false;
+	if (pick < 0 && !wanted && !quiet)
+		for (int i = 0; i < n; i++)
+			if (lc[i].usable) {
+				skipped = true;
+				char name[32];
+				connector_name(cs[i], name, sizeof name);
+				log_msg("display: not starting on %s - while the card has HDMI/DVI/DP "
+					"connectors only those are picked automatically (set "
+					"CONNECTOR=%s to use it)", name, name);
+			}
+	if (pick >= 0) {
+		drmModeConnector *c = cs[pick];
+		connector_name(c, v->conn_name, sizeof v->conn_name);
+		result = pick_mode(v, c, true, quiet_mode, &v->mode);
+		if (result == 0) {
+			v->connector_id = c->connector_id;
+			v->crtc_id = crtcs[pick];
+			for (int k = 0; k < res->count_crtcs; k++)
+				if (res->crtcs[k] == crtcs[pick])
+					v->crtc_pipe = (uint32_t)k;
+		}
+	}
+	for (int i = 0; i < n; i++)
+		if (cs[i])
+			drmModeFreeConnector(cs[i]);
+	free(cs);
+	free(lc);
+	free(crtcs);
 
 	if (result == 1 && wanted && !name_matched) {
 		log_msg("CONNECTOR=%s: no such connector on %s", wanted, v->drm_path);
@@ -535,12 +586,33 @@ static int find_connector(struct wall *v, bool quiet, bool quiet_mode)
 	} else if (result == 1 && !quiet) {
 		if (wanted)
 			log_msg("CONNECTOR=%s: not connected (or no modes/usable CRTC yet)", wanted);
+		else if (skipped)
+			log_msg("found no connected HDMI/DVI/DP display on %s", v->drm_path);
 		else
 			log_msg("found no connected display on %s", v->drm_path);
 		list_connectors(v->drmfd, res);
 	}
 	drmModeFreeResources(res);
 	return result;
+}
+
+/* The plane's "type" property (DRM_PLANE_TYPE_*), 0 if unreadable. */
+static uint64_t plane_type(int fd, uint32_t plane_id)
+{
+	drmModeObjectProperties *props = drmModeObjectGetProperties(fd, plane_id,
+								    DRM_MODE_OBJECT_PLANE);
+	uint64_t type = 0;
+	if (!props)
+		return 0;
+	for (uint32_t j = 0; j < props->count_props; j++) {
+		drmModePropertyRes *pr = drmModeGetProperty(fd, props->props[j]);
+		if (pr && !strcmp(pr->name, "type"))
+			type = props->prop_values[j];
+		if (pr)
+			drmModeFreeProperty(pr);
+	}
+	drmModeFreeObjectProperties(props);
+	return type;
 }
 
 /* Hands out one NV12-capable overlay plane per camera, plus a primary
@@ -564,19 +636,7 @@ static int assign_planes(struct wall *v)
 			continue;
 		}
 
-		drmModeObjectProperties *props = drmModeObjectGetProperties(
-			v->drmfd, p->plane_id, DRM_MODE_OBJECT_PLANE);
-		uint64_t type = 0;
-		if (props) {
-			for (uint32_t j = 0; j < props->count_props; j++) {
-				drmModePropertyRes *pr2 = drmModeGetProperty(v->drmfd, props->props[j]);
-				if (pr2 && !strcmp(pr2->name, "type"))
-					type = props->prop_values[j];
-				if (pr2)
-					drmModeFreeProperty(pr2);
-			}
-			drmModeFreeObjectProperties(props);
-		}
+		uint64_t type = plane_type(v->drmfd, p->plane_id);
 
 		if (type == DRM_PLANE_TYPE_PRIMARY && !v->primary_plane) {
 			v->primary_plane = p->plane_id;
@@ -664,6 +724,10 @@ int wait_for_display(struct wall *v)
 	}
 
 	v->display_connected = true;
+	atomic_store(&v->display_down, false);
+	v->home_connector_id = v->connector_id;
+	pacing_conn_follow_init(&v->follow);
+	pacing_retry_init(&v->conn_retry, 1000000, 60 * 1000000LL);
 	log_msg("display: %s (connector %u), CRTC %u (index %u), %ux%u@%u",
 		v->conn_name, v->connector_id, v->crtc_id, v->crtc_pipe,
 		v->mode.hdisplay, v->mode.vdisplay, v->mode.vrefresh);
@@ -782,12 +846,68 @@ static bool recovery_log_ok(struct wall *v, int64_t now)
 	return true;
 }
 
+/* How long a connector must stay disconnected (or the home connector
+ * connected) before the wall moves, see pacing_conn_follow_update. */
+#define CONN_STABLE_US (10 * 1000000LL)
+
+/* Another connector to move the wall to (see switch_connector). */
+struct conn_switch {
+	uint32_t connector_id, crtc_id, crtc_pipe, primary_plane;
+	char     name[32];
+	bool     quiet;     /* a retry: failures are not logged again */
+};
+
+/* After a blocking commit that detached every camera plane (a connector
+ * switch): nothing of the old frames is on screen any more, exactly as if
+ * the compositor had confirmed a detach for each camera. */
+static void planes_detached(struct wall *v)
+{
+	for (int i = 0; i < v->count; i++) {
+		struct camera *k = &v->cam[i];
+		struct leaked_buffer leaked[MAX_LEAKED];
+		int n_leaked = 0;
+		pthread_mutex_lock(&k->lock);
+		/* Every camera plane is off (or was never on) after the blocking
+		 * commit: the buffers teardown_stream had to leak are no longer
+		 * on screen either. Freed outside the lock, as in complete_flip. */
+		for (int j = 0; j < k->n_leaked; j++)
+			leaked[n_leaked++] = k->leaked[j];
+		k->m_leaks_closed += (unsigned long)k->n_leaked;
+		k->n_leaked = 0;
+		if (k->plane_attached) {
+			if (k->shown >= 0)
+				ring_push(k, k->shown);
+			k->shown = -1;
+			for (int j = 0; j < k->n_limbo; j++)
+				ring_push(k, k->limbo[j]);
+			k->n_limbo = 0;
+			k->plane_attached = false;
+			pthread_cond_broadcast(&k->detached);
+		}
+		pthread_mutex_unlock(&k->lock);
+		for (int j = 0; j < n_leaked; j++) {
+			if (leaked[j].fb)
+				drmModeRmFB(v->drmfd, leaked[j].fb);
+			if (leaked[j].dmafd >= 0)
+				close(leaked[j].dmafd);
+		}
+		if (n_leaked)
+			log_msg("%s: cleaned up %d previously leaked buffer(s) after the display switch",
+				k->name, n_leaked);
+	}
+}
+
 /* Sets mode m again with ALLOW_MODESET (blocking commit; the caller makes
  * sure no page flip is pending). If the size changes, a new black primary
  * framebuffer and new tiles are made, and every attached camera plane is
  * moved in the same commit (a plane outside the new screen would make the
- * commit fail). On failure the old state is kept and -1 returned. */
-static int display_remodeset(struct wall *v, const drmModeModeInfo *m)
+ * commit fail). With sw the wall moves to another connector (and CRTC):
+ * the old connector/CRTC/primary plane are switched off and every camera
+ * plane is detached in the same commit (the compositor attaches them
+ * again, to the new CRTC, with the next frame). On failure the old state
+ * is kept and -1 returned. */
+static int display_remodeset(struct wall *v, const drmModeModeInfo *m,
+			     const struct conn_switch *sw)
 {
 	static struct layout_config tiles;   /* compositor thread only */
 	bool resize = m->hdisplay != v->mode.hdisplay || m->vdisplay != v->mode.vdisplay;
@@ -836,20 +956,45 @@ static int display_remodeset(struct wall *v, const drmModeModeInfo *m)
 		}
 		return -1;
 	}
-	drmModeAtomicAddProperty(req, v->crtc_id, v->p_crtc_active, 1);
-	drmModeAtomicAddProperty(req, v->crtc_id, v->p_crtc_mode, blob);
-	drmModeAtomicAddProperty(req, v->connector_id, v->p_conn_crtc, v->crtc_id);
-	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_fb, fb);
-	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_crtc, v->crtc_id);
-	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_crtc_x, 0);
-	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_crtc_y, 0);
-	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_crtc_w, m->hdisplay);
-	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_crtc_h, m->vdisplay);
-	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_src_x, 0);
-	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_src_y, 0);
-	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_src_w, (uint64_t)m->hdisplay << 16);
-	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_src_h, (uint64_t)m->vdisplay << 16);
-	if (resize)
+	uint32_t crtc = sw ? sw->crtc_id : v->crtc_id;
+	uint32_t conn = sw ? sw->connector_id : v->connector_id;
+	uint32_t primary = sw ? sw->primary_plane : v->primary_plane;
+	if (sw) {
+		if (v->connector_id != conn)
+			drmModeAtomicAddProperty(req, v->connector_id, v->p_conn_crtc, 0);
+		if (v->crtc_id != crtc) {
+			drmModeAtomicAddProperty(req, v->crtc_id, v->p_crtc_active, 0);
+			drmModeAtomicAddProperty(req, v->crtc_id, v->p_crtc_mode, 0);
+		}
+		if (v->primary_plane != primary) {
+			drmModeAtomicAddProperty(req, v->primary_plane, v->pp_fb, 0);
+			drmModeAtomicAddProperty(req, v->primary_plane, v->pp_crtc, 0);
+		}
+		for (int i = 0; i < v->count; i++) {
+			struct camera *k = &v->cam[i];
+			pthread_mutex_lock(&k->lock);
+			bool attached = k->plane_attached;
+			pthread_mutex_unlock(&k->lock);
+			if (!attached)
+				continue;
+			drmModeAtomicAddProperty(req, k->plane_id, k->p_fb, 0);
+			drmModeAtomicAddProperty(req, k->plane_id, k->p_crtc, 0);
+		}
+	}
+	drmModeAtomicAddProperty(req, crtc, v->p_crtc_active, 1);
+	drmModeAtomicAddProperty(req, crtc, v->p_crtc_mode, blob);
+	drmModeAtomicAddProperty(req, conn, v->p_conn_crtc, crtc);
+	drmModeAtomicAddProperty(req, primary, v->pp_fb, fb);
+	drmModeAtomicAddProperty(req, primary, v->pp_crtc, crtc);
+	drmModeAtomicAddProperty(req, primary, v->pp_crtc_x, 0);
+	drmModeAtomicAddProperty(req, primary, v->pp_crtc_y, 0);
+	drmModeAtomicAddProperty(req, primary, v->pp_crtc_w, m->hdisplay);
+	drmModeAtomicAddProperty(req, primary, v->pp_crtc_h, m->vdisplay);
+	drmModeAtomicAddProperty(req, primary, v->pp_src_x, 0);
+	drmModeAtomicAddProperty(req, primary, v->pp_src_y, 0);
+	drmModeAtomicAddProperty(req, primary, v->pp_src_w, (uint64_t)m->hdisplay << 16);
+	drmModeAtomicAddProperty(req, primary, v->pp_src_h, (uint64_t)m->vdisplay << 16);
+	if (resize && !sw)
 		for (int i = 0; i < v->count; i++) {
 			struct camera *k = &v->cam[i];
 			const struct layout_camera *t = &tiles.cam[i];
@@ -868,8 +1013,14 @@ static int display_remodeset(struct wall *v, const drmModeModeInfo *m)
 	int e = errno;
 	drmModeAtomicFree(req);
 	if (r) {
-		if (recovery_log_ok(v, now))
-			log_msg("display: setting the mode again failed: %s (will retry)", strerror(e));
+		if (sw) {
+			if (!sw->quiet)
+				log_msg("display: moving the wall to %s failed: %s (will retry, "
+					"backing off up to 60 s)", sw->name, strerror(e));
+		} else if (recovery_log_ok(v, now)) {
+			log_msg("display: setting the mode again failed: %s (will retry)",
+				strerror(e));
+		}
 		drmModeDestroyPropertyBlob(v->drmfd, blob);
 		if (fb != old_fb) {
 			drmModeRmFB(v->drmfd, fb);
@@ -882,6 +1033,14 @@ static int display_remodeset(struct wall *v, const drmModeModeInfo *m)
 		drmModeDestroyPropertyBlob(v->drmfd, v->mode_blob);
 	v->mode_blob = blob;
 	v->mode = *m;
+	if (sw) {
+		planes_detached(v);
+		v->connector_id = sw->connector_id;
+		v->crtc_id = sw->crtc_id;
+		v->crtc_pipe = sw->crtc_pipe;
+		v->primary_plane = sw->primary_plane;
+		snprintf(v->conn_name, sizeof v->conn_name, "%s", sw->name);
+	}
 	if (resize) {
 		drmModeRmFB(v->drmfd, old_fb);
 		destroy_dumb(v->drmfd, old_handle);
@@ -906,9 +1065,212 @@ static int display_remodeset(struct wall *v, const drmModeModeInfo *m)
 	}
 	set_vblank_period(v);
 	v->last_vblank_us = monotonic_us();
-	log_msg("display: mode set again on %s, %ux%u@%u", v->conn_name,
-		m->hdisplay, m->vdisplay, m->vrefresh);
+	if (sw)
+		log_msg("display: the wall is on %s now (connector %u), CRTC %u (index %u), "
+			"%ux%u@%u", v->conn_name, v->connector_id, v->crtc_id, v->crtc_pipe,
+			m->hdisplay, m->vdisplay, m->vrefresh);
+	else
+		log_msg("display: mode set again on %s, %ux%u@%u", v->conn_name,
+			m->hdisplay, m->vdisplay, m->vrefresh);
 	return 0;
+}
+
+/* The primary plane for CRTC index `pipe`: the current one if it can be
+ * used there, else the first primary plane that can. 0 if none. */
+static uint32_t primary_plane_for(struct wall *v, uint32_t pipe)
+{
+	drmModePlaneRes *pr = drmModeGetPlaneResources(v->drmfd);
+	uint32_t found = 0;
+	if (!pr)
+		return 0;
+	for (uint32_t i = 0; i < pr->count_planes; i++) {
+		drmModePlane *p = drmModeGetPlane(v->drmfd, pr->planes[i]);
+		if (!p)
+			continue;
+		bool ok = (p->possible_crtcs & (1u << pipe))
+			  && plane_type(v->drmfd, p->plane_id) == DRM_PLANE_TYPE_PRIMARY;
+		if (ok && (p->plane_id == v->primary_plane || !found))
+			found = p->plane_id;
+		drmModeFreePlane(p);
+	}
+	drmModeFreePlaneResources(pr);
+	return found;
+}
+
+/* True if every camera plane can be shown on CRTC index `pipe`. */
+static bool camera_planes_fit_pipe(struct wall *v, uint32_t pipe)
+{
+	for (int i = 0; i < v->count; i++) {
+		drmModePlane *p = drmModeGetPlane(v->drmfd, v->cam[i].plane_id);
+		bool ok = p && (p->possible_crtcs & (1u << pipe));
+		if (p)
+			drmModeFreePlane(p);
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+/* The wall's property ids were read from the first connector/CRTC/primary
+ * plane. DRM core shares them between objects of one device, but check
+ * rather than commit a wrong id. */
+static bool same_prop_ids(struct wall *v, const struct conn_switch *sw)
+{
+	return prop_id(v->drmfd, sw->crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE") == v->p_crtc_active
+	       && prop_id(v->drmfd, sw->crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID") == v->p_crtc_mode
+	       && prop_id(v->drmfd, sw->connector_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID")
+		  == v->p_conn_crtc
+	       && prop_id(v->drmfd, sw->primary_plane, DRM_MODE_OBJECT_PLANE, "FB_ID") == v->pp_fb
+	       && prop_id(v->drmfd, sw->primary_plane, DRM_MODE_OBJECT_PLANE, "CRTC_ID") == v->pp_crtc
+	       && prop_id(v->drmfd, sw->primary_plane, DRM_MODE_OBJECT_PLANE, "SRC_W") == v->pp_src_w;
+}
+
+/* May connector `id` (cached state `c`) be where the wall goes? target
+ * != 0: only that one (the home connector, whatever its type); else any
+ * other connector of an external monitor type (layout_connector_auto_target)
+ * that reports a display. */
+static bool is_candidate(const struct wall *v, const drmModeConnector *c, uint32_t target)
+{
+	if (c->connection != DRM_MODE_CONNECTED)
+		return false;
+	if (target)
+		return c->connector_id == target;
+	return c->connector_id != v->connector_id
+	       && layout_connector_auto_target(drmModeGetConnectorTypeName(c->connector_type));
+}
+
+/* Cheap check (cached status, no EDID read) whether switch_connector has
+ * anything to try. */
+static bool candidate_available(struct wall *v, uint32_t target)
+{
+	drmModeRes *res = drmModeGetResources(v->drmfd);
+	bool found = false;
+	if (!res)
+		return false;
+	for (int i = 0; i < res->count_connectors && !found; i++) {
+		drmModeConnector *c = drmModeGetConnectorCurrent(v->drmfd, res->connectors[i]);
+		if (c) {
+			found = is_candidate(v, c, target);
+			drmModeFreeConnector(c);
+		}
+	}
+	drmModeFreeResources(res);
+	return found;
+}
+
+/* True if connector `id` reports a display (cached status). */
+static bool connector_connected_cached(struct wall *v, uint32_t id)
+{
+	drmModeConnector *c = drmModeGetConnectorCurrent(v->drmfd, id);
+	bool connected = c && c->connection == DRM_MODE_CONNECTED;
+	if (c)
+		drmModeFreeConnector(c);
+	return connected;
+}
+
+/* Moves the wall to another connector: `target` (the home connector), or
+ * with target 0 the first connected external monitor connector (a cable
+ * moved from HDMI-A-1 to HDMI-A-2). quiet: a retry - no log lines except
+ * the success line. Returns true if it moved. */
+static bool switch_connector(struct wall *v, int64_t now, uint32_t target, bool quiet)
+{
+	drmModeRes *res = drmModeGetResources(v->drmfd);
+	bool done = false;
+	if (!res)
+		return false;
+
+	for (int i = 0; i < res->count_connectors && !done; i++) {
+		/* cheap cached status first, the full probe (EDID) only for a
+		 * candidate that reports a display */
+		drmModeConnector *c = drmModeGetConnectorCurrent(v->drmfd, res->connectors[i]);
+		bool cand = c && is_candidate(v, c, target);
+		if (c)
+			drmModeFreeConnector(c);
+		if (!cand)
+			continue;
+		c = drmModeGetConnector(v->drmfd, res->connectors[i]);
+		if (!c)
+			continue;
+		uint32_t crtc = c->connection == DRM_MODE_CONNECTED && c->count_modes > 0
+				? crtc_for_connector(v->drmfd, res, c) : 0;
+		struct conn_switch sw = { .connector_id = c->connector_id, .crtc_id = crtc,
+					  .quiet = quiet };
+		connector_name(c, sw.name, sizeof sw.name);
+		for (int k = 0; k < res->count_crtcs; k++)
+			if (res->crtcs[k] == crtc)
+				sw.crtc_pipe = (uint32_t)k;
+		if (crtc)
+			sw.primary_plane = primary_plane_for(v, sw.crtc_pipe);
+		if (!crtc || !sw.primary_plane || !camera_planes_fit_pipe(v, sw.crtc_pipe)
+		    || !same_prop_ids(v, &sw)) {
+			if (crtc && (!v->last_cantmove_log_us
+				     || now - v->last_cantmove_log_us >= 60 * 1000000LL)) {
+				v->last_cantmove_log_us = now;
+				log_msg("display: %s is connected, but the wall's planes cannot be moved "
+					"to its CRTC %u - set CONNECTOR=%s and restart to use it",
+					sw.name, crtc, sw.name);
+			}
+			drmModeFreeConnector(c);
+			continue;
+		}
+
+		if (!quiet) {
+			if (target)
+				log_msg("display: %s (the connector the wall started on) has been "
+					"connected for %lld s - moving the wall back to it", sw.name,
+					CONN_STABLE_US / 1000000);
+			else
+				log_msg("display: %s has been disconnected for %lld s but %s is "
+					"connected - moving the wall to %s", v->conn_name,
+					CONN_STABLE_US / 1000000, sw.name, sw.name);
+		}
+		char old_name[sizeof v->conn_name];
+		bool old_fallback = v->mode_fallback, old_reserve = v->mode_reserve_only;
+		memcpy(old_name, v->conn_name, sizeof old_name);
+		snprintf(v->conn_name, sizeof v->conn_name, "%s", sw.name);   /* pick_mode logs it */
+		drmModeModeInfo m;
+		if (pick_mode(v, c, true, quiet, &m) == 0 && display_remodeset(v, &m, &sw) == 0) {
+			v->display_connected = true;
+			atomic_store(&v->display_down, false);
+			v->remodeset_pending = false;
+			v->last_fallback_probe_us = now;
+			done = true;
+		} else {
+			memcpy(v->conn_name, old_name, sizeof v->conn_name);
+			v->mode_fallback = old_fallback;
+			v->mode_reserve_only = old_reserve;
+		}
+		drmModeFreeConnector(c);
+	}
+	drmModeFreeResources(res);
+	return done;
+}
+
+/* Without CONNECTOR: follows a cable moved to another port and goes back to
+ * the connector the wall started on (see pacing_conn_follow_update for the
+ * 10 s debounce). Attempts that fail back off 1, 2, 4 ... 60 s; only the
+ * first of a run logs. Returns true if the wall moved. */
+static bool follow_cable(struct wall *v, bool connected, int64_t now)
+{
+	if (v->cfg.connector[0] || !v->home_connector_id)
+		return false;
+	bool moved = v->connector_id != v->home_connector_id;
+	bool home_up = moved && connector_connected_cached(v, v->home_connector_id);
+	enum pacing_conn_action act = pacing_conn_follow_update(&v->follow, connected, moved,
+								 home_up, now, CONN_STABLE_US);
+	if (act == PACING_CONN_STAY) {
+		pacing_retry_reset(&v->conn_retry);
+		return false;
+	}
+	uint32_t target = act == PACING_CONN_MOVE_HOME ? v->home_connector_id : 0;
+	if (!candidate_available(v, target))
+		return false;
+	bool first = !v->conn_retry.armed;
+	if (!pacing_retry_due(&v->conn_retry, now) || !switch_connector(v, now, target, !first))
+		return false;
+	pacing_conn_follow_moved(&v->follow);
+	pacing_retry_reset(&v->conn_retry);
+	return true;
 }
 
 static bool same_timing(const drmModeModeInfo *a, const drmModeModeInfo *b)
@@ -939,19 +1301,20 @@ static int primary_only_commit(struct wall *v)
 static bool explicit_mode_offered(const struct wall *v, const drmModeConnector *c)
 {
 	struct layout_mode lm[MAX_MODES];
-	int n = c->count_modes < MAX_MODES ? c->count_modes : MAX_MODES;
+	int n = connector_layout_modes(c, lm);
 	enum layout_mode_reason why;
 
-	for (int i = 0; i < n; i++)
-		lm[i] = (struct layout_mode){
-			.width = c->modes[i].hdisplay, .height = c->modes[i].vdisplay,
-			.refresh_mhz = mode_refresh_mhz(&c->modes[i]),
-			.interlaced = (c->modes[i].flags & DRM_MODE_FLAG_INTERLACE) != 0,
-		};
 	return layout_select_mode(lm, n, v->cfg.mode_w, v->cfg.mode_h, v->cfg.mode_mhz, &why) >= 0;
 }
 
-#define FALLBACK_PROBE_US (30 * 1000000LL)
+/* True if the connector offers more than the driver's reserve modes now. */
+static bool real_modes_offered(const drmModeConnector *c)
+{
+	struct layout_mode lm[MAX_MODES];
+	int n = connector_layout_modes(c, lm);
+
+	return !layout_only_reserve_modes(lm, n);
+}
 
 bool display_poll(struct wall *v)
 {
@@ -985,13 +1348,20 @@ bool display_poll(struct wall *v)
 		return false;
 	bool connected = c->connection == DRM_MODE_CONNECTED;
 
+	if (!connected && v->display_connected) {
+		log_msg("display: %s disconnected (TV off or in standby, input switched or "
+			"cable out?) - the wall keeps running and the mode is set again when "
+			"it comes back", v->conn_name);
+		v->display_connected = false;
+		atomic_store(&v->display_down, true);
+	}
+	/* Without CONNECTOR: follow a cable moved to another port, and go
+	 * back to the start connector when it is in use again. */
+	if (follow_cable(v, connected, now)) {
+		drmModeFreeConnector(c);
+		return true;
+	}
 	if (!connected) {
-		if (v->display_connected) {
-			log_msg("display: %s disconnected (TV off or in standby, input switched or "
-				"cable out?) - the wall keeps running and the mode is set again when "
-				"it comes back", v->conn_name);
-			v->display_connected = false;
-		}
 		drmModeFreeConnector(c);
 		return false;
 	}
@@ -1000,6 +1370,7 @@ bool display_poll(struct wall *v)
 		log_msg("display: %s connected again - re-reading its modes and setting the mode",
 			v->conn_name);
 		v->display_connected = true;
+		atomic_store(&v->display_down, false);
 		v->remodeset_pending = true;
 		first = true;
 	}
@@ -1042,12 +1413,18 @@ bool display_poll(struct wall *v)
 	}
 
 	if (fallback_probe && !v->remodeset_pending) {
-		if (c->count_modes < 1 || !explicit_mode_offered(v, c)) {
+		bool want_explicit = c->count_modes > 0 && v->cfg.mode_w && explicit_mode_offered(v, c);
+		bool want_real = c->count_modes > 0 && v->mode_reserve_only && real_modes_offered(c);
+		if (!want_explicit && !want_real) {
 			drmModeFreeConnector(c);
 			return false;
 		}
-		log_msg("display: MODE=%dx%d is offered by %s now - switching to it",
-			v->cfg.mode_w, v->cfg.mode_h, v->conn_name);
+		if (want_explicit)
+			log_msg("display: MODE=%dx%d is offered by %s now - switching to it",
+				v->cfg.mode_w, v->cfg.mode_h, v->conn_name);
+		else
+			log_msg("display: %s offers its real modes now (not just reserve modes) - "
+				"setting the mode again", v->conn_name);
 		v->remodeset_pending = true;
 		first = true;
 	}
@@ -1074,7 +1451,7 @@ bool display_poll(struct wall *v)
 	 * failure lines). */
 	drmModeModeInfo m;
 	bool done = false;
-	if (pick_mode(v, c, true, !first, &m) == 0 && display_remodeset(v, &m) == 0) {
+	if (pick_mode(v, c, true, !first, &m) == 0 && display_remodeset(v, &m, NULL) == 0) {
 		v->remodeset_pending = false;
 		done = true;
 	}

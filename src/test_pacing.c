@@ -1201,6 +1201,142 @@ static void test_backoff_live_grace_is_bounded(void)
 	ASSERT(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, t) <= 5000);
 }
 
+
+/* qa: DNS failures come back from libavformat as a generic EIO; the text
+ * of its error line tells them apart. Treated as "unreachable" (transient),
+ * like probe does. */
+static void test_dns_failure_text(void)
+{
+	ASSERT(pacing_text_is_dns_failure("[tcp @ 0x55d4] Failed to resolve hostname cam.local: "
+					  "Name or service not known"));
+	ASSERT(pacing_text_is_dns_failure("Failed to resolve hostname nvr: Temporary failure in "
+					  "name resolution"));
+	ASSERT(pacing_text_is_dns_failure("Name or service not known"));
+	ASSERT(pacing_text_is_dns_failure("temporary failure in name resolution"));
+	ASSERT(pacing_text_is_dns_failure("No address associated with hostname"));
+	ASSERT(pacing_text_is_dns_failure("[udp @ 0x1] getaddrinfo(cam, 554): Name has no usable "
+					  "address"));
+	ASSERT(!pacing_text_is_dns_failure(""));
+	ASSERT(!pacing_text_is_dns_failure(NULL));
+	ASSERT(!pacing_text_is_dns_failure("method DESCRIBE failed: 404 Not Found"));
+	ASSERT(!pacing_text_is_dns_failure("Connection refused"));
+
+	ASSERT_EQ_I(pacing_fault_refine(PACING_FAULT_OTHER, "Failed to resolve hostname x: Name or "
+					"service not known"), PACING_FAULT_UNREACHABLE);
+	ASSERT_EQ_I(pacing_fault_refine(PACING_FAULT_OTHER, "Invalid data found"), PACING_FAULT_OTHER);
+	ASSERT_EQ_I(pacing_fault_refine(PACING_FAULT_OTHER, NULL), PACING_FAULT_OTHER);
+	/* a definite class from the error code is never overridden */
+	ASSERT_EQ_I(pacing_fault_refine(PACING_FAULT_UNAUTHORIZED, "Name or service not known"),
+		    PACING_FAULT_UNAUTHORIZED);
+	ASSERT_EQ_I(pacing_fault_refine(PACING_FAULT_STALL, "Name or service not known"),
+		    PACING_FAULT_STALL);
+	ASSERT(!pacing_fault_is_deterministic(pacing_fault_refine(PACING_FAULT_OTHER,
+						"Name or service not known")));
+}
+
+/* qa A5: re-modesets triggered by refused vblank waits back off 1, 2, 4 ...
+ * 60 s, and start again from 1 s once vblank works. */
+static void test_retry_backoff(void)
+{
+	struct pacing_retry r;
+	const int64_t S = 1000000;
+	pacing_retry_init(&r, 1 * S, 60 * S);
+
+	int64_t t = 100 * S;
+	ASSERT(pacing_retry_due(&r, t));          /* the first one at once */
+	ASSERT(!pacing_retry_due(&r, t + S - 1));
+	ASSERT(pacing_retry_due(&r, t + S));      /* 1 s later */
+	t += S;
+	ASSERT(!pacing_retry_due(&r, t + 2 * S - 1));
+	ASSERT(pacing_retry_due(&r, t + 2 * S));  /* then 2 s */
+	t += 2 * S;
+	ASSERT(!pacing_retry_due(&r, t + 4 * S - 1));
+	ASSERT(pacing_retry_due(&r, t + 4 * S));  /* then 4 s */
+	t += 4 * S;
+
+	/* ... capped at 60 s */
+	int64_t gaps[16];
+	for (int i = 0; i < 16; i++) {
+		int64_t step = 0;
+		while (!pacing_retry_due(&r, t + step))
+			step += S / 2;
+		gaps[i] = step;
+		t += step;
+	}
+	ASSERT_EQ_I(gaps[0], 8 * S);
+	ASSERT_EQ_I(gaps[1], 16 * S);
+	ASSERT_EQ_I(gaps[2], 32 * S);
+	ASSERT_EQ_I(gaps[3], 60 * S);
+	ASSERT_EQ_I(gaps[15], 60 * S);
+
+	/* vblank works again: next failure run starts over at 1 s */
+	pacing_retry_reset(&r);
+	ASSERT(pacing_retry_due(&r, t + 1));
+	ASSERT(pacing_retry_due(&r, t + 1 + S));
+	ASSERT(!pacing_retry_due(&r, t + 1 + S + 2 * S - 1));
+}
+
+/* qa item 9: with the display disconnected a teardown does not wait for a
+ * flip that never comes - but only while the leak list can take every
+ * index that may still be on screen. */
+static void test_teardown_skip_wait(void)
+{
+	ASSERT(pacing_teardown_skip_wait(true, 0, 2, 32));
+	ASSERT(pacing_teardown_skip_wait(true, 30, 2, 32));
+	ASSERT(!pacing_teardown_skip_wait(true, 31, 2, 32));   /* no room: wait as before */
+	ASSERT(!pacing_teardown_skip_wait(false, 0, 2, 32));   /* display up: wait */
+	ASSERT(pacing_teardown_skip_wait(true, 0, 0, 32));
+	ASSERT(!pacing_teardown_skip_wait(true, 0, 33, 32));
+}
+
+
+/* qa B1: following the cable - the wall's connector must be gone for 10 s
+ * in a row before it moves (a short HPD pulse at TV power-on or an input
+ * switch does not count), and it moves back to the connector chosen at
+ * start once that has been connected for 10 s in a row. */
+static void test_conn_follow(void)
+{
+	const int64_t S = 1000000, STABLE = 10 * S;
+	struct pacing_conn_follow f;
+	pacing_conn_follow_init(&f);
+
+	/* connected: nothing to do */
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, false, false, 100 * S, STABLE), PACING_CONN_STAY);
+	/* short HPD pulse (3 s down) never moves */
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, false, false, false, 101 * S, STABLE), PACING_CONN_STAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, false, false, false, 104 * S, STABLE), PACING_CONN_STAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, false, false, 105 * S, STABLE), PACING_CONN_STAY);
+	/* down again: the 10 s start over */
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, false, false, false, 106 * S, STABLE), PACING_CONN_STAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, false, false, false, 115 * S, STABLE), PACING_CONN_STAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, false, false, false, 116 * S, STABLE), PACING_CONN_MOVE_AWAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, false, false, false, 120 * S, STABLE), PACING_CONN_MOVE_AWAY);
+
+	/* moved; the new connector is up, home not connected */
+	pacing_conn_follow_moved(&f);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, true, false, 121 * S, STABLE), PACING_CONN_STAY);
+	/* home flickers (HPD pulse): not long enough */
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, true, true, 122 * S, STABLE), PACING_CONN_STAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, true, false, 125 * S, STABLE), PACING_CONN_STAY);
+	/* home connected 10 s in a row: back home, even though the current one is fine */
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, true, true, 130 * S, STABLE), PACING_CONN_STAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, true, true, 139 * S, STABLE), PACING_CONN_STAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, true, true, 140 * S, STABLE), PACING_CONN_MOVE_HOME);
+
+	/* moved, the current one goes away too and home stays off: move on after 10 s */
+	pacing_conn_follow_init(&f);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, false, true, false, 200 * S, STABLE), PACING_CONN_STAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, false, true, false, 210 * S, STABLE), PACING_CONN_MOVE_AWAY);
+	/* ... but home coming back (stable) wins over moving on */
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, false, true, true, 211 * S, STABLE), PACING_CONN_MOVE_AWAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, false, true, true, 221 * S, STABLE), PACING_CONN_MOVE_HOME);
+
+	/* not moved: home_connected is ignored */
+	pacing_conn_follow_init(&f);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, false, true, 300 * S, STABLE), PACING_CONN_STAY);
+	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, false, true, 400 * S, STABLE), PACING_CONN_STAY);
+}
+
 int main(void)
 {
 	test_anchor_sliding_minimum();
@@ -1270,6 +1406,12 @@ int main(void)
 	test_backoff_auth_404_transient_after_live();
 	test_backoff_live_grace_is_bounded();
 	test_pts_classify_reorder_window();
+
+	/* qa rc1 "can wait" items */
+	test_dns_failure_text();
+	test_retry_backoff();
+	test_teardown_skip_wait();
+	test_conn_follow();
 
 	return test_summary("test_pacing");
 }

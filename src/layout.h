@@ -238,6 +238,51 @@ enum layout_mode_reason {
 int layout_select_mode(const struct layout_mode *m, int n, int want_w, int want_h,
 		       int want_mhz, enum layout_mode_reason *reason);
 
+/* True if the modes look like the driver's reserve set rather than the
+ * display's own (a TV in standby or without a readable EDID at boot): no
+ * progressive mode of at least 1280x720, or no mode flagged preferred at
+ * all. An empty list counts as reserve-only. The caller treats MODE=auto
+ * on such a set like a MODE fallback (drm.c: a full probe every 30 s
+ * switches to the real modes once they show up). */
+bool layout_only_reserve_modes(const struct layout_mode *m, int n);
+
+/* True if a connector of this type (the kernel's type name, as
+ * drmModeGetConnectorTypeName gives it: "HDMI-A", "DSI", ...) may be the
+ * target when the wall follows a moved cable (CONNECTOR unset): only
+ * external monitor outputs - HDMI-A, HDMI-B, DVI-I/D/A and DP. Panels
+ * (DSI, eDP), TV outputs (Composite, TV, SVIDEO, Component), VGA and
+ * virtual connectors (Virtual, Writeback) are never chosen: several of
+ * them report "connected" whether or not anything is plugged in. */
+bool layout_connector_auto_target(const char *type_name);
+
+/* One connector as the startup scan found it (CONNECTOR unset). */
+struct layout_conn {
+	bool auto_target;   /* layout_connector_auto_target(its type) */
+	bool usable;        /* connected, with modes and a CRTC */
+};
+
+/* Which connector the wall starts on when CONNECTOR is unset: the first
+ * usable one of an external monitor type (HDMI/DVI/DP). If the card has
+ * such connectors but none is usable yet (TV in standby) -1 = wait, even
+ * when a DSI panel or the composite output reports "connected". Only a
+ * card without any such connector (e.g. just the official DSI touch
+ * screen) starts on the first usable connector of any type. -1 if none. */
+int layout_pick_start_connector(const struct layout_conn *c, int n);
+
+/* ------------------------------------------------------- stream selection */
+
+/* One stream of an opened input, as the caller found it. */
+struct layout_stream {
+	bool video;      /* AVMEDIA_TYPE_VIDEO */
+	bool h264;       /* AV_CODEC_ID_H264 */
+};
+
+/* The stream the wall (and `rtspwall probe`) uses: the first H.264 video
+ * stream, else the first video stream of any codec (so an H.265-only
+ * camera gets the "not H.264" verdict). -1 if there is no video. *is_h264
+ * (may be NULL) tells which case it was. */
+int layout_pick_video_stream(const struct layout_stream *s, int n, bool *is_h264);
+
 /* ------------------------------------------------------------ URL helpers */
 
 /* UniFi Protect shows its streams as rtsps://HOST:7441/TOKEN?enableSrtp.

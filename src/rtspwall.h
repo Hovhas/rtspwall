@@ -37,17 +37,19 @@
                                   * (pacing.h) is 20, with margin over this. */
 #define OUTPUT_BUFFER_SIZE  (1024 * 1024)
 
-/* Leaked buffers (see struct camera .leaked below): in practice
- * teardown_stream leaks at most two indices per teardown (keep_a/keep_b).
- * Four slots give margin should an unusually tight situation occur
- * (several teardown timeouts in a row before a flip gets to confirm and
- * drain the list). */
-#define MAX_LEAKED   4
-
 /* Indices parked by the compositor after an abandoned page flip (see
- * abandon_flip in compositor.c): at most the previous "shown" per
- * abandoned flip, drained by the next confirmed flip. */
-#define MAX_LIMBO    4
+ * abandon_flip in compositor.c): the previous "shown" per abandoned flip,
+ * drained by the next confirmed flip. An index can be parked only once
+ * (it leaves limbo only through the ring), so CAPTURE_BUFFERS slots can
+ * never overflow, however many flips in a row are abandoned. */
+#define MAX_LIMBO    CAPTURE_BUFFERS
+
+/* Leaked buffers (see struct camera .leaked below): a teardown that gives
+ * up (or skips the wait because the display is disconnected) leaks every
+ * index that may still be on screen - shown, in flight and the limbo
+ * indices, at most CAPTURE_BUFFERS distinct ones. Twice that leaves room
+ * for a second such teardown before a confirmed flip drains the list. */
+#define MAX_LEAKED   (2 * CAPTURE_BUFFERS)
 
 /* A page flip without an event for this long is abandoned (compositor.c). */
 #define FLIP_TIMEOUT_US   (2 * 1000000LL)
@@ -55,7 +57,9 @@
 /* teardown_stream waits this long for the plane to be confirmed detached.
  * Longer than FLIP_TIMEOUT_US plus a second detach attempt, so a flip
  * that times out does not make the camera thread give up (and leak) at
- * the same moment the compositor retries the detach. */
+ * the same moment the compositor retries the detach. Not waited at all
+ * while the display is disconnected (wall.display_down, see
+ * pacing_teardown_skip_wait). */
 #define TEARDOWN_WAIT_S   5
 
 #define ANCHOR_WINDOW_US     (10 * 1000000)   /* sliding minimum over 10 s */
@@ -177,8 +181,8 @@ struct camera {
 	 *                  commit, no wait.
 	 *
 	 * leaked/n_leaked — when teardown_stream gives up and DELIBERATELY
-	 *                  leaks a protected index (keep_a/keep_b, see the
-	 *                  comment at close_buffers) its fb/dmafd is saved HERE
+	 *                  leaks a protected index (shown/in flight/limbo,
+	 *                  see teardown_stream and close_buffers) its fb/dmafd is saved HERE
 	 *                  instead of just being left in k->cap[i] — where
 	 *                  start_capture would otherwise overwrite it without
 	 *                  closing/destroying on the next connection, losing
@@ -397,11 +401,21 @@ struct wall {
 	 * main() before). See display_poll in drm.c. */
 	char             conn_name[32];        /* e.g. "HDMI-A-1" */
 	bool             display_connected;
+	_Atomic bool     display_down;         /* !display_connected, for the camera
+					        * threads (teardown_stream) */
 	bool             remodeset_pending;    /* reconnected, mode not yet set again */
 	int              commit_failures;      /* failed atomic commits in a row */
 	int              last_commit_errno;    /* errno of the latest failed commit */
-	bool             mode_fallback;        /* explicit MODE not offered: running on
-					        * MODE=auto (see pick_mode) */
+	bool             mode_fallback;        /* explicit MODE not offered, or only
+					        * reserve modes: running on a fallback
+					        * mode (see pick_mode) */
+	bool             mode_reserve_only;    /* the modes at the latest pick were only
+					        * the driver's reserve set */
+	/* Following a moved cable (CONNECTOR unset), see follow_cable in drm.c */
+	uint32_t         home_connector_id;    /* the connector chosen at start */
+	struct pacing_conn_follow follow;
+	struct pacing_retry conn_retry;        /* failed moves back off 1 ... 60 s */
+	int64_t          last_cantmove_log_us;
 	int64_t          last_fallback_probe_us;
 	int64_t          last_display_poll_us;
 	int64_t          last_forced_probe_us;
@@ -426,6 +440,10 @@ struct thread_arg {
 void log_msg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int xioctl(int fd, unsigned long req, void *arg);
 int64_t monotonic_us(void);
+/* The latest error line libav logged in the calling thread (URLs masked;
+ * "" if none since av_last_error_clear), whatever FFMPEG_LOGLEVEL is. */
+const char *av_last_error(void);
+void av_last_error_clear(void);
 
 /* ------------------------------------------------------------------- drm.c */
 
@@ -456,7 +474,9 @@ bool display_poll(struct wall *v);
 
 /* ------------------------------------------------------------------ v4l2.c */
 
-void close_buffers(struct camera *k, int keep_a, int keep_b);
+/* Unmaps/closes the camera's V4L2 buffers, except the CAPTURE indices
+ * marked in keep[CAPTURE_BUFFERS] (may be NULL), which are left alone. */
+void close_buffers(struct camera *k, const bool *keep);
 int open_decoder(const char *device, struct camera *k, unsigned width, unsigned height);
 /* VIDIOC_QUERYCAP + ENUM_FMT on the decoder before any camera starts.
  * Waits up to 15 s for the device node to appear and up to 30 s (in all)

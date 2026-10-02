@@ -656,3 +656,116 @@ int64_t pacing_filepace_due(struct pacing_filepace *p, int64_t pts_us, int64_t n
 	p->base_pts_us = pts_us;
 	return now_us;
 }
+
+/* ------------------------------------------------------- DNS fault refine */
+
+static bool contains_nocase(const char *hay, const char *needle)
+{
+	size_t n = strlen(needle);
+	for (; *hay; hay++) {
+		size_t i = 0;
+		while (i < n && hay[i] && tolower((unsigned char)hay[i]) == tolower((unsigned char)needle[i]))
+			i++;
+		if (i == n)
+			return true;
+	}
+	return false;
+}
+
+bool pacing_text_is_dns_failure(const char *av_msg)
+{
+	static const char *const pat[] = {
+		"failed to resolve hostname",            /* libavformat tcp.c */
+		"name or service not known",             /* glibc EAI_NONAME */
+		"temporary failure in name resolution",  /* glibc EAI_AGAIN */
+		"no address associated with hostname",   /* glibc EAI_NODATA */
+		"nodename nor servname",                 /* BSD/macOS EAI_NONAME */
+		"getaddrinfo(",                          /* libavformat udp.c */
+	};
+	if (!av_msg || !*av_msg)
+		return false;
+	for (size_t i = 0; i < sizeof pat / sizeof pat[0]; i++)
+		if (contains_nocase(av_msg, pat[i]))
+			return true;
+	return false;
+}
+
+enum pacing_fault pacing_fault_refine(enum pacing_fault f, const char *av_msg)
+{
+	if (f == PACING_FAULT_OTHER && pacing_text_is_dns_failure(av_msg))
+		return PACING_FAULT_UNREACHABLE;
+	return f;
+}
+
+/* --------------------------------------------------- exponential retry */
+
+void pacing_retry_init(struct pacing_retry *r, int64_t min_us, int64_t max_us)
+{
+	r->min_us = min_us > 0 ? min_us : 1;
+	r->max_us = max_us > r->min_us ? max_us : r->min_us;
+	pacing_retry_reset(r);
+}
+
+void pacing_retry_reset(struct pacing_retry *r)
+{
+	r->delay_us = r->min_us;
+	r->next_us = 0;
+	r->armed = false;
+}
+
+bool pacing_retry_due(struct pacing_retry *r, int64_t now_us)
+{
+	if (r->armed && now_us < r->next_us)
+		return false;
+	r->armed = true;
+	r->next_us = now_us + r->delay_us;
+	r->delay_us = r->delay_us > r->max_us / 2 ? r->max_us : r->delay_us * 2;
+	return true;
+}
+
+/* ---------------------------------------------------- teardown shortcut */
+
+bool pacing_teardown_skip_wait(bool display_down, int n_leaked, int n_protect, int max_leaked)
+{
+	return display_down && n_protect >= 0 && n_leaked >= 0 && n_leaked + n_protect <= max_leaked;
+}
+
+/* ----------------------------------------------------- follow the cable */
+
+void pacing_conn_follow_init(struct pacing_conn_follow *f)
+{
+	f->down_since_us = 0;
+	f->home_up_since_us = 0;
+}
+
+void pacing_conn_follow_moved(struct pacing_conn_follow *f)
+{
+	pacing_conn_follow_init(f);
+}
+
+enum pacing_conn_action pacing_conn_follow_update(struct pacing_conn_follow *f,
+						  bool current_connected, bool moved,
+						  bool home_connected, int64_t now_us,
+						  int64_t stable_us)
+{
+	/* 0 means "not running", so a timestamp of 0 is nudged to 1 */
+	int64_t t = now_us ? now_us : 1;
+
+	if (current_connected)
+		f->down_since_us = 0;
+	else if (!f->down_since_us)
+		f->down_since_us = t;
+
+	if (moved && home_connected) {
+		if (!f->home_up_since_us)
+			f->home_up_since_us = t;
+	} else {
+		f->home_up_since_us = 0;
+	}
+
+	if (f->home_up_since_us && t - f->home_up_since_us >= stable_us)
+		return PACING_CONN_MOVE_HOME;
+	if (f->down_since_us && t - f->down_since_us >= stable_us)
+		return PACING_CONN_MOVE_AWAY;
+	return PACING_CONN_STAY;
+}

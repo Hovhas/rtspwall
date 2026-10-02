@@ -424,6 +424,79 @@ unsigned pacing_backoff_total(const struct pacing_backoff *b);
 bool pacing_backoff_is_deterministic(const struct pacing_backoff *b, enum pacing_fault f,
 				     int64_t now_us);
 
+/* True if a libavformat error line (as logged, "[tcp @ 0x...]" prefix and
+ * all) reports a failed host name lookup. libavformat returns a generic
+ * AVERROR(EIO) for those ("Failed to resolve hostname X: Name or service
+ * not known"), so only the text tells them apart. NULL/"" -> false. */
+bool pacing_text_is_dns_failure(const char *av_msg);
+
+/* The fault class from the error code, refined by libavformat's last error
+ * line: an unclassified error (OTHER) whose line is a DNS failure becomes
+ * UNREACHABLE (transient, like `rtspwall probe` reports it). Any other
+ * class is returned unchanged. */
+enum pacing_fault pacing_fault_refine(enum pacing_fault f, const char *av_msg);
+
+/* ----------------------------------------------------- exponential retry
+ *
+ * Rate limit for a recovery action that may not help (compositor.c: a
+ * re-modeset after refused vblank waits): the first call is due at once,
+ * then the gaps double from min_us up to max_us. pacing_retry_reset (the
+ * condition went away) starts over at min_us. */
+struct pacing_retry {
+	int64_t min_us, max_us;
+	int64_t delay_us;    /* gap after the next due action */
+	int64_t next_us;     /* not due before this; 0 = due at once */
+	bool    armed;       /* false = nothing done since init/reset */
+};
+
+void pacing_retry_init(struct pacing_retry *r, int64_t min_us, int64_t max_us);
+void pacing_retry_reset(struct pacing_retry *r);
+/* True if the action is due at now_us; schedules the next one. */
+bool pacing_retry_due(struct pacing_retry *r, int64_t now_us);
+
+/* ------------------------------------------------------- follow the cable
+ *
+ * With CONNECTOR unset the wall follows a cable moved to another port
+ * (drm.c, display_poll). Called about once a second with the cached
+ * connector states:
+ *   current_connected - the wall's connector right now
+ *   moved             - the wall is not on the connector chosen at start
+ *   home_connected    - that start ("home") connector right now (only
+ *                       looked at when moved)
+ * MOVE_HOME once home has been connected for stable_us in a row (the
+ * wall goes back, even from a working connector); otherwise MOVE_AWAY
+ * once the current connector has been disconnected for stable_us in a row
+ * (a short hotplug pulse at TV power-on or an input switch never moves
+ * the wall). The caller calls pacing_conn_follow_moved after a move. */
+enum pacing_conn_action {
+	PACING_CONN_STAY,
+	PACING_CONN_MOVE_AWAY,
+	PACING_CONN_MOVE_HOME,
+};
+
+struct pacing_conn_follow {
+	int64_t down_since_us;      /* current disconnected since, 0 = connected */
+	int64_t home_up_since_us;   /* home connected since (while moved), 0 = not */
+};
+
+void pacing_conn_follow_init(struct pacing_conn_follow *f);
+void pacing_conn_follow_moved(struct pacing_conn_follow *f);
+enum pacing_conn_action pacing_conn_follow_update(struct pacing_conn_follow *f,
+						  bool current_connected, bool moved,
+						  bool home_connected, int64_t now_us,
+						  int64_t stable_us);
+
+/* ------------------------------------------------------ teardown shortcut */
+
+/* teardown_stream (camera_thread.c) normally waits up to TEARDOWN_WAIT_S
+ * for the plane to be confirmed detached. With the display disconnected
+ * that confirmation may never come, so the wait is skipped and the indices
+ * that may still be on screen (`n_protect`: shown, in flight, parked in
+ * limbo) are leaked through the leak list instead - but only while that
+ * list (n_leaked of max_leaked used) has room for all of them; otherwise
+ * the normal wait applies. */
+bool pacing_teardown_skip_wait(bool display_down, int n_leaked, int n_protect, int max_leaked);
+
 /* ------------------------------------------------------------ log collapse
  *
  * Collapses repeated identical log lines: the first occurrence of a line is
