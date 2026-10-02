@@ -11,7 +11,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -41,7 +41,7 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates git \
             build-essential pkg-config dpkg-dev lintian devscripts \
             libdrm-dev libavformat-dev libavcodec-dev libavutil-dev ffmpeg
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build and test
         run: |
           make
@@ -71,7 +71,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           name: deb-${{ matrix.dist }}

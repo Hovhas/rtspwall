@@ -12,7 +12,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Tag matches CHANGELOG.md
         env:
           TAG: ${{ github.ref_name }}
@@ -34,7 +34,7 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates git \
             build-essential pkg-config dpkg-dev lintian devscripts ffmpeg \
             libdrm-dev libavformat-dev libavcodec-dev libavutil-dev
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build, test, package
         env:
           TAG: ${{ github.ref_name }}
@@ -62,7 +62,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
