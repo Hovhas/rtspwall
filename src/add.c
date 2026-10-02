@@ -343,7 +343,25 @@ static bool wait_for_watcher(void)
 	return seen;
 }
 
-static int start_service(void)
+/* InvocationID of a unit (a new one per start); "" if it never ran, NULL
+ * (out untouched) if systemctl could not tell. */
+static const char *unit_invocation(const char *unit, char *out, size_t outlen)
+{
+	char *argv[] = { "systemctl", "show", "-p", "InvocationID", "--value", (char *)unit,
+			 NULL };
+	char buf[128];
+	if (cli_run(argv, buf, sizeof buf, 10000) != 0)
+		return NULL;
+	buf[strcspn(buf, "\r\n")] = '\0';
+	snprintf(out, outlen, "%s", buf);
+	return out;
+}
+
+/* inv_before: rtspwall.service's InvocationID read before the rename
+ * (NULL if unknown). The watcher only gets the credit for a restart when
+ * the ID really changed: its validation may have rejected the file, or a
+ * hardening/setpriv failure may have stopped it before the restart. */
+static int start_service(const char *inv_before)
 {
 	if (!cli_have_systemd()) {
 		printf("systemd is not running here; start the wall yourself, e.g.: "
@@ -372,7 +390,15 @@ static int start_service(void)
 	bool watcher_acted = false;
 	if (watcher) {
 		printf("waiting for %s to pick up the change ...\n", CLI_WATCH_PATH);
-		watcher_acted = wait_for_watcher() && was_enabled;
+		bool ran = wait_for_watcher();
+		char inv_after[128];
+		watcher_acted = ran && was_enabled &&
+				unit_restarted(inv_before, unit_invocation(CLI_SERVICE, inv_after,
+									   sizeof inv_after));
+		if (ran && was_enabled && !watcher_acted)
+			printf("%s ran but did not restart %s (its check of the config failed or "
+			       "it was blocked; see: journalctl -u %s -b); doing it now\n",
+			       CLI_WATCH_PATH, CLI_SERVICE, CLI_WATCH_SERVICE);
 	}
 
 	char state[64];
@@ -625,7 +651,12 @@ int cmd_add(int argc, char **argv)
 	if (v == BUDGET_FAIL)
 		printf("--force: adding despite FAIL\n");
 
-	/* ---- write */
+	/* ---- write (the service's InvocationID first: start_service compares
+	 * it to tell whether rtspwall-config.path really restarted the wall) */
+	char inv_buf[128];
+	const char *inv_before = NULL;
+	if (!no_systemd && cli_have_systemd() && geteuid() == 0)
+		inv_before = unit_invocation(CLI_SERVICE, inv_buf, sizeof inv_buf);
 	if (write_atomic(real, next, &st, check_with_daemon_parser) < 0) {
 		free(next);
 		goto out;
@@ -644,7 +675,7 @@ int cmd_add(int argc, char **argv)
 			       "when it sees the change\n", CLI_WATCH_PATH);
 		ret = 0;
 	} else {
-		ret = start_service();
+		ret = start_service(inv_before);
 	}
 out:
 	free(text);

@@ -330,13 +330,13 @@ int layout_parse_size(const char *s, int *w, int *h);
  *     does not end the userinfo early: when the authority up to the first
  *     '/', '?' or '#' has a ':' but no '@' and an '@' follows later, the
  *     userinfo ends at the last '@' before the first '/' after the first
- *     such '@' (rtsp://admin:pa/ss@1.2.3.4/s -> rtsp://admin:***@1.2.3.4/s).
+ *     such '@' (rtsp://admin:ex/ample@1.2.3.4/s -> rtsp://admin:***@1.2.3.4/s).
  *     A non-numeric "port" without any '@' (a URL cut short inside the
  *     password) is masked too;
  *   - the whole query string (and fragment):
  *       realmonitor?channel=1&subtype=0  ->  realmonitor?***
  *   - every path segment that looks like a token, e.g. the UniFi segment
- *     in rtsp://host:7447/aB3dE5fG7hJ9kL1m becomes "***";
+ *     in rtsp://host:7447/EXAMPLEtoken1234 becomes "***";
  *   - credentials in the path: a segment with both '&' and '=' is masked
  *     whole (XMEye: /user=admin&password=x&channel=1 -> "/" + "***"), and in a
  *     "key=value" segment or ";key=value" parameter whose key contains

@@ -794,6 +794,16 @@ int cfg_append_camera(const char *text, const char *name, const char *url, int c
 	return (n < 0 || (size_t)n >= outlen) ? -1 : 0;
 }
 
+bool unit_restarted(const char *inv_before, const char *inv_after)
+{
+	if (!inv_before || !inv_after)
+		return false;
+	size_t nb = strcspn(inv_before, " \t\r\n"), na = strcspn(inv_after, " \t\r\n");
+	if (na == 0)
+		return false;
+	return na != nb || memcmp(inv_before, inv_after, na) != 0;
+}
+
 const char *url_secret_reason(const char *url)
 {
 	const char *sch = strstr(url, "://");

@@ -12,15 +12,18 @@
  *     SIGPIPE, points stdin/stdout at /dev/null;
  *   - closes every inherited file descriptor except its result pipe and,
  *     for a local file, the file it may read (opened by the parent);
+ *   - runs in its own process group;
  *   - drops to the user `rtspwall` (or `nobody`/65534 when that does not
  *     exist, with a notice): setgroups to its primary group only (no
  *     supplementary groups — a probe needs neither video nor render),
- *     setresgid, setresuid, and checks that root cannot be regained;
+ *     setresgid, setresuid, and checks that root cannot be regained
+ *     (uid 0 and gid 0 are refused as targets);
  *   - sets PR_SET_NO_NEW_PRIVS and PR_SET_DUMPABLE=0;
  *   - writes one fixed-size result (no pointers) to the pipe and _exit()s.
  *
  * The parent reads exactly that many bytes (anything else is an error),
- * kills children still running at the deadline, and reaps them all. The
+ * kills the process group of every child still running at the deadline
+ * (also one that closed its pipe early), and reaps them all. The
  * caller validates the content.
  *
  * Without root there is nothing to drop; callers then run the work
@@ -71,7 +74,8 @@ struct sandbox_job {
 };
 
 /* Runs every job in its own child, all in parallel, and waits for them;
- * children still running after timeout_ms are killed (SIGKILL). The
+ * children still running after timeout_ms are killed (SIGKILL, with their
+ * process group), so this returns after about timeout_ms at most. The
  * calling process must be single-threaded. */
 void sandbox_run(struct sandbox_job *jobs, int n, int timeout_ms);
 

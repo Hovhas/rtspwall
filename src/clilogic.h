@@ -199,6 +199,12 @@ int cfg_append_camera(const char *text, const char *name, const char *url, int c
  * layout_mask_url would mask. NULL if the URL carries none of these. */
 const char *url_secret_reason(const char *url);
 
+/* `systemctl show -p InvocationID --value` before and after: true only if
+ * the unit got a new, non-empty invocation (it was (re)started in
+ * between). NULL (could not be read) or an unchanged/empty ID is false.
+ * Trailing whitespace is ignored. */
+bool unit_restarted(const char *inv_before, const char *inv_after);
+
 /* --------------------------------------------------------- report masking */
 
 /* A growable text buffer for doctor --report. Every line that goes in is

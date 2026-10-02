@@ -39,6 +39,8 @@ sudo rtspwall --check-config /etc/rtspwall/cameras.conf
 
 You can use grid lines or manual lines, not both in one file. At most 16 cameras.
 
+Supported sources: `rtsp://` and `rtsps://` URLs, and local video files. Any other URL scheme (http, rtmp, udp, ...) is rejected with `line N: unsupported URL for camera NAME`. Network sources must be H.264. See [SECURITY.md](../SECURITY.md#the-probe-sandbox).
+
 ### Grid layout
 
 ```

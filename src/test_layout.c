@@ -416,10 +416,10 @@ static void expect_mask(const char *in, const char *want)
 
 static void test_mask_url_userinfo(void)
 {
-	expect_mask("rtsp://admin:s3cret@192.168.1.10:554/stream1",
+	expect_mask("rtsp://admin:fakepw@192.168.1.10:554/stream1",
 		    "rtsp://admin:***@192.168.1.10:554/stream1");
 	/* password containing '@' — the LAST '@' in the authority counts */
-	expect_mask("rtsp://user:p@ss@host/path", "rtsp://user:***@host/path");
+	expect_mask("rtsp://user:ex@mple@host/path", "rtsp://user:***@host/path");
 	/* '@' in the path is not userinfo */
 	expect_mask("rtsp://host/a:b@c", "rtsp://host/a:b@c");
 	/* no credentials / user only: unchanged */
@@ -433,11 +433,11 @@ static void test_mask_url_unifi(void)
 {
 	/* UniFi Protect: the 16-character alphanumeric path segment IS the
 	 * credential. Also without any digit (a random token may lack one). */
-	expect_mask("rtsp://192.168.1.1:7447/aB3dE5fG7hJ9kL1m",
+	expect_mask("rtsp://192.168.1.1:7447/EXAMPLEtoken1234",
 		    "rtsp://192.168.1.1:7447/***");
 	expect_mask("rtsp://192.168.1.1:7447/AbCdEfGhIjKlMnOp",
 		    "rtsp://192.168.1.1:7447/***");
-	expect_mask("rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp",
+	expect_mask("rtsps://192.168.1.1:7441/EXAMPLEtoken1234?enableSrtp",
 		    "rtsps://192.168.1.1:7441/***?***");
 }
 
@@ -472,7 +472,7 @@ static void test_mask_url_long_tokens_with_separators(void)
 static void test_mask_url_truncation(void)
 {
 	char out[10];
-	layout_mask_url("rtsp://admin:s3cret@host/x", out, sizeof out);
+	layout_mask_url("rtsp://admin:fakepw@host/x", out, sizeof out);
 	ASSERT_EQ_I(strlen(out), 9);
 }
 
@@ -480,7 +480,7 @@ static void test_mask_urls_in_text(void)
 {
 	char out[512];
 	layout_mask_urls_in_text(
-		"Connection to rtsp://u:pw@10.0.0.1:7447/aB3dE5fG7hJ9kL1m failed: 401\n",
+		"Connection to rtsp://u:pw@10.0.0.1:7447/EXAMPLEtoken1234 failed: 401\n",
 		out, sizeof out);
 	ASSERT(strcmp(out, "Connection to rtsp://u:***@10.0.0.1:7447/*** failed: 401\n") == 0);
 
@@ -500,7 +500,7 @@ static void test_mask_url_edge_cases(void)
 	 * userinfo separator, and the password is still masked. */
 	expect_mask("rtsp://user:pw@[::1]:554/stream", "rtsp://user:***@[::1]:554/stream");
 	expect_mask("rtsp://[fe80::1]:554/stream1", "rtsp://[fe80::1]:554/stream1");
-	expect_mask("rtsp://[::1]:7447/aB3dE5fG7hJ9kL1m", "rtsp://[::1]:7447/***");
+	expect_mask("rtsp://[::1]:7447/EXAMPLEtoken1234", "rtsp://[::1]:7447/***");
 	/* no path at all */
 	expect_mask("rtsp://user:pw@host", "rtsp://user:***@host");
 	expect_mask("rtsp://user:pw@host:554", "rtsp://user:***@host:554");
@@ -511,7 +511,7 @@ static void test_mask_url_edge_cases(void)
 	/* fragment */
 	expect_mask("rtsp://user:pw@host/x#frag", "rtsp://user:***@host/x#***");
 	/* token segment followed by a trailing slash */
-	expect_mask("rtsp://host/aB3dE5fG7hJ9kL1m/", "rtsp://host/***/");
+	expect_mask("rtsp://host/EXAMPLEtoken1234/", "rtsp://host/***/");
 	/* empty input */
 	expect_mask("", "");
 }
@@ -520,7 +520,7 @@ static void test_mask_url_truncation_never_leaks(void)
 {
 	/* Whatever the output size, the result is a prefix of the full masked
 	 * URL and never contains any part of the secret. */
-	const char *url = "rtsp://admin:s3cretPW@192.168.1.10:7447/aB3dE5fG7hJ9kL1m?token=xyz";
+	const char *url = "rtsp://admin:fakepw@192.168.1.10:7447/EXAMPLEtoken1234?token=xyz";
 	char full[512];
 	layout_mask_url(url, full, sizeof full);
 	for (size_t n = 1; n <= strlen(full) + 1; n++) {
@@ -529,8 +529,8 @@ static void test_mask_url_truncation_never_leaks(void)
 		layout_mask_url(url, out, n);
 		ASSERT(strlen(out) == n - 1 || strlen(out) == strlen(full));
 		ASSERT(strncmp(out, full, strlen(out)) == 0);
-		ASSERT(strstr(out, "s3c") == NULL);
-		ASSERT(strstr(out, "aB3") == NULL);
+		ASSERT(strstr(out, "fak") == NULL);
+		ASSERT(strstr(out, "EXA") == NULL);
 		ASSERT(strstr(out, "xyz") == NULL);
 		ASSERT(out[n] == 'Z' || n == sizeof out);   /* nothing written past outlen */
 	}
@@ -538,9 +538,9 @@ static void test_mask_url_truncation_never_leaks(void)
 	for (size_t n = 1; n < 80; n++) {
 		char out[128];
 		memset(out, 'Z', sizeof out);
-		layout_mask_urls_in_text("err: rtsp://u:s3cret@h/x", out, n);
+		layout_mask_urls_in_text("err: rtsp://u:fakepw@h/x", out, n);
 		ASSERT(strlen(out) < n);
-		ASSERT(strstr(out, "s3c") == NULL);
+		ASSERT(strstr(out, "fak") == NULL);
 		ASSERT(out[n] == 'Z');
 	}
 }
@@ -553,15 +553,15 @@ static void test_mask_urls_in_text_token_before_punctuation(void)
 {
 	char out[512];
 
-	layout_mask_urls_in_text("rtsp://h:7447/aB3dE5fG7hJ9kL1m: Connection refused",
+	layout_mask_urls_in_text("rtsp://h:7447/EXAMPLEtoken1234: Connection refused",
 				 out, sizeof out);
-	ASSERT(strstr(out, "aB3dE5fG7hJ9kL1m") == NULL);
+	ASSERT(strstr(out, "EXAMPLEtoken1234") == NULL);
 
-	layout_mask_urls_in_text("url=rtsp://h:7447/aB3dE5fG7hJ9kL1m, retrying", out, sizeof out);
-	ASSERT(strstr(out, "aB3dE5fG7hJ9kL1m") == NULL);
+	layout_mask_urls_in_text("url=rtsp://h:7447/EXAMPLEtoken1234, retrying", out, sizeof out);
+	ASSERT(strstr(out, "EXAMPLEtoken1234") == NULL);
 
-	layout_mask_urls_in_text("failed to open rtsp://h:7447/aB3dE5fG7hJ9kL1m.", out, sizeof out);
-	ASSERT(strstr(out, "aB3dE5fG7hJ9kL1m") == NULL);
+	layout_mask_urls_in_text("failed to open rtsp://h:7447/EXAMPLEtoken1234.", out, sizeof out);
+	ASSERT(strstr(out, "EXAMPLEtoken1234") == NULL);
 }
 
 static void test_crlf_whole_file(void)
@@ -764,7 +764,7 @@ static void test_mask_urls_in_text_second_url_in_same_run(void)
 	ASSERT(strcmp(out, "open 'rtsp://a:***@h:554/s1': 401.") == 0);
 
 	/* the trimmed punctuation stays in the output */
-	layout_mask_urls_in_text("see rtsp://h/aB3dE5fG7hJ9kL1m, then", out, sizeof out);
+	layout_mask_urls_in_text("see rtsp://h/EXAMPLEtoken1234, then", out, sizeof out);
 	ASSERT(strcmp(out, "see rtsp://h/***, then") == 0);
 }
 
@@ -898,7 +898,7 @@ static void test_placeholder_angle_brackets_is_error(void)
 	ASSERT(layout_has_placeholder("rtsp://h/<x>"));
 	ASSERT(!layout_has_placeholder("rtsp://h/<>"));
 	ASSERT(layout_has_placeholder("CHANGE_ME"));
-	ASSERT(!layout_has_placeholder("rtsp://viewer:s3cret@h/stream1"));
+	ASSERT(!layout_has_placeholder("rtsp://viewer:fakepw@h/stream1"));
 }
 
 static void test_unknown_key_strict_is_error_with_suggestion(void)
@@ -1135,10 +1135,10 @@ static void unifi(const char *in, int expect_r, const char *expect)
 
 static void test_unifi_rewrite(void)
 {
-	unifi("rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp", 1,
-	      "rtsp://192.168.1.1:7447/aB3dE5fG7hJ9kL1m");
-	unifi("rtsps://nvr.local:7441/aB3dE5fG7hJ9kL1m", 1,
-	      "rtsp://nvr.local:7447/aB3dE5fG7hJ9kL1m");
+	unifi("rtsps://192.168.1.1:7441/EXAMPLEtoken1234?enableSrtp", 1,
+	      "rtsp://192.168.1.1:7447/EXAMPLEtoken1234");
+	unifi("rtsps://nvr.local:7441/EXAMPLEtoken1234", 1,
+	      "rtsp://nvr.local:7447/EXAMPLEtoken1234");
 	unifi("RTSPS://NVR:7441/Tok?enableSrtp", 1, "rtsp://NVR:7447/Tok");
 	unifi("rtsps://h:7441/T?enableSrtp&foo=1", 1, "rtsp://h:7447/T?foo=1");
 	unifi("rtsps://h:7441/T?foo=1&enableSrtp=true", 1, "rtsp://h:7447/T?foo=1");
@@ -1148,7 +1148,7 @@ static void test_unifi_rewrite(void)
 	unifi("  rtsps://h:7441/T?enableSrtp", 0, NULL);   /* fields arrive trimmed */
 
 	/* not UniFi Protect rtsps: untouched */
-	unifi("rtsp://192.168.1.1:7447/aB3dE5fG7hJ9kL1m", 0, NULL);
+	unifi("rtsp://192.168.1.1:7447/EXAMPLEtoken1234", 0, NULL);
 	unifi("rtsps://cam:322/stream1", 0, NULL);
 	unifi("rtsps://cam/stream1", 0, NULL);
 	unifi("rtsps://cam:74410/stream1", 0, NULL);
@@ -1166,11 +1166,11 @@ static void test_unifi_rewrite_in_config(void)
 	struct layout_config cfg;
 	ASSERT_EQ_I(parse(&cfg,
 		"GRID=1x2\n"
-		"door|rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp|1\n"
+		"door|rtsps://192.168.1.1:7441/EXAMPLEtoken1234?enableSrtp|1\n"
 		"yard|rtsp://cam/stream1|2\n"), 0);
 	/* default (tls): rtsps and port 7441 kept, only ?enableSrtp dropped */
 	ASSERT_EQ_I(cfg.unifi_mode, LAYOUT_UNIFI_MODE_TLS);
-	ASSERT(strcmp(cfg.cam[0].url, "rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m") == 0);
+	ASSERT(strcmp(cfg.cam[0].url, "rtsps://192.168.1.1:7441/EXAMPLEtoken1234") == 0);
 	ASSERT_EQ_I(cfg.cam[0].unifi, LAYOUT_UNIFI_KEPT_TLS);
 	ASSERT(!cfg.cam[0].unifi_rewritten);
 	ASSERT_EQ_I(cfg.cam[1].unifi, LAYOUT_UNIFI_NOT_UNIFI);
@@ -1179,10 +1179,10 @@ static void test_unifi_rewrite_in_config(void)
 	/* plain: the old rewrite to rtsp:7447 */
 	ASSERT_EQ_I(parse(&cfg,
 		"GRID=1x2\nUNIFI_REWRITE=plain\n"
-		"door|rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp|1\n"
+		"door|rtsps://192.168.1.1:7441/EXAMPLEtoken1234?enableSrtp|1\n"
 		"yard|rtsp://cam/stream1|2\n"), 0);
 	ASSERT_EQ_I(cfg.unifi_mode, LAYOUT_UNIFI_MODE_PLAIN);
-	ASSERT(strcmp(cfg.cam[0].url, "rtsp://192.168.1.1:7447/aB3dE5fG7hJ9kL1m") == 0);
+	ASSERT(strcmp(cfg.cam[0].url, "rtsp://192.168.1.1:7447/EXAMPLEtoken1234") == 0);
 	ASSERT_EQ_I(cfg.cam[0].unifi, LAYOUT_UNIFI_PLAIN);
 	ASSERT(cfg.cam[0].unifi_rewritten);
 	ASSERT(!cfg.cam[1].unifi_rewritten);
@@ -1190,18 +1190,18 @@ static void test_unifi_rewrite_in_config(void)
 	/* auto: alias for tls (Phase A configs keep working, now encrypted) */
 	ASSERT_EQ_I(parse(&cfg,
 		"GRID=1x1\nUNIFI_REWRITE=auto\n"
-		"door|rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp|1\n"), 0);
+		"door|rtsps://192.168.1.1:7441/EXAMPLEtoken1234?enableSrtp|1\n"), 0);
 	ASSERT_EQ_I(cfg.unifi_mode, LAYOUT_UNIFI_MODE_TLS);
-	ASSERT(strcmp(cfg.cam[0].url, "rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m") == 0);
+	ASSERT(strcmp(cfg.cam[0].url, "rtsps://192.168.1.1:7441/EXAMPLEtoken1234") == 0);
 
 	/* UNIFI_REWRITE=off keeps the URL unchanged, even when set after
 	 * the camera line */
 	ASSERT_EQ_I(parse(&cfg,
 		"GRID=1x1\n"
-		"door|rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp|1\n"
+		"door|rtsps://192.168.1.1:7441/EXAMPLEtoken1234?enableSrtp|1\n"
 		"UNIFI_REWRITE=off\n"), 0);
 	ASSERT_EQ_I(cfg.unifi_mode, LAYOUT_UNIFI_MODE_OFF);
-	ASSERT(strcmp(cfg.cam[0].url, "rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp") == 0);
+	ASSERT(strcmp(cfg.cam[0].url, "rtsps://192.168.1.1:7441/EXAMPLEtoken1234?enableSrtp") == 0);
 	ASSERT(!cfg.cam[0].unifi_rewritten);
 	ASSERT_EQ_I(cfg.cam[0].unifi, LAYOUT_UNIFI_OFF);
 
@@ -1305,7 +1305,7 @@ static void qa_test_unifi_rewrite_edges(void)
 	/* userinfo that itself looks like ":7441" must not confuse the port */
 	unifi("rtsps://u:7441@h:7441/T?enableSrtp", 1, "rtsp://u:7441@h:7447/T");
 	/* '@' inside the password (unencoded): the last '@' ends userinfo */
-	unifi("rtsps://u:p@ss@h:7441/T?enableSrtp", 1, "rtsp://u:p@ss@h:7447/T");
+	unifi("rtsps://u:ex@mple@h:7441/T?enableSrtp", 1, "rtsp://u:ex@mple@h:7447/T");
 	/* fragment survives, enableSrtp alone leaves no dangling '?' */
 	unifi("rtsps://h:7441/T?enableSrtp#x", 1, "rtsp://h:7447/T#x");
 	/* IPv6 with zone id */
@@ -1317,10 +1317,10 @@ static void qa_test_unifi_rewrite_edges(void)
 static void qa_test_mask_url_regular_passwords(void)
 {
 	char out[LAYOUT_URL_MAX];
-	layout_mask_url("rtsp://admin:p@ss@1.2.3.4/s", out, sizeof out);
-	ASSERT(!contains(out, "p@ss"));
-	layout_mask_url("rtsp://admin:p%2Fss@1.2.3.4/s", out, sizeof out);
-	ASSERT(!contains(out, "p%2Fss"));
+	layout_mask_url("rtsp://admin:ex@mple@1.2.3.4/s", out, sizeof out);
+	ASSERT(!contains(out, "ex@mple"));
+	layout_mask_url("rtsp://admin:ex%2Fample@1.2.3.4/s", out, sizeof out);
+	ASSERT(!contains(out, "ex%2Fample"));
 }
 
 /* Fixed (was a QA_KNOWN_BUGS test): layout.c mask_url_into ended the authority at the
@@ -1331,15 +1331,15 @@ static void qa_test_mask_url_password_with_slash_query_hash(void)
 {
 	char out[LAYOUT_URL_MAX];
 
-	layout_mask_url("rtsp://admin:pa/ss@1.2.3.4/stream", out, sizeof out);
-	ASSERT(!contains(out, "admin:pa"));
-	ASSERT(!contains(out, "ss@1.2.3.4"));
+	layout_mask_url("rtsp://admin:ex/ample@1.2.3.4/stream", out, sizeof out);
+	ASSERT(!contains(out, "admin:ex"));
+	ASSERT(!contains(out, "ample@1.2.3.4"));
 
-	layout_mask_url("rtsp://admin:pa?ss@1.2.3.4/s", out, sizeof out);
-	ASSERT(!contains(out, "admin:pa"));
+	layout_mask_url("rtsp://admin:ex?ample@1.2.3.4/s", out, sizeof out);
+	ASSERT(!contains(out, "admin:ex"));
 
-	layout_mask_url("rtsp://admin:pa#ss@1.2.3.4/s", out, sizeof out);
-	ASSERT(!contains(out, "admin:pa"));
+	layout_mask_url("rtsp://admin:ex#ample@1.2.3.4/s", out, sizeof out);
+	ASSERT(!contains(out, "admin:ex"));
 }
 
 /* Fixed (was a QA_KNOWN_BUGS test): layout.c url_char excludes ( ) ' " and space, so
@@ -1364,10 +1364,10 @@ static void qa_test_angle_brackets_in_password_not_echoed(void)
 {
 	static struct layout_config cfg;
 	char err[512];
-	int r = layout_parse(&cfg, "GRID=1x1\ncam|rtsp://admin:<S3cret>@h/s|1\n",
+	int r = layout_parse(&cfg, "GRID=1x1\ncam|rtsp://admin:<notreal>@h/s|1\n",
 			     NULL, NULL, err, sizeof err);
 	ASSERT_EQ_I(r, -1);
-	ASSERT(!contains(err, "S3cret"));
+	ASSERT(!contains(err, "notreal"));
 }
 
 /* ------------------------------------------- Phase A security review fixes */
@@ -1378,38 +1378,38 @@ static void test_mask_url_review_m1(void)
 	char out[LAYOUT_URL_MAX];
 
 	/* unencoded '/', '?', '#' in the password: masked completely */
-	expect_mask("rtsp://admin:pa/ss@1.2.3.4/stream", "rtsp://admin:***@1.2.3.4/stream");
-	expect_mask("rtsp://admin:pa?ss@1.2.3.4/s", "rtsp://admin:***@1.2.3.4/s");
-	expect_mask("rtsp://admin:pa#ss@1.2.3.4/s", "rtsp://admin:***@1.2.3.4/s");
+	expect_mask("rtsp://admin:ex/ample@1.2.3.4/stream", "rtsp://admin:***@1.2.3.4/stream");
+	expect_mask("rtsp://admin:ex?ample@1.2.3.4/s", "rtsp://admin:***@1.2.3.4/s");
+	expect_mask("rtsp://admin:ex#ample@1.2.3.4/s", "rtsp://admin:***@1.2.3.4/s");
 	expect_mask("rtsp://u:a/b@c@h/x", "rtsp://u:***@h/x");
-	expect_mask("rtsp://admin:pa/ss@1.2.3.4", "rtsp://admin:***@1.2.3.4");
+	expect_mask("rtsp://admin:ex/ample@1.2.3.4", "rtsp://admin:***@1.2.3.4");
 	/* an '@' in the path of a URL without a port/userinfo is still a path */
 	expect_mask("rtsp://host/a:b@c", "rtsp://host/a:b@c");
 	/* a numeric-looking password before an unencoded '/' */
 	expect_mask("rtsp://admin:12/34@h/x", "rtsp://admin:***@h/x");
 
 	/* userinfo without a colon */
-	expect_mask("rtsp://Secr3tTokenOnly@host/live", "rtsp://***@host/live");
+	expect_mask("rtsp://faketokenonly@host/live", "rtsp://***@host/live");
 
 	/* an authority cut short (no '@' reached, e.g. a truncated key in a
 	 * config warning): a non-numeric "port" is a password */
-	expect_mask("rtsp://admin:Secr3tPass", "rtsp://admin:***");
+	expect_mask("rtsp://admin:fakepwonly", "rtsp://admin:***");
 	expect_mask("rtsp://host:554/s", "rtsp://host:554/s");
 	expect_mask("rtsp://[fe80::1]:554/s", "rtsp://[fe80::1]:554/s");
 
 	/* XMEye: the whole segment carries '&' and '=' */
-	layout_mask_url("rtsp://h:554/user=admin&password=Secr3tPw&channel=1&stream=0.sdp",
+	layout_mask_url("rtsp://h:554/user=admin&password=examplepw&channel=1&stream=0.sdp",
 			out, sizeof out);
-	ASSERT(!contains(out, "Secr3tPw"));
-	expect_mask("rtsp://h:554/user=admin&password=Secr3tPw&channel=1&stream=0.sdp",
+	ASSERT(!contains(out, "examplepw"));
+	expect_mask("rtsp://h:554/user=admin&password=examplepw&channel=1&stream=0.sdp",
 		    "rtsp://h:554/***");
 	/* Foscam: ;param with a credential-like key */
-	layout_mask_url("rtsp://h:88/videoMain;user=admin;pwd=Secr3t", out, sizeof out);
-	ASSERT(!contains(out, "Secr3t"));
-	expect_mask("rtsp://h:88/videoMain;user=admin;pwd=Secr3t",
+	layout_mask_url("rtsp://h:88/videoMain;user=admin;pwd=notreal", out, sizeof out);
+	ASSERT(!contains(out, "notreal"));
+	expect_mask("rtsp://h:88/videoMain;user=admin;pwd=notreal",
 		    "rtsp://h:88/videoMain;user=admin;pwd=***");
 	/* single key=value segments; key match is case-insensitive */
-	expect_mask("rtsp://h/live/Password=hunter2/x", "rtsp://h/live/Password=***/x");
+	expect_mask("rtsp://h/live/Password=fakepw/x", "rtsp://h/live/Password=***/x");
 	expect_mask("rtsp://h/live/token=abc", "rtsp://h/live/token=***");
 	expect_mask("rtsp://h/s;AuthKey=zz;ch=1", "rtsp://h/s;AuthKey=***;ch=1");
 	expect_mask("rtsp://h/s;psw=1;sig=2;secret=3;cred=4;pas=5",
@@ -1424,9 +1424,9 @@ static void test_mask_text_review_m1(void)
 {
 	char out[512];
 
-	layout_mask_urls_in_text("open rtsp://admin:ab\"cd@host/x failed", out, sizeof out);
-	ASSERT(!contains(out, "ab\"cd"));
-	ASSERT(!contains(out, "cd@"));
+	layout_mask_urls_in_text("open rtsp://admin:ex\"ample@host/x failed", out, sizeof out);
+	ASSERT(!contains(out, "ex\"ample"));
+	ASSERT(!contains(out, "ample@"));
 	ASSERT(contains(out, "rtsp://admin:***@host/x failed"));
 
 	layout_mask_urls_in_text("cannot open rtsp://admin:p(1)@h/a: x", out, sizeof out);
@@ -1435,17 +1435,17 @@ static void test_mask_text_review_m1(void)
 	layout_mask_urls_in_text("cannot open rtsp://admin:it's@h/a: x", out, sizeof out);
 	ASSERT(strcmp(out, "cannot open rtsp://admin:***@h/a: x") == 0);
 
-	layout_mask_urls_in_text("err rtsp://admin:my secret pw@h/a, retrying", out, sizeof out);
-	ASSERT(!contains(out, "secret"));
+	layout_mask_urls_in_text("err rtsp://admin:my fake pw@h/a, retrying", out, sizeof out);
+	ASSERT(!contains(out, "fake"));
 	ASSERT(strcmp(out, "err rtsp://admin:***@h/a, retrying") == 0);
 
 	/* a password-less URL followed by unrelated text is left alone */
 	layout_mask_urls_in_text("open rtsp://host/x (user bob@home)", out, sizeof out);
 	ASSERT(strcmp(out, "open rtsp://host/x (user bob@home)") == 0);
 	/* a config warning about a key that was a URL */
-	layout_mask_urls_in_text("line 3: unknown key rtsp://ad:Secr3t@1.2.3.4/x, ignored",
+	layout_mask_urls_in_text("line 3: unknown key rtsp://ad:notreal@1.2.3.4/x, ignored",
 				 out, sizeof out);
-	ASSERT(!contains(out, "Secr3t"));
+	ASSERT(!contains(out, "notreal"));
 }
 
 /* L2 / placeholder echo: <...> only counts as a whole field or segment,
@@ -1463,15 +1463,15 @@ static void test_placeholder_whole_segment_only(void)
 	ASSERT(!layout_has_placeholder("x<y>"));
 
 	/* a real password with <...> inside is accepted ... */
-	ASSERT_EQ_I(parse(&cfg, "GRID=1x1\ncam|rtsp://admin:a<S3cret>b@h/s|1\n"), 0);
+	ASSERT_EQ_I(parse(&cfg, "GRID=1x1\ncam|rtsp://admin:a<notreal>b@h/s|1\n"), 0);
 	/* ... (with a warning about unencoded characters, without the URL) */
 	ASSERT(warnings >= 1);
-	ASSERT(!contains(last_warning, "S3cret"));
+	ASSERT(!contains(last_warning, "notreal"));
 	ASSERT(contains(last_warning, "camera cam"));
 
 	/* a whole-segment placeholder is an error that never echoes the URL */
-	ASSERT_EQ_I(parse(&cfg, "GRID=1x1\ncam|rtsp://admin:<S3cret>@h/s|1\n"), -1);
-	ASSERT(!contains(err, "S3cret"));
+	ASSERT_EQ_I(parse(&cfg, "GRID=1x1\ncam|rtsp://admin:<notreal>@h/s|1\n"), -1);
+	ASSERT(!contains(err, "notreal"));
 	ASSERT(contains(err, "line 2: placeholder in the URL of camera cam"));
 	ASSERT_EQ_I(parse(&cfg, "GRID=1x1\ncam|rtsp://admin:CHANGE_ME@10.1.2.3/s|1\n"), -1);
 	ASSERT(!contains(err, "10.1.2.3"));
@@ -1518,12 +1518,12 @@ static void unifi_mode(const char *in, enum layout_unifi_mode mode,
 
 static void test_unifi_modes(void)
 {
-	const char *u = "rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp";
+	const char *u = "rtsps://192.168.1.1:7441/EXAMPLEtoken1234?enableSrtp";
 
 	unifi_mode(u, LAYOUT_UNIFI_MODE_TLS, LAYOUT_UNIFI_KEPT_TLS,
-		   "rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m");
+		   "rtsps://192.168.1.1:7441/EXAMPLEtoken1234");
 	unifi_mode(u, LAYOUT_UNIFI_MODE_PLAIN, LAYOUT_UNIFI_PLAIN,
-		   "rtsp://192.168.1.1:7447/aB3dE5fG7hJ9kL1m");
+		   "rtsp://192.168.1.1:7447/EXAMPLEtoken1234");
 	unifi_mode(u, LAYOUT_UNIFI_MODE_OFF, LAYOUT_UNIFI_OFF, NULL);
 
 	/* tls: other query parameters and fragment survive, userinfo too */
@@ -1606,6 +1606,124 @@ static void test_tiles_fit(void)
 	/* grid mode always fits */
 	ASSERT_EQ_I(parse(&cfg, "GRID=2x2\nc|rtsp://h/s|4\n"), 0);
 	ASSERT(layout_tiles_fit(&cfg, 640, 480, NULL, NULL));
+}
+
+/* ------------------------------------------- QA final review (c4fb7e5)
+ *
+ * Readability guards: the stricter masking must keep common camera paths
+ * readable (only userinfo and the query are hidden). Pass on c4fb7e5. */
+static void qa_final_mask_keeps_camera_paths_readable(void)
+{
+	expect_mask("rtsp://admin:pw@192.168.1.64:554/Streaming/Channels/101",
+		    "rtsp://admin:***@192.168.1.64:554/Streaming/Channels/101");
+	expect_mask("rtsp://admin:pw@192.168.1.64/ISAPI/Streaming/channels/102",
+		    "rtsp://admin:***@192.168.1.64/ISAPI/Streaming/channels/102");
+	expect_mask("rtsp://admin:pw@192.168.1.20:554/h264Preview_01_sub",
+		    "rtsp://admin:***@192.168.1.20:554/h264Preview_01_sub");
+	expect_mask("rtsp://127.0.0.1:8554/front_door", "rtsp://127.0.0.1:8554/front_door");
+	expect_mask("rtsp://127.0.0.1:8554/backyard_camera_main_stream_hd",
+		    "rtsp://127.0.0.1:8554/backyard_camera_main_stream_hd");
+	expect_mask("rtsp://admin:pw@10.0.0.7:554/cam/realmonitor?channel=1&subtype=0",
+		    "rtsp://admin:***@10.0.0.7:554/cam/realmonitor?***");
+	expect_mask("rtsp://10.0.0.7:554/live/ch00_0", "rtsp://10.0.0.7:554/live/ch00_0");
+	expect_mask("rtsp://10.0.0.7:554/MediaInput/h264/stream_1",
+		    "rtsp://10.0.0.7:554/MediaInput/h264/stream_1");
+	expect_mask("rtsp://10.0.0.7/keyframe_stream", "rtsp://10.0.0.7/keyframe_stream");
+	expect_mask("rtsp://10.0.0.7/passage_cam", "rtsp://10.0.0.7/passage_cam");
+	expect_mask("rtsp://[fe80::1]:554/stream1", "rtsp://[fe80::1]:554/stream1");
+	expect_mask("rtsp://user:ex@mple@[fe80::1]:554/stream1", "rtsp://user:***@[fe80::1]:554/stream1");
+
+	/* An FFmpeg log prefix "[rtsp @ 0x...]" before a URL does not trigger
+	 * the "extend to the next '@'" rule. */
+	char out[512];
+	layout_mask_urls_in_text("[rtsp @ 0x5583c] rtsp://10.0.0.5:554/stream1: 404 Not Found",
+				 out, sizeof out);
+	ASSERT(contains(out, "rtsp://10.0.0.5:554/stream1: 404 Not Found"));
+}
+
+/* Fixed (was a QA_KNOWN_BUGS test): layout.c layout_mask_urls_in_text: a
+ * URL without a path (host:port only)
+ * followed later on the same line by any '@' is "extended" to that '@',
+ * swallowing the diagnostic text in between (false positive, readability). */
+static void qa_final_text_pathless_url_then_at_keeps_text(void)
+{
+	char out[512];
+	layout_mask_urls_in_text("cannot open rtsp://cam.local:554: Connection refused "
+				 "(see admin@example.com)", out, sizeof out);
+	ASSERT(contains(out, "Connection refused"));
+}
+
+/* Fixed (was a QA_KNOWN_BUGS test): layout.c layout_mask_urls_in_text: a
+ * password with BOTH an unencoded '/'
+ * and a space is cut at the space; the URL part has a '/' so the
+ * "extend to '@'" rule does not apply and the rest leaks. */
+static void qa_final_text_password_slash_and_space(void)
+{
+	char out[512];
+	layout_mask_urls_in_text("front: cannot open rtsp://admin:ex/am ple@h/s (401)", out,
+				 sizeof out);
+	ASSERT(!contains(out, "am ple"));
+	ASSERT(strcmp(out, "front: cannot open rtsp://admin:***@h/s (401)") == 0);
+}
+
+/* Guards for the two fixes above: a port is not a password, an IPv6 host
+ * has no userinfo, and a password that merely starts with digits is still
+ * masked. */
+static void test_mask_text_port_vs_password(void)
+{
+	char out[512];
+	layout_mask_urls_in_text("cannot open rtsp://cam.local:554: Connection refused "
+				 "(see admin@example.com)", out, sizeof out);
+	ASSERT(strcmp(out, "cannot open rtsp://cam.local:554: Connection refused "
+			   "(see admin@example.com)") == 0);
+	layout_mask_urls_in_text("open rtsp://h:554/s failed (bob@home)", out, sizeof out);
+	ASSERT(strcmp(out, "open rtsp://h:554/s failed (bob@home)") == 0);
+	layout_mask_urls_in_text("open rtsp://[fe80::1]:554/s failed (bob@home)", out, sizeof out);
+	ASSERT(strcmp(out, "open rtsp://[fe80::1]:554/s failed (bob@home)") == 0);
+	layout_mask_urls_in_text("err rtsp://admin:1234 5@h/a, retrying", out, sizeof out);
+	ASSERT(strcmp(out, "err rtsp://admin:***@h/a, retrying") == 0);
+	layout_mask_urls_in_text("[rtsp @ 0x55] rtsp://admin:a b/c d@h/x: 401", out, sizeof out);
+	ASSERT(strcmp(out, "[rtsp @ 0x55] rtsp://admin:***@h/x: 401") == 0);
+}
+
+/* A4: only rtsp://, rtsps:// (any case), file: and local paths are
+ * played; anything else is a config error with the line number. */
+static void test_url_scheme_whitelist(void)
+{
+	static struct layout_config cfg;
+	static const char *const ok[] = {
+		"rtsp://h/s", "RTSP://h/s", "rtsps://h:7441/T", "RtSpS://h/s",
+		"/home/pi/clip.mp4", "clips/cam1.mp4", "./cam:1.mp4", "file:///home/pi/a.mp4",
+		"FILE:/home/pi/a.mp4", "file:a.mp4",
+	};
+	static const char *const bad[] = {
+		"http://h/s.mjpg", "https://h/s", "rtmp://h/live", "udp://239.0.0.1:1234",
+		"tcp://h:554", "srt://h:9000", "HTTP://h/s", "rtp://h:5004", "pipe:0",
+		"concat:a.mp4|b.mp4", "subfile:,start,0,end,0,:/etc/shadow", "rtsp:/h/s",
+	};
+	char text[256];
+	for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++) {
+		snprintf(text, sizeof text, "GRID=1x1\ncam|%s|1\n", ok[i]);
+		if (parse(&cfg, text) != 0) {
+			fprintf(stderr, "rejected %s: %s\n", ok[i], err);
+			ASSERT(0);
+		}
+	}
+	for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+		if (strchr(bad[i], '|'))
+			continue;             /* '|' would split the line */
+		snprintf(text, sizeof text, "GRID=1x1\n\ncam|%s|1\n", bad[i]);
+		ASSERT_EQ_I(parse(&cfg, text), -1);
+		if (!contains(err, "line 3: ") ||
+		    !contains(err, "only rtsp://, rtsps:// URLs or local video files are supported")) {
+			fprintf(stderr, "accepted or wrong error for %s: \"%s\"\n", bad[i], err);
+			ASSERT(0);
+		}
+	}
+	/* the URL is not echoed (it may hold a password) */
+	ASSERT_EQ_I(parse(&cfg, "GRID=1x1\ncam|http://admin:examplepw@h/s|1\n"), -1);
+	ASSERT(!contains(err, "examplepw"));
+	ASSERT(contains(err, "camera cam"));
 }
 
 int main(void)
@@ -1701,6 +1819,14 @@ int main(void)
 	test_unifi_modes();
 	test_notify_sockaddr_abstract_max();
 	test_tiles_fit();
+
+	test_url_scheme_whitelist();
+
+	/* QA final review (c4fb7e5) */
+	qa_final_mask_keeps_camera_paths_readable();
+	qa_final_text_pathless_url_then_at_keeps_text();
+	qa_final_text_password_slash_and_space();
+	test_mask_text_port_vs_password();
 
 	return test_summary("test_layout");
 }

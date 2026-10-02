@@ -383,14 +383,14 @@ static void test_report_masking(void)
 	/* Fixture: config excerpt, journal lines and a sudo log line, each
 	 * carrying a secret that must not survive into the report. */
 	const char *fixture =
-		"front|rtsp://admin:hunter2pass@192.168.1.10:554/stream1|1\n"
-		"unifi|rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp|2\n"
+		"front|rtsp://admin:examplepw@192.168.1.10:554/stream1|1\n"
+		"unifi|rtsps://192.168.1.1:7441/EXAMPLEtoken1234?enableSrtp|2\n"
 		"[12:00:01] ffmpeg: [rtsp @ 0x55] method DESCRIBE failed: 401 Unauthorized "
-		"(rtsp://viewer:s3cr%40t@10.0.0.7/Streaming/Channels/102)\n"
+		"(rtsp://viewer:ex%40ample@10.0.0.7/Streaming/Channels/102)\n"
 		"Oct 02 12:00:00 pi sudo[812]:     pi : TTY=pts/0 ; PWD=/home/pi ; USER=root ; "
-		"COMMAND=/usr/bin/rtspwall probe rtsp://root:Tr0ub4dor@cam.local/h264Preview_01_sub\n"
-		"camera 2: plain rtsp://10.0.0.9:7447/Zx9Yw8Vu7Ts6Rq5P\n"
-		"cgi: password=hunter3 token=QwErTy123 user=bob\n"
+		"COMMAND=/usr/bin/rtspwall probe rtsp://root:notreal@cam.local/h264Preview_01_sub\n"
+		"camera 2: plain rtsp://10.0.0.9:7447/NOTrealToken5678\n"
+		"cgi: password=fakepw token=faketoken user=bob\n"
 		"evil \x1b[2J escape\n";
 	struct report_buf r;
 
@@ -400,8 +400,8 @@ static void test_report_masking(void)
 	ASSERT(!r.oom);
 	ASSERT(r.data != NULL);
 
-	const char *secrets[] = { "hunter2pass", "aB3dE5fG7hJ9kL1m", "enableSrtp", "s3cr",
-				  "Tr0ub4dor", "Zx9Yw8Vu7Ts6Rq5P", "hunter3", "QwErTy123", "\x1b" };
+	const char *secrets[] = { "examplepw", "EXAMPLEtoken1234", "enableSrtp", "ex%40",
+				  "notreal", "NOTrealToken5678", "fakepw", "faketoken", "\x1b" };
 	for (size_t i = 0; i < sizeof secrets / sizeof secrets[0]; i++) {
 		if (strstr(r.data, secrets[i])) {
 			fprintf(stderr, "secret %zu leaked:\n%s\n", i, r.data);
@@ -426,10 +426,10 @@ static void test_report_masking(void)
 			for (int off = 4060; off <= 4090; off += 3) {
 				memset(big, 'x', (size_t)off);
 				big[off - 1] = ' ';
-				strcpy(big + off, "rtsp://admin:LongLinePw@10.1.1.1/stream1 tail\n");
+				strcpy(big + off, "rtsp://admin:fakelongpw@10.1.1.1/stream1 tail\n");
 				report_init(&r);
 				report_append_masked(&r, big);
-				ASSERT(r.data && strstr(r.data, "LongLinePw") == NULL);
+				ASSERT(r.data && strstr(r.data, "fakelongpw") == NULL);
 				report_free(&r);
 			}
 			free(big);
@@ -703,7 +703,7 @@ static void test_url_secret(void)
 	ASSERT(url_secret_reason("rtsp://admin@10.0.0.5/x") != NULL);
 	ASSERT(url_secret_reason("rtsp://10.0.0.5/cam/realmonitor?channel=1") != NULL);
 	ASSERT(url_secret_reason("rtsp://10.0.0.5/x#frag") != NULL);
-	ASSERT(url_secret_reason("rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m") != NULL);
+	ASSERT(url_secret_reason("rtsps://192.168.1.1:7441/EXAMPLEtoken1234") != NULL);
 	ASSERT(url_secret_reason("rtsp://10.0.0.5/0123456789abcdef0123456789abcdef") != NULL);
 }
 
@@ -724,6 +724,21 @@ static void test_report_mask_more_keys(void)
 	}
 	report_mask_line("user=bob signal=11 path=/x", out, sizeof out);
 	ASSERT(strcmp(out, "user=bob signal=11 path=/x") == 0);
+}
+
+/* B2: add only credits the watcher with a restart when the unit's
+ * InvocationID really changed. */
+static void test_unit_restarted(void)
+{
+	ASSERT(unit_restarted("aaaa", "bbbb"));
+	ASSERT(unit_restarted("", "bbbb"));             /* first start */
+	ASSERT(unit_restarted("aaaa\n", "bbbb\n"));
+	ASSERT(!unit_restarted("aaaa", "aaaa"));        /* watcher refused or was blocked */
+	ASSERT(!unit_restarted("aaaa\n", "aaaa"));      /* trailing newline ignored */
+	ASSERT(!unit_restarted("", ""));
+	ASSERT(!unit_restarted("aaaa", ""));            /* stopped: not a restart */
+	ASSERT(!unit_restarted(NULL, "bbbb"));          /* unknown before: do not guess */
+	ASSERT(!unit_restarted("aaaa", NULL));
 }
 
 int main(void)
@@ -753,5 +768,6 @@ int main(void)
 	test_configtxt_variants();
 	test_url_secret();
 	test_report_mask_more_keys();
+	test_unit_restarted();
 	return test_summary("test_clilogic");
 }

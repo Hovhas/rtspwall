@@ -389,28 +389,40 @@ int64_t pacing_backoff_ms(enum pacing_fault f, unsigned attempt);
  * restart (refused x N, then 404 while the stream path is not ready yet)
  * would hand the 404 attempt N+1 and wait 60 s.
  *
- * Once the camera has delivered video in this process (mark_live), 401
- * and 404 count as transient: the credentials and the path were right
- * before, so the server is most likely still starting. */
+ * Right after the camera has delivered video (mark_live), 401 and 404
+ * count as transient: the credentials and the path were right before, so
+ * the server is most likely still starting. That grace is bounded: only
+ * the first PACING_LIVE_GRACE_ATTEMPTS 401/404 attempts and only within
+ * PACING_LIVE_GRACE_US of the moment the camera was last live, whichever
+ * ends first. After that a password or path changed for good backs off
+ * like any deterministic fault (up to 60 s). */
+#define PACING_LIVE_GRACE_ATTEMPTS 10
+#define PACING_LIVE_GRACE_US       (120 * 1000000LL)
+
 struct pacing_backoff {
-	enum pacing_fault last;     /* fault of the previous failed attempt */
-	unsigned          failures; /* failed attempts in a row with `last` */
-	unsigned          total;    /* failed attempts in a row, any fault */
-	bool              was_live; /* delivered video at least once */
+	enum pacing_fault last;       /* fault of the previous failed attempt */
+	unsigned          failures;   /* failed attempts in a row with `last` */
+	unsigned          total;      /* failed attempts in a row, any fault */
+	unsigned          since_live; /* 401/404 attempts since mark_live */
+	bool              was_live;   /* delivered video at least once */
+	int64_t           live_us;    /* when it was last live (mark_live) */
 };
 
 void pacing_backoff_init(struct pacing_backoff *b);
-/* The camera delivered video (sticky for the life of the process). */
-void pacing_backoff_mark_live(struct pacing_backoff *b);
+/* The camera delivered video until now_us (monotonic, us): starts a new
+ * 401/404 grace. */
+void pacing_backoff_mark_live(struct pacing_backoff *b, int64_t now_us);
 /* A healthy period ended the run of failures (keeps was_live). */
 void pacing_backoff_reset(struct pacing_backoff *b);
-/* Records a failed attempt with fault f and returns the delay before the
- * next one. */
-int64_t pacing_backoff_next(struct pacing_backoff *b, enum pacing_fault f);
+/* Records a failed attempt with fault f at now_us and returns the delay
+ * before the next one. */
+int64_t pacing_backoff_next(struct pacing_backoff *b, enum pacing_fault f, int64_t now_us);
 /* Failed attempts in a row, whatever the fault (for "after N attempts"). */
 unsigned pacing_backoff_total(const struct pacing_backoff *b);
-/* pacing_fault_is_deterministic, except 401/404 after the camera was live. */
-bool pacing_backoff_is_deterministic(const struct pacing_backoff *b, enum pacing_fault f);
+/* pacing_fault_is_deterministic, except 401/404 during the grace after
+ * the camera was live (for the next attempt at now_us). */
+bool pacing_backoff_is_deterministic(const struct pacing_backoff *b, enum pacing_fault f,
+				     int64_t now_us);
 
 /* ------------------------------------------------------------ log collapse
  *

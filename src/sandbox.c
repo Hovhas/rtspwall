@@ -28,6 +28,7 @@
 #define FD_JOB        4           /* child: the job's fd */
 #define MAX_JOBS      64
 #define MAX_OUT       (64 * 1024)
+#define REAP_GRACE_MS 250         /* exit time for a child that sent EOF */
 
 const struct sandbox_user *sandbox_user(void)
 {
@@ -70,7 +71,9 @@ const char *sandbox_status_text(enum sandbox_status s)
 
 int sandbox_drop(const struct sandbox_user *u)
 {
-	if (u->uid == 0)
+	/* Neither root's uid nor its group: gid 0 still opens root:root 0640
+	 * files and devices. */
+	if (u->uid == 0 || u->gid == 0)
 		return -1;
 	if (setgroups(1, &u->gid) < 0 || setresgid(u->gid, u->gid, u->gid) < 0 ||
 	    setresuid(u->uid, u->uid, u->uid) < 0)
@@ -129,6 +132,9 @@ static void write_all(int fd, const void *buf, size_t len)
 
 static void child(struct sandbox_job *j, int result_fd, const struct sandbox_user *u)
 {
+	/* Own process group, so the parent can kill whatever the job started
+	 * along with it (kill(-pid)). The parent sets it too (no race). */
+	setpgid(0, 0);
 	static const int dfl[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP, SIGCHLD };
 	for (size_t i = 0; i < sizeof dfl / sizeof dfl[0]; i++)
 		signal(dfl[i], SIG_DFL);
@@ -205,6 +211,7 @@ void sandbox_run(struct sandbox_job *jobs, int n, int timeout_ms)
 			close(p[0]);
 			child(j, p[1], u);
 		}
+		setpgid(pid, pid);
 		close(p[1]);
 		j->pid = pid;
 		rfd[i] = p[0];
@@ -251,15 +258,42 @@ void sandbox_run(struct sandbox_job *jobs, int n, int timeout_ms)
 		}
 	}
 
+	/* Reap. A child that closed its result pipe but keeps running (or a
+	 * grandchild holding it open) must not block us: wait without blocking
+	 * until the deadline (plus a short grace for a child that is just
+	 * exiting), then kill its whole process group. The group is killed
+	 * while the child is still a zombie (WNOWAIT), so its pid - and with it
+	 * the group id - cannot have been reused yet. */
+	int64_t reap_deadline = deadline + REAP_GRACE_MS;
 	for (int i = 0; i < n; i++) {
 		struct sandbox_job *j = &jobs[i];
 		if (j->pid <= 0)
 			continue;
 		bool timed_out = rfd[i] >= 0;
 		if (timed_out) {
+			kill(-j->pid, SIGKILL);
 			kill(j->pid, SIGKILL);
 			close(rfd[i]);
+			rfd[i] = -1;
 		}
+		bool killed = timed_out;
+		for (;;) {
+			siginfo_t si;
+			si.si_pid = 0;
+			int w = waitid(P_PID, (id_t)j->pid, &si, WEXITED | WNOHANG | WNOWAIT);
+			if (w < 0 && errno == EINTR)
+				continue;
+			if (w < 0 || si.si_pid == j->pid)
+				break;                       /* exited (zombie), or gone */
+			if (!killed && mono_ms() >= reap_deadline) {
+				timed_out = killed = true;   /* then wait for the SIGKILL */
+				kill(-j->pid, SIGKILL);
+				kill(j->pid, SIGKILL);
+			}
+			struct timespec ts = { 0, 10 * 1000000L };
+			nanosleep(&ts, NULL);
+		}
+		kill(-j->pid, SIGKILL);              /* leftover grandchildren */
 		int st = 0;
 		while (waitpid(j->pid, &st, 0) < 0 && errno == EINTR)
 			;

@@ -1,0 +1,10 @@
+# ggshield / GitGuardian configuration.
+#
+# The unit tests in src/test_*.c contain deliberately fake credentials
+# (e.g. rtsp://admin:examplepw@..., pwd=notreal) to exercise the URL and
+# log-line masking code. They are not real secrets; keep them obvious
+# placeholders and ignore these files in secret scanning.
+version: 2
+secret:
+  ignored_paths:
+    - "src/test_*.c"

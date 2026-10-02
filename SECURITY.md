@@ -77,6 +77,23 @@ The binary is built hardened: position-independent code (PIE), stack protector, 
 
 More options are documented, switched off, in `systemd/rtspwall.service`. They can break video, so enable them one at a time and check the picture.
 
+## The probe sandbox
+
+`sudo rtspwall probe`, `add` and `doctor` read data from cameras, and that data may be hostile. They never parse it as root. Each probe runs in its own child process, and the parent checks the result before it uses it. The child:
+
+- drops root and runs as the system user `rtspwall` (or `nobody` if that user does not exist, with a note)
+- keeps only that user's primary group, not `video` or `render`
+- sets `no_new_privs` and turns off core dumps
+- lets FFmpeg open only what it needs: protocols `rtsp`, `rtsps`, `tcp`, `udp`, `tls`, `rtp`, `srtp` and `crypto`; formats `rtsp`, `sdp` and `rtp`; codec `h264`
+
+**If dropping privileges fails, the probe does not run.** The result says "not probing as root".
+
+**Trade-off.** The child has the same rights as the service. A compromised probe could read `/etc/rtspwall/cameras.conf` (`0640`, `root:rtspwall`) and send signals to the service. That is the same damage as a compromised service, but it is never root.
+
+The service uses the same FFmpeg whitelists.
+
+**Supported sources.** Only `rtsp://`, `rtsps://` and local video files. Any other scheme (http, rtmp, udp, ...) is rejected by `--check-config` and at startup with the line number.
+
 ## Verifying a release
 
 Each release publishes `SHA256SUMS` and build-provenance attestations next to the packages. Download the package and `SHA256SUMS` from the [Releases page](https://github.com/Hovhas/rtspwall/releases) into one folder, then check:

@@ -938,7 +938,7 @@ retry:
 		int64_t now = monotonic_us();
 		bool was_healthy = k->live_since_us && now - k->live_since_us >= 10 * 1000000LL;
 		if (k->live_since_us)
-			pacing_backoff_mark_live(&backoff);   /* 401/404 transient from now on */
+			pacing_backoff_mark_live(&backoff, now);   /* 401/404 grace starts */
 		if (k->live_since_us && now - k->live_since_us >= 60 * 1000000LL)
 			pacing_dedup_reset(&k->logdd);
 		k->live_since_us = 0;
@@ -953,7 +953,7 @@ retry:
 			log_fault(k, fault, what, 0);
 			continue;
 		}
-		int64_t delay_ms = pacing_backoff_next(&backoff, fault);
+		int64_t delay_ms = pacing_backoff_next(&backoff, fault, now);
 		log_fault(k, fault, what, delay_ms);
 		for (int64_t waited = 0; waited < delay_ms && !quit; waited += 100)
 			usleep(100000);

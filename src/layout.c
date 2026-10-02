@@ -423,6 +423,27 @@ static bool pipe_in_password(const struct config_fields *f)
  * cameras accept some of them anyway, so this is only a warning. */
 #define URL_UNSAFE_CHARS "\"'<>{}\\^`"
 
+/* What the wall can play: rtsp:// and rtsps:// (any case), or a local file
+ * (a path, or file:). Anything with another "scheme:" prefix - http, rtmp,
+ * udp, but also FFmpeg pseudo-protocols such as pipe: or concat: - is
+ * refused. A scheme is at least 2 characters (RFC 3986 letters, digits,
+ * + - .), so "./a:b.mp4" and "/x" stay paths. */
+static bool url_scheme_supported(const char *url)
+{
+	size_t n = 0;
+	if (!isalpha((unsigned char)url[0]))
+		return true;                         /* a path */
+	while (isalnum((unsigned char)url[n]) || url[n] == '+' || url[n] == '-' || url[n] == '.')
+		n++;
+	if (url[n] != ':' || n < 2)
+		return true;                         /* a relative path */
+	if (n == 4 && strncasecmp(url, "file", 4) == 0)
+		return true;
+	return ((n == 4 && strncasecmp(url, "rtsp", 4) == 0) ||
+		(n == 5 && strncasecmp(url, "rtsps", 5) == 0)) &&
+	       strncmp(url + n, "://", 3) == 0;
+}
+
 static void warn_unsafe_url_chars(const char *url, const char *name, int line,
 				  layout_warn_fn warn, void *ctx)
 {
@@ -490,6 +511,13 @@ static int handle_camera(struct layout_config *cfg, const struct config_fields *
 			"placeholder in the URL of camera %s (%s) - replace it with the real "
 			"value (user, password, address or stream path)", f->field[0],
 			strncasecmp(ph, "CHANGE_ME", 9) == 0 ? "CHANGE_ME" : "a <...> field");
+		return -1;
+	}
+	if (!url_scheme_supported(f->field[1])) {
+		/* Not echoed either: the URL may carry a password. */
+		set_err(err, errlen, line,
+			"unsupported URL for camera %s: only rtsp://, rtsps:// URLs or local "
+			"video files are supported", f->field[0]);
 		return -1;
 	}
 	for (int i = 2; i < f->count; i++)
@@ -1033,6 +1061,38 @@ static bool scheme_char(char c)
 	return isalnum((unsigned char)c) || c == '+' || c == '-' || c == '.';
 }
 
+/* layout_mask_urls_in_text: does the run [a, stop) after "://" look like
+ * a URL cut short inside its password? That is: no '@' yet, and the
+ * authority (up to the first '/') is "user:something" where "something"
+ * is not a port. A port (1-5 digits) is "host:port": then the cut is
+ * real when a '/' follows ("rtsp://h:554/s (bob@home)") or sentence
+ * punctuation ends the run ("rtsp://h:554: refused (admin@x)"); only a
+ * bare "x:1234" followed by a space may be the start of a password. An
+ * IPv6 host "[...]" has no userinfo without '@'. */
+static bool cut_inside_password(const char *a, const char *stop)
+{
+	if (a >= stop || *a == '[' || memchr(a, '@', (size_t)(stop - a)))
+		return false;
+	const char *slash = memchr(a, '/', (size_t)(stop - a));
+	const char *auth_end = slash ? slash : stop;
+	const char *colon = memchr(a, ':', (size_t)(auth_end - a));
+	if (!colon)
+		return false;
+	const char *port = colon + 1, *pend = auth_end;
+	bool punct = false;
+	if (!slash)
+		while (pend > port && strchr(":,.;!?", pend[-1])) {
+			pend--;
+			punct = true;
+		}
+	bool digits = pend > port && pend - port <= 5;
+	for (const char *q = port; digits && q < pend; q++)
+		digits = isdigit((unsigned char)*q);
+	if (!digits)
+		return true;
+	return !slash && !punct;
+}
+
 void layout_mask_urls_in_text(const char *in, char *out, size_t outlen)
 {
 	struct sbuf b = { out, 0, outlen, false };
@@ -1059,24 +1119,16 @@ void layout_mask_urls_in_text(const char *in, char *out, size_t outlen)
 			stop++;
 
 		/* ... unless that cut a password with ( ) ' " or a space in it:
-		 * a ':' but no '@' or '/' so far, and an '@' later on the line.
-		 * Then the URL runs on past that '@'. */
-		{
-			bool colon = false, at = false, slash = false;
-			for (const char *q = sep + 3; q < stop; q++) {
-				colon |= *q == ':';
-				at |= *q == '@';
-				slash |= *q == '/';
-			}
-			if (colon && !at && !slash && *stop) {
-				const char *a = stop;
-				while (*a && *a != '\n' && *a != '@')
-					a++;
-				if (*a == '@') {
-					stop = a + 1;
-					while (url_char(*stop))
-						stop++;
-				}
+		 * "user:pass" before any '/', no '@' so far, and an '@' later on
+		 * the line. Then the URL runs on past that '@'. */
+		if (*stop && cut_inside_password(sep + 3, stop)) {
+			const char *a = stop;
+			while (*a && *a != '\n' && *a != '@')
+				a++;
+			if (*a == '@') {
+				stop = a + 1;
+				while (url_char(*stop))
+					stop++;
 			}
 		}
 

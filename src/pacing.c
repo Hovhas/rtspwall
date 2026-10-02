@@ -464,9 +464,11 @@ void pacing_backoff_init(struct pacing_backoff *b)
 	b->last = PACING_FAULT_NONE;
 }
 
-void pacing_backoff_mark_live(struct pacing_backoff *b)
+void pacing_backoff_mark_live(struct pacing_backoff *b, int64_t now_us)
 {
 	b->was_live = true;
+	b->live_us = now_us;
+	b->since_live = 0;
 }
 
 void pacing_backoff_reset(struct pacing_backoff *b)
@@ -476,15 +478,23 @@ void pacing_backoff_reset(struct pacing_backoff *b)
 	b->total = 0;
 }
 
-bool pacing_backoff_is_deterministic(const struct pacing_backoff *b, enum pacing_fault f)
+bool pacing_backoff_is_deterministic(const struct pacing_backoff *b, enum pacing_fault f,
+				     int64_t now_us)
 {
-	if (b->was_live && (f == PACING_FAULT_UNAUTHORIZED || f == PACING_FAULT_NOT_FOUND))
+	if (b->was_live && (f == PACING_FAULT_UNAUTHORIZED || f == PACING_FAULT_NOT_FOUND) &&
+	    b->since_live < PACING_LIVE_GRACE_ATTEMPTS && now_us - b->live_us < PACING_LIVE_GRACE_US)
 		return false;
 	return pacing_fault_is_deterministic(f);
 }
 
-int64_t pacing_backoff_next(struct pacing_backoff *b, enum pacing_fault f)
+int64_t pacing_backoff_next(struct pacing_backoff *b, enum pacing_fault f, int64_t now_us)
 {
+	/* the grace is judged on the attempts before this one; only 401/404
+	 * use it up (an NVR restarting refuses connections first) */
+	bool det = pacing_backoff_is_deterministic(b, f, now_us);
+	if ((f == PACING_FAULT_UNAUTHORIZED || f == PACING_FAULT_NOT_FOUND) &&
+	    b->since_live < UINT_MAX)
+		b->since_live++;
 	if (f != b->last) {
 		b->last = f;
 		b->failures = 0;
@@ -494,8 +504,7 @@ int64_t pacing_backoff_next(struct pacing_backoff *b, enum pacing_fault f)
 	if (b->total < UINT_MAX)
 		b->total++;
 	/* PACING_FAULT_OTHER follows the transient schedule */
-	return pacing_backoff_ms(pacing_backoff_is_deterministic(b, f) ? f : PACING_FAULT_OTHER,
-				 b->failures);
+	return pacing_backoff_ms(det ? f : PACING_FAULT_OTHER, b->failures);
 }
 
 unsigned pacing_backoff_total(const struct pacing_backoff *b)

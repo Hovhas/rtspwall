@@ -1079,30 +1079,30 @@ static void test_backoff_class_change_resets(void)
 	pacing_backoff_init(&b);
 
 	for (int i = 0; i < 10; i++)
-		pacing_backoff_next(&b, PACING_FAULT_REFUSED);
+		pacing_backoff_next(&b, PACING_FAULT_REFUSED, 0);
 	ASSERT_EQ_I(pacing_backoff_total(&b), 10);
 	/* never live: 404 is deterministic, but its first attempt */
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 5000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 10000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 20000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, 0), 5000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, 0), 10000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, 0), 20000);
 	/* back to a transient fault: fast again */
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_REFUSED), 2000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_REFUSED, 0), 2000);
 	ASSERT_EQ_I(pacing_backoff_total(&b), 14);
 
 	/* the same deterministic fault keeps growing to 60 s */
 	pacing_backoff_init(&b);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 5000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 10000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 20000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 40000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 60000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 60000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED, 0), 5000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED, 0), 10000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED, 0), 20000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED, 0), 40000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED, 0), 60000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED, 0), 60000);
 
 	/* a healthy period forgets the run, not that the camera was live */
-	pacing_backoff_mark_live(&b);
+	pacing_backoff_mark_live(&b, 0);
 	pacing_backoff_reset(&b);
 	ASSERT_EQ_I(pacing_backoff_total(&b), 0);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_REFUSED), 2000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_REFUSED, 0), 2000);
 }
 
 /* Backoff item 4: once a camera has been live in this process, 401 and
@@ -1112,25 +1112,25 @@ static void test_backoff_auth_404_transient_after_live(void)
 {
 	struct pacing_backoff b;
 	pacing_backoff_init(&b);
-	pacing_backoff_mark_live(&b);
+	pacing_backoff_mark_live(&b, 0);
 
 	for (int i = 0; i < 10; i++)
-		pacing_backoff_next(&b, PACING_FAULT_REFUSED);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 2000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 3000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 4000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 5000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 5000);
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 2000);
-	ASSERT(!pacing_backoff_is_deterministic(&b, PACING_FAULT_UNAUTHORIZED));
-	ASSERT(!pacing_backoff_is_deterministic(&b, PACING_FAULT_NOT_FOUND));
-	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_FORBIDDEN));
-	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_CODEC));
-	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_FORBIDDEN), 5000);
+		pacing_backoff_next(&b, PACING_FAULT_REFUSED, 0);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, 0), 2000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, 0), 3000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, 0), 4000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, 0), 5000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, 0), 5000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED, 0), 2000);
+	ASSERT(!pacing_backoff_is_deterministic(&b, PACING_FAULT_UNAUTHORIZED, 0));
+	ASSERT(!pacing_backoff_is_deterministic(&b, PACING_FAULT_NOT_FOUND, 0));
+	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_FORBIDDEN, 0));
+	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_CODEC, 0));
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_FORBIDDEN, 0), 5000);
 
 	/* never live: 401 stays deterministic */
 	pacing_backoff_init(&b);
-	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_UNAUTHORIZED));
+	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_UNAUTHORIZED, 0));
 }
 
 /* B-frames: steps back within the reorder window are not new series, a
@@ -1144,6 +1144,61 @@ static void test_pts_classify_reorder_window(void)
 	ASSERT_EQ_I(pacing_pts_classify(1600000, 1200000), PACING_PTS_OK);
 	/* the loop of a 10 s clip */
 	ASSERT_EQ_I(pacing_pts_classify(9960000, 0), PACING_PTS_BACKWARDS);
+}
+
+
+/* A9: "was live" does not make 401/404 transient forever. A password
+ * changed for good on the camera: fast retries for the first attempts
+ * after the camera was last live (an NVR restarting), then at most one
+ * attempt a minute. */
+static void test_backoff_live_grace_is_bounded(void)
+{
+	struct pacing_backoff b;
+	const int64_t s = 1000000;     /* us */
+
+	/* attempt limit: transient for PACING_LIVE_GRACE_ATTEMPTS attempts */
+	pacing_backoff_init(&b);
+	pacing_backoff_mark_live(&b, 1000 * s);
+	int64_t t = 1000 * s;
+	unsigned fast = 0;
+	for (int i = 0; i < PACING_LIVE_GRACE_ATTEMPTS; i++) {
+		int64_t d = pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED, t);
+		ASSERT(d <= 5000);
+		fast++;
+		t += d * 1000 + 100000;
+	}
+	ASSERT_EQ_I(fast, PACING_LIVE_GRACE_ATTEMPTS);
+	ASSERT(t - 1000 * s < PACING_LIVE_GRACE_US);   /* the attempt limit came first */
+	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_UNAUTHORIZED, t));
+	/* afterwards: <= 1 attempt per minute, for an hour */
+	int64_t start = t;
+	unsigned attempts = 0;
+	while (t - start < 3600 * s) {
+		int64_t d = pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED, t);
+		ASSERT_EQ_I(d, 60000);
+		attempts++;
+		t += d * 1000;
+	}
+	ASSERT(attempts <= 60);
+
+	/* time limit: slow connects (10 s timeouts) reach 2 min first */
+	pacing_backoff_init(&b);
+	pacing_backoff_mark_live(&b, 0);
+	t = 0;
+	int n = 0;
+	while (t < PACING_LIVE_GRACE_US) {
+		ASSERT(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, t) <= 5000);
+		t += 15 * s;
+		n++;
+	}
+	ASSERT(n < PACING_LIVE_GRACE_ATTEMPTS);
+	ASSERT(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, t) > 5000);
+	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_NOT_FOUND, t));
+
+	/* live again: a fresh grace */
+	pacing_backoff_mark_live(&b, t);
+	ASSERT(!pacing_backoff_is_deterministic(&b, PACING_FAULT_NOT_FOUND, t));
+	ASSERT(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND, t) <= 5000);
 }
 
 int main(void)
@@ -1213,6 +1268,7 @@ int main(void)
 	/* Phase A review fixes */
 	test_backoff_class_change_resets();
 	test_backoff_auth_404_transient_after_live();
+	test_backoff_live_grace_is_bounded();
 	test_pts_classify_reorder_window();
 
 	return test_summary("test_pacing");

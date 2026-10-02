@@ -586,7 +586,11 @@ enum budget_verdict probe_print_one(const char *url, const struct probe_result *
 	enum budget_verdict v = probe_result_verdict(r, masked, hint, sizeof hint);
 
 	if (r->err != PROBE_OK) {
-		printf("error:    %s: %s\n", probe_error_label(r->err), r->detail);
+		/* PROBE_ERR_OTHER's label is "error" itself: no "error: error:" */
+		if (r->err == PROBE_ERR_OTHER)
+			printf("error:    %s\n", r->detail[0] ? r->detail : "unknown error");
+		else
+			printf("error:    %s: %s\n", probe_error_label(r->err), r->detail);
 	} else {
 		describe_codec(r, codec, sizeof codec);
 		printf("codec:    %s\n", codec);
