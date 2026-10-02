@@ -58,6 +58,10 @@ Phase-locked loop. A small correction loop that keeps frame timing even. rtspwal
 
 Real Time Streaming Protocol. The way most IP cameras offer live video, with URLs like `rtsp://192.168.1.10:554/stream1`.
 
+## RTSPS
+
+RTSP inside an encrypted (TLS) connection, with URLs like `rtsps://192.168.1.10:7441/TOKEN`. UniFi Protect uses it. rtspwall keeps it by default. FFmpeg does not check the camera's certificate, so it hides the video from someone who only listens, not from someone who pretends to be the camera ([details](../SECURITY.md#the-unifi-tls-trade-off)).
+
 ## Sub-stream
 
 A camera's second, smaller video stream, made for live viewing. Use it for a wall. It uses far less of the decoder than the full-size main stream and looks the same in a small tile.

@@ -6,6 +6,10 @@ rtspwall needs an **H.264** stream of at most 1920x1920 pixels. Use the camera's
 
 Always check a URL before you add it. `sudo rtspwall probe` asks for the URL at a hidden prompt, reads the codec, size and frame rate, and tells you if it fits.
 
+- **Keep the URL off the command line.** `probe` refuses a URL that contains a password, a query string or a token when you give it as an argument. A command line is saved in your shell history, shows up in `ps` and is logged by `sudo`. Use the hidden prompt, or read the URL from a file with `sudo rtspwall probe - < url.txt`. The flag `--insecure-argv` allows it anyway. Do not use it.
+- **Run it with `sudo`.** As root, `probe` reads the stream in a sandbox, as the unprivileged user `rtspwall`, so a broken or hostile stream cannot run as root.
+- **Local video files work too.** `sudo rtspwall probe clip.mp4` checks a regular video file. Only RTSP URLs (`rtsp://`, `rtsps://`) and local files can be probed.
+
 > Paths and menus differ between models and firmware versions. Treat the URLs here as starting points and check your vendor's documentation. Only UniFi Protect has been tested by the project. See [Compatibility](compatibility.md) and tell us what works for you with the [camera report form](https://github.com/Hovhas/rtspwall/issues/new?template=camera-report.yml).
 
 ## UniFi Protect
@@ -18,9 +22,19 @@ Always check a URL before you add it. `sudo rtspwall probe` asks for the URL at 
 
 Each quality level has its own token. The token changes when you turn RTSP off and on again, and after a camera reset. If a camera suddenly shows `stream not found (404)`, copy the URL again.
 
-**What rtspwall does with the URL.** It rewrites `rtsps://HOST:7441/TOKEN?enableSrtp` to the plain form `rtsp://HOST:7447/TOKEN` and logs `UniFi Protect rtsps URL rewritten to plain RTSP on port 7447`. This means the video travels unencrypted inside your network. That is the trade-off. See [SECURITY.md](../SECURITY.md#the-unifi-tls-trade-off).
+**What rtspwall does with the URL.** By default it keeps the encrypted `rtsps` form on port 7441 and only removes `?enableSrtp`, a parameter that only Protect understands. It logs `UniFi Protect URL: kept rtsps on port 7441 (TLS), Protect-only ?enableSrtp removed`. You do not need to change anything.
 
-To keep the URL exactly as written, set `UNIFI_REWRITE=off` in the config. We have not verified that the encrypted form plays with every FFmpeg build, so expect that it may not.
+The setting `UNIFI_REWRITE` in the config changes this:
+
+| Value | What happens to `rtsps://HOST:7441/TOKEN?enableSrtp` |
+|---|---|
+| `tls` (default) | Becomes `rtsps://HOST:7441/TOKEN`. The video and the token stay encrypted. |
+| `plain` | Becomes `rtsp://HOST:7447/TOKEN`. The token and the video cross your network **unencrypted**. rtspwall logs a warning, and `doctor` warns for each camera. |
+| `off` | Used exactly as written. |
+
+`auto` is an older name for `tls`. It still works.
+
+Use `plain` only if `tls` does not play on your setup, and only when the Pi and the cameras sit on an isolated, wired camera network (VLAN). See [SECURITY.md](../SECURITY.md#the-unifi-tls-trade-off) for why. The `tls` path has not been tested on hardware by the project yet, so tell us how it goes with the [camera report form](https://github.com/Hovhas/rtspwall/issues/new?template=camera-report.yml).
 
 ## Reolink
 
@@ -107,6 +121,7 @@ We have not yet verified on both supported FFmpeg versions (5.1 on Bookworm, 7.1
 | `connection refused` | RTSP is off, or the port is wrong | Enable RTSP. Port 554 is usual. UniFi uses 7441 and 7447. |
 | `timeout` or `unreachable` | Wrong address, or a VLAN or firewall in the way | Check the address and that the Pi can reach the camera's network. |
 | `not H.264` | The stream is H.265 | [Switch to H.264](#switching-a-camera-to-h264-or-a-sub-stream). |
+| `not probing: this URL contains ...` | You gave a URL with a secret as a command-line argument | Run `sudo rtspwall probe` and paste the URL at the prompt. |
 | Every path "works" but the picture is wrong | The device answers any path | Use the exact URL from the vendor. |
 
 More in [Troubleshooting](troubleshooting.md).

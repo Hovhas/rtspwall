@@ -20,7 +20,7 @@ This page lists only things somebody ran. Everything else says **community repor
 
 | Brand or system | Model and firmware | Stream | Result | Reporter |
 |---|---|---|---|---|
-| UniFi Protect | 6 cameras, console and firmware not recorded | Medium stream, H.264, 1024x576 at 25 to 30 fps, through the UniFi URL rewrite | Works | Project maintainer |
+| UniFi Protect | 6 cameras, console and firmware not recorded | Medium stream, H.264, 1024x576 at 25 to 30 fps, through the UniFi URL rewrite to plain RTSP (the default at the time; the default is now `rtsps` kept, see [Cameras](cameras.md#unifi-protect)) | Works with the plain rewrite. The `rtsps` default is **not tested on hardware** | Project maintainer |
 | Reolink | | | Community reports welcome | |
 | Hikvision, ABUS | | | Community reports welcome | |
 | Dahua, Amcrest | | | Community reports welcome | |

@@ -7,7 +7,8 @@ Reference for the config file and the command line. For a first setup, read [Get
 - Location: `/etc/rtspwall/cameras.conf`.
 - Permissions: `0640`, owner `root`, group `rtspwall`. The file holds camera passwords. Do not use `chmod 600`: it locks the service out. Keep the file out of git.
 - Edit it with `sudoedit /etc/rtspwall/cameras.conf`.
-- When you save a **valid** file and the wall is enabled, it restarts by itself within a few seconds. A file that fails the check leaves the running wall untouched and logs one line: `cameras.conf changed but is INVALID: rtspwall left running unchanged.`
+- Only root may change the file. `sudo rtspwall doctor` reports a `FAIL` if the owner (other than root), the group or other users can write to it.
+- When you save a **valid** file and the wall is enabled, a watcher (`rtspwall-config.path`) checks it as the user `rtspwall` and restarts the wall within a few seconds. This also restarts a wall that had stopped with `failed` because of an earlier bad file. Three cases change nothing: while `rtspwall demo` runs, a wall you stopped on purpose stays stopped, and a file that fails the check leaves the running wall untouched. The last case logs one line: `cameras.conf changed but is INVALID (or unreadable by user rtspwall): rtspwall left unchanged. Run: sudo rtspwall --check-config /etc/rtspwall/cameras.conf`
 - Lines that start with `#` are comments. Settings are `KEY=VALUE` lines and can appear anywhere. A camera is one line with fields separated by `|`.
 
 A commented example is installed with the package and lives in the repository as [examples/cameras.conf](../examples/cameras.conf).
@@ -27,8 +28,8 @@ sudo rtspwall --check-config /etc/rtspwall/cameras.conf
 | `GRID` | not set | `COLSxROWS`, up to `8x8`. Splits the screen into equal cells. Not set means manual layout. |
 | `BUFFER_MS` | `160` | How far ahead of the stream's own timestamps each frame is shown. Higher is smoother but adds latency. Lower is snappier but more late frames are skipped. |
 | `ROTATE_SECONDS` | `15` | How long each camera of a rotation group is shown. |
-| `MODE` | `auto` | Display mode: `auto`, `WxH` or `WxH@Hz` (for example `1280x720@50`). `auto` keeps the display's preferred mode, except that a 4K mode or one under 50 Hz is replaced by the best mode up to 1920 wide with the same shape. A 4K TV then runs at 1920x1080 at 60 Hz. Interlaced modes are never used. If the display lacks the mode, the log lists the modes it has. |
-| `UNIFI_REWRITE` | `auto` | `auto` rewrites a UniFi Protect `rtsps://HOST:7441/TOKEN?enableSrtp` URL to `rtsp://HOST:7447/TOKEN` and logs that it did. `off` uses URLs exactly as written. See [Cameras](cameras.md#unifi-protect). |
+| `MODE` | `auto` | Display mode: `auto`, `WxH` or `WxH@Hz` (for example `1280x720@50`). `auto` keeps the display's preferred mode, except that a 4K mode or one under 50 Hz is replaced by the best mode up to 1920 wide with the same shape. A 4K TV then runs at 1920x1080 at 60 Hz. Interlaced modes are never used. If the display lacks the mode, the log lists the modes it has, the wall runs with `auto`, and it switches to your `MODE` as soon as the display offers it (it checks every 30 s). |
+| `UNIFI_REWRITE` | `tls` | What to do with a UniFi Protect `rtsps://HOST:7441/TOKEN?enableSrtp` URL. `tls` keeps `rtsps` on port 7441 and only removes `?enableSrtp`. `plain` rewrites it to `rtsp://HOST:7447/TOKEN`: the token and the video are then **unencrypted**, and a warning is logged. `off` uses the URL exactly as written. `auto` is an older name for `tls`. See [Cameras](cameras.md#unifi-protect) and [SECURITY.md](../SECURITY.md#the-unifi-tls-trade-off). |
 | `DECODER` | `/dev/video10` | The V4L2 H.264 decoder device (`bcm2835-codec` on a Pi 4). |
 | `CONNECTOR` | first connected | The display output by its kernel name, for example `HDMI-A-1` or `HDMI-A-2`. |
 | `DRM_DEVICE` | auto | The DRM card, for example `/dev/dri/card1`. Auto picks the first card with a connected display (or, with `CONNECTOR` set, the first card that has that connector). |
@@ -86,7 +87,7 @@ Leave out `GRID` and give each camera a tile in screen pixels:
 name|url|width|height|x|y[|delay_ms]
 ```
 
-The tile is the size on screen. The display hardware scales the stream. Cameras with identical `width|height|x|y` form a rotation group. A tile that reaches outside the screen gives a warning.
+The tile is the size on screen. The display hardware scales the stream. Cameras with identical `width|height|x|y` form a rotation group. A tile that reaches outside the screen gives a warning. At start, if the screen is smaller than the tiles need (a TV in standby often offers only small modes), the wall waits up to 60 s for a larger mode, then starts anyway and cuts off what does not fit.
 
 ```
 front-door|rtsp://viewer:PASSWORD@192.168.1.10:554/stream2|960|540|0|0
@@ -122,18 +123,35 @@ All commands that touch the system need `sudo`.
 | `rtspwall [CONFIG]` | Run the wall. This is what the service does. The default config is `/etc/rtspwall/cameras.conf`. |
 | `rtspwall --check-config [--mode WxH] [CONFIG]` | Validate a config and print the layout. `--mode` sets the screen size to lay out for (default `1920x1080`). |
 | `rtspwall --help`, `rtspwall --version` | Help and version. |
-| `rtspwall probe [URL \| - \| CONFIG]` | Check a stream without playing it. No argument: hidden prompt. `-`: read the URL from stdin. A config file: probe every camera. Giving the URL as an argument works but leaves it in your shell history. Exit status: 0 `PASS`, 1 `WARN`, 2 `FAIL` or error. |
-| `rtspwall add [--config PATH] [--force] [--no-systemd] NAME [CELL]` | Probe a camera, add it to the first free cell (or `CELL`), then start or restart the service. A taken `CELL` makes a rotation group. `--force` adds despite a `FAIL`. `--no-systemd` only edits the file. Needs a `GRID=` line and grid-style config. |
-| `rtspwall doctor [--config PATH] [--fix] [--yes] [--report] [--summary] [--no-hardware] [--no-probe]` | Self-test with one `PASS`, `INFO`, `WARN` or `FAIL` line per check and a fix to copy. `--fix` offers to set `gpu_mem=256` (asks first, backs up `config.txt`, never reboots). `--yes` answers yes without a terminal. `--report` prints one block for bug reports with URLs and tokens masked. `--summary` prints only problems and totals. `--no-hardware` skips checks that need the Pi. `--no-probe` does not contact the cameras. Exit status: 0 all pass, 1 warnings, 2 failures. |
+| `rtspwall probe [--insecure-argv] [URL \| - \| CONFIG \| FILE]` | Check a stream without playing it. No argument: hidden prompt. `-`: read the URL from stdin. A config file: probe every camera. A local video file: probe the file. A URL with a password, query string or token on the command line is **refused**, because the command line ends up in shell history, `ps` and the `sudo` log. `--insecure-argv` allows it anyway. As root, each probe runs as the user `rtspwall` in a sandbox. Only regular files are probed. Exit status: 0 `PASS`, 1 `WARN`, 2 `FAIL` or error. |
+| `rtspwall add [--config PATH] [--force] [--no-systemd] NAME [CELL]` | Probe a camera, add it to the first free cell (or `CELL`), then start or restart the service. A taken `CELL` makes a rotation group. `--force` adds despite a `FAIL`. `--no-systemd` only edits the file. Needs a `GRID=` line and grid-style config. See [How `add` edits the file](#how-add-edits-the-file). |
+| `rtspwall doctor [--config PATH] [--fix] [--yes] [--report] [--summary] [--no-hardware] [--no-probe]` | Self-test with one `PASS`, `INFO`, `WARN` or `FAIL` line per check and a fix to copy. `--fix` offers to set `gpu_mem=256` (asks first, backs up `config.txt`, prints the command to undo it, never reboots). `--yes` answers yes without a terminal. `--report` prints one block for bug reports with URLs and tokens masked. `--summary` prints only problems and totals. `--no-hardware` skips checks that need the Pi. `--no-probe` does not contact the cameras. Exit status: 0 all pass, 1 warnings, 2 failures. See [What `doctor` checks](#what-doctor-checks). |
 | `rtspwall demo` | Show the built-in 2x2 demo wall. Ctrl-C stops it and restores the previous state. |
+
+### How `add` edits the file
+
+- If the config path is a symlink, `add` edits the file it points to.
+- It takes a lock, so a second `rtspwall add` waits until the first one is done.
+- If the config changed while it probed the camera, it writes nothing and tells you to run `add` again.
+- It writes a temporary file next to the config. Ctrl-C removes that file, because it holds the camera password.
+- It refuses to run if the config's directory is writable by other users.
+- After the change, the watcher `rtspwall-config.path` restarts the wall when it is active. Otherwise `add` starts or restarts the service itself.
+
+### What `doctor` checks
+
+- **Config permissions:** `FAIL` if the config is writable by anyone but root.
+- **UniFi:** `WARN` for each camera that uses `UNIFI_REWRITE=plain`. The warning is stronger when the default route goes over Wi-Fi (`wlan`).
+- **`gpu_mem`:** it understands `gpu_mem_1024`, which overrides `gpu_mem` on a Pi 4, and the section filters in `config.txt`. If a `gpu_mem` line sits under a filter doctor cannot evaluate (for example `[HDMI:0]` or `[board-type=...]`), it gives a `WARN` instead of a guess. `doctor --fix` then changes nothing and tells you to set the value by hand under `[all]`.
 
 ### Exit codes of the wall
 
 | Code | Meaning | The service |
 |---|---|---|
 | `2` | Config error, no cameras configured, or bad command line | Not restarted. Fix the file. |
-| `3` | No usable H.264 hardware decoder (for example a Pi 5) | Not restarted. Unsupported hardware. |
-| other non-zero | A crash or failure | Restarted with a growing delay. |
+| `3` | No usable H.264 hardware decoder: `/dev/video10` is still missing after 15 s, or is not an H.264 decoder (for example a Pi 5) | Not restarted. Unsupported hardware. |
+| other non-zero | A crash or failure. A failed `VIDIOC_QUERYCAP` on the decoder counts here (exit `1`). | Restarted with a growing delay. |
+
+Before the wall gives up it waits for things that are only late at boot: the `DRM_DEVICE` node, a display, a `MODE` the display offers, a screen big enough for manual tiles (60 s, then it starts anyway), and access to the decoder (up to 30 s while udev sets its permissions).
 
 ## The 60 second statistics line
 
@@ -155,6 +173,12 @@ front-door: 60s dec=25.0 shown=25.0 dropped=0(0.0%) late=0 depth=4.1 jitter p50=
 | `active` | Seconds the camera was visible in the window (60 for a fixed camera). |
 | `idle` | Frames released while the camera was not visible. Not counted as dropped. |
 
-Once a minute there are also a `diag regulated ptsdelta` line per camera (`synthetic`, `leaks_closed` and `leaks_active` should normally be 0) and one global `diag: busy_drops=... switches=...` line. `diag: WARNING late1+=...` means picture updates landed one display refresh later than planned.
+Once a minute there are also diagnostic lines:
+
+| Line | Meaning |
+|---|---|
+| `NAME: diag regulated ptsdelta p5=...ms p50=...ms p95=...ms synthetic=N leaks_closed=N leaks_active=N` | How even the frame timing is after correction (`p5`, `p50`, `p95`). `synthetic`, `leaks_closed` and `leaks_active` should normally be 0. |
+| `diag: busy_drops=N switches=N` | Since the last line: frames that were never shown because a display update (atomic commit) failed, and rotation switches. `busy_drops` should normally be 0. |
+| `diag: WARNING late1+=N flips confirmed >=1 vblank after target (regression?)` | Picture updates landed one display refresh later than planned. |
 
 **Measure with this line only.** Do not run `ffprobe` or `mpv` against the same cameras while the wall runs. Some NVRs share frames between viewers, so a second viewer steals frames and causes visible drops.

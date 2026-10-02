@@ -54,7 +54,7 @@ For streams, you have two choices.
 
 `sudo rtspwall demo` starts the **installed** demo service, not your build.
 
-To install from source on a Pi, use `sudo ./install.sh` (options `--no-build-deps`). It builds, tests and installs the binary and the units, and does not start the service. Remove it with `sudo ./uninstall.sh [--purge]`. The package and a source install must not coexist: `install.sh` refuses to run when the package is installed.
+To install from source on a Pi, use `sudo ./install.sh` (options `--no-build-deps`). It builds, tests and installs the binary and the units, and does not start the service. Remove it with `sudo ./uninstall.sh [--purge]`. The package and a source install must not coexist: `install.sh` refuses to run when the package is installed. The install prefix is `/usr/local` by default. Set `PREFIX` to change it. It must be an absolute path that matches `^/[A-Za-z0-9._/-]+$` (letters, digits, `.`, `_`, `/` and `-`), because it is written into the unit files. `install.sh` exits with status 2 on any other value.
 
 ## Code style
 
@@ -69,6 +69,7 @@ To install from source on a Pi, use `sudo ./install.sh` (options `--no-build-dep
 - Update the docs and `CHANGELOG.md` (under the top version) when behaviour or config changes.
 - If you add or change a log message that users can see, update the table in [docs/troubleshooting.md](docs/troubleshooting.md) with the exact text.
 - Follow [docs/STYLE.md](docs/STYLE.md) for docs.
+- The package build checks the hardening of the binary (PIE, stack protector, fortify, RELRO, bindnow) and fails if one is missing. CI runs it, so do not remove hardening flags.
 - Test on a real Raspberry Pi 4 when the change touches decoding, DRM or timing, and paste the 60 second statistics lines (`journalctl -u rtspwall | grep ': 60s'`). Check them before pasting.
 
 ## Releasing

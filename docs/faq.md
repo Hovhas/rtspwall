@@ -68,7 +68,15 @@ For showing cameras on a TV: yes, if you accept the limits above. It does not co
 
 ## Is my traffic encrypted?
 
-RTSP in this setup is plain, unencrypted traffic on your network. For UniFi Protect, rtspwall rewrites the encrypted `rtsps` URL to plain `rtsp` by default. Read the [security notes](../SECURITY.md) and put the cameras on an isolated network or VLAN where you can.
+For most cameras, no. Plain `rtsp://` URLs are unencrypted traffic on your network. For UniFi Protect, rtspwall keeps the encrypted `rtsps` URL by default (`UNIFI_REWRITE=tls`). That stops someone who only listens to the network. It does not stop someone who pretends to be the camera, because FFmpeg does not verify the certificate. `UNIFI_REWRITE=plain` sends the token and the video unencrypted, and `doctor` warns about it. Read the [security notes](../SECURITY.md#the-unifi-tls-trade-off) and put the cameras on an isolated network or VLAN where you can.
+
+## Why does `probe` refuse my URL?
+
+A URL with a password, a query string or a token on the command line is saved in your shell history, shown by `ps` and logged by `sudo`. Run `sudo rtspwall probe` and paste the URL at the hidden prompt, or use `sudo rtspwall probe - < url.txt`. The flag `--insecure-argv` allows it anyway. See [Cameras](cameras.md).
+
+## Do I need to run `doctor` after the install?
+
+Not right away. The installer does not run it and does not change `gpu_mem`. Add your cameras first, then run `sudo rtspwall doctor`. It tells you if `gpu_mem` must be raised, and `sudo rtspwall doctor --fix` can do it after asking.
 
 ## Where are my passwords stored?
 

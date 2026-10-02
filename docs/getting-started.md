@@ -45,11 +45,11 @@ Use the user name and hostname you set in Step 0. If `.local` names do not work 
 curl -fsSL https://github.com/Hovhas/rtspwall/releases/latest/download/get.sh | sudo bash
 ```
 
-The script refuses to continue on a Pi 5, a 32-bit system or an unsupported OS. It waits if another package job is running, installs the package for your OS and prints a short health check. It never reboots.
+The script refuses to continue on a Pi 5, a 32-bit system or an unsupported OS. It waits if another package job is running, checks the download against `SHA256SUMS` and installs the package for your OS. It never reboots, never starts the wall and never changes `gpu_mem`. The options `--yes` and `--no-gpu-mem` are accepted, but they do nothing.
 
 If you prefer to read the script first, see [Other ways to install](../README.md#try-it-in-5-minutes).
 
-**You should now see** the health check from `rtspwall doctor`: one line per problem, each with a fix, and a total at the end. Warnings about cameras are normal at this point, because none are configured. Fix any `FAIL` line before you go on. The most common one is `a desktop holds the display`. See [Troubleshooting](troubleshooting.md#doctor-says-a-desktop-holds-the-display).
+**You should now see** the message `rtspwall is installed. It was not started and nothing was rebooted.` with the next steps, ending in `After adding cameras: sudo rtspwall doctor`. Run `doctor` once you have added your cameras (Step 6). If it shows a `FAIL` line about a desktop, see [Troubleshooting](troubleshooting.md#doctor-says-a-desktop-holds-the-display).
 
 ## Step 3: Run the demo (about 1 minute)
 
@@ -71,7 +71,7 @@ First get the camera's RTSP URL. [Cameras](cameras.md) has the steps for each br
 sudo rtspwall probe
 ```
 
-Paste the URL at the hidden prompt. Nothing is shown while you paste, and the URL never lands in your shell history. `probe` opens the stream, reads its codec, size and frame rate, and stops. It does not start playing.
+Paste the URL at the hidden prompt. Nothing is shown while you paste, and the URL never lands in your shell history. `probe` opens the stream, reads its codec, size and frame rate, and stops. It does not start playing. Do not put the URL on the command line: `probe` refuses a URL with a password, query string or token there. As root it reads the stream as the unprivileged user `rtspwall`, in a sandbox.
 
 **You should now see** lines like `codec: H.264 ...`, `size:`, `fps:`, `decoder: ... % of the Pi 4 H.264 budget` and a `verdict:` of `PASS`. A `FAIL` comes with a `fix:` line. If it says H.265, switch the camera to H.264 ([Cameras](cameras.md#switching-a-camera-to-h264-or-a-sub-stream)).
 
@@ -81,7 +81,7 @@ Paste the URL at the hidden prompt. Nothing is shown while you paste, and the UR
 sudo rtspwall add front-door
 ```
 
-Paste the URL again at the hidden prompt. `add` probes it, writes one line to `/etc/rtspwall/cameras.conf`, and starts the wall. It also enables the service, so the wall starts at every boot.
+Paste the URL again at the hidden prompt. `add` probes it, writes one line to `/etc/rtspwall/cameras.conf`, and starts the wall. It also enables the service, so the wall starts at every boot. If you run two `add` commands at once, the second waits for the first.
 
 **You should now see** `added: front-door|...|1` and `enabled and started rtspwall`. Within about 15 seconds the camera appears in the top-left tile of the TV. The other three tiles stay black until you add more cameras.
 
@@ -91,7 +91,13 @@ Repeat `sudo rtspwall add NAME` for each camera. Each one takes the next free ce
 
 Saving a valid `/etc/rtspwall/cameras.conf` restarts the wall by itself. An invalid file leaves the running wall alone.
 
-If `probe` or `doctor` says you need `gpu_mem=256`, run this, then reboot as a **separate** step:
+Now run the health check once. It tells you if you need `gpu_mem=256` and names any other problem, each with a fix:
+
+```bash
+sudo rtspwall doctor
+```
+
+If it says you need `gpu_mem=256`, run this, then reboot as a **separate** step:
 
 ```bash
 sudo rtspwall doctor --fix
@@ -101,7 +107,7 @@ sudo rtspwall doctor --fix
 sudo reboot
 ```
 
-`doctor --fix` asks first and makes a backup of `config.txt`. It never reboots for you.
+`doctor --fix` asks first, makes a backup of `config.txt` and prints the command that undoes the change. It never reboots for you. If your `config.txt` sets `gpu_mem` under a section filter that `doctor` cannot evaluate, it changes nothing and tells you to edit the file by hand.
 
 **You should now see** every camera you added in its own tile, and `sudo systemctl status rtspwall` showing `active (running)` with a status such as `N/N live`.
 

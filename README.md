@@ -25,7 +25,7 @@ Not sure? Run the demo below first. It needs no cameras.
 
 You need a Pi 4 with Raspberry Pi OS Lite 64-bit, a TV and an SSH login. [Getting started](docs/getting-started.md) covers flashing the card.
 
-1. **Install** (about 2 to 4 minutes). It checks your board and OS, installs the package, prints a health check and never reboots:
+1. **Install** (about 2 to 4 minutes). It checks your board and OS, verifies the download, installs the package, and never reboots or changes `gpu_mem`:
 
    ```bash
    curl -fsSL https://github.com/Hovhas/rtspwall/releases/latest/download/get.sh | sudo bash
@@ -49,7 +49,7 @@ You need a Pi 4 with Raspberry Pi OS Lite 64-bit, a TV and an SSH login. [Gettin
    sudo rtspwall add front-door
    ```
 
-If something fails, run `sudo rtspwall doctor`. It names the problem and prints the fix.
+After adding cameras, run `sudo rtspwall doctor`. It names any problem, says if `gpu_mem` must be raised, and prints the fix.
 
 <details><summary>Other ways to install</summary>
 

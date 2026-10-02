@@ -30,24 +30,34 @@ What we assume and do not defend against:
 - `/etc/rtspwall/cameras.conf` holds camera URLs, usually with passwords. The package and `install.sh` create it as `0640`, owner `root`, group `rtspwall`, in a directory of mode `0750`. `chmod 600` would lock the service out.
 - Keep the file out of version control and out of backups you share.
 - Use a **read-only camera account** for the wall where the camera supports it.
-- `sudo rtspwall probe` and `sudo rtspwall add NAME` read the URL from a **hidden prompt**, so it does not end up in your shell history, in `ps` output or in the `sudo` log. Passing a URL as an argument works, but then it does.
+- `sudo rtspwall probe` and `sudo rtspwall add NAME` read the URL from a **hidden prompt**, so it does not end up in your shell history, in `ps` output or in the `sudo` log. `probe` also reads the URL from stdin (`sudo rtspwall probe - < url.txt`).
+- `probe` **refuses** a URL with a password, a query string or a token on the command line. `--insecure-argv` allows it anyway, and then the URL is in your history, in `ps` and in the `sudo` log.
+- Only root may change `cameras.conf`. `sudo rtspwall doctor` reports a `FAIL` if the file is writable by anyone else. `add` refuses to edit a config whose directory other users can write to, and it removes its temporary file (which holds the password) if you press Ctrl-C.
+- Core dumps are off for the wall (`LimitCORE=0` in the unit and `PR_SET_DUMPABLE` in the program), so the passwords in its memory do not end up in a dump file.
 
 ## What is masked in logs and reports
 
 rtspwall masks credential-like parts of URLs in its log, in `--check-config`, in `probe` and `add` output, and in `rtspwall doctor --report`:
 
-- the password in `rtsp://user:password@host/...`
+- the password in `rtsp://user:password@host/...`, including a password that contains an unencoded `/`, `?`, `#`, `"` or `'`
+- a user info part without a colon (`rtsp://secret@host/...`), which may itself be a token
 - the whole query string (`?channel=1&subtype=0` becomes `?***`)
+- credentials in the path or in `;` parameters, for example the XMEye form `/user=admin&password=...` and the Foscam form `;pwd=...`
 - path segments that look like tokens: 16 or more letters and digits, or 32 or more letters, digits, `_` and `-`. This covers the UniFi Protect token.
 
 **The masking is a heuristic.** It leans towards hiding too much, but it can miss a secret in an unusual shape, and it does not touch camera names, IP addresses or host names. **Read what you paste** into an issue, a forum or a pull request.
 
 ## The UniFi TLS trade-off
 
-UniFi Protect shows an encrypted URL, `rtsps://HOST:7441/TOKEN?enableSrtp`. By default (`UNIFI_REWRITE=auto`) rtspwall rewrites it to the plain form `rtsp://HOST:7447/TOKEN` and logs that it did. This makes the setup work when pasted as shown, but it means the video and the token cross your network **unencrypted**.
+UniFi Protect shows an encrypted URL, `rtsps://HOST:7441/TOKEN?enableSrtp`. The setting `UNIFI_REWRITE` decides what rtspwall does with it:
 
-- If your cameras sit on an isolated VLAN or a trusted wired network, this is usually acceptable.
-- To keep the URL exactly as written, set `UNIFI_REWRITE=off`. We have not verified that the encrypted form plays on every FFmpeg build, so it may not work.
+- **`tls` (default).** rtspwall keeps `rtsps` on port 7441 and only removes `?enableSrtp`. The video and the token are encrypted on the network. `auto`, the name used by older versions, means the same.
+- **`plain`.** rtspwall rewrites the URL to `rtsp://HOST:7447/TOKEN`. The token and the video then cross your network **unencrypted**. rtspwall logs a warning, and `doctor` warns for each such camera (with a stronger message if the default route is Wi-Fi). Use it only if `tls` does not play, and only on an isolated, wired camera network (VLAN).
+- **`off`.** The URL is used exactly as written.
+
+**What `tls` does not give you.** FFmpeg, which rtspwall uses, does not verify the camera's certificate. The encryption protects against someone who only listens to your network (passive eavesdropping). It does **not** protect against someone who sits between the Pi and the camera and pretends to be the camera (active man-in-the-middle). Keep the cameras on a network you trust either way.
+
+The `tls` path has not been tested on hardware by the project yet (see [Compatibility](docs/compatibility.md)).
 
 All other RTSP in a typical setup is also plain. Treat the camera network as a trusted segment.
 
@@ -59,6 +69,11 @@ The unit `rtspwall.service` runs as the system user `rtspwall` (groups `video` a
 - protected kernel settings, modules, logs and control groups
 - a restricted set of system calls (`@system-service` without `@privileged`) and of network address families
 - `UMask=0077`
+- no core dumps (`LimitCORE=0`), and the program also marks itself non-dumpable (`PR_SET_DUMPABLE`), so other processes of the same user cannot read its memory through `ptrace`
+
+The binary is built hardened: position-independent code (PIE), stack protector, `_FORTIFY_SOURCE`, full RELRO and immediate binding (bindnow). The package build fails if one of these is missing, and CI runs that build.
+
+`probe` and `add` never parse a camera stream as root. As root, each probe runs in a separate process as the unprivileged user `rtspwall` (or `nobody` if that user does not exist, with a note). If it cannot drop its privileges, it does not probe.
 
 More options are documented, switched off, in `systemd/rtspwall.service`. They can break video, so enable them one at a time and check the picture.
 
@@ -76,4 +91,10 @@ To check that GitHub Actions built the file from this repository (needs the [Git
 gh attestation verify rtspwall_trixie_arm64.deb --repo Hovhas/rtspwall
 ```
 
-Use `rtspwall_bookworm_arm64.deb` on Bookworm. If you do not want to pipe a script into a shell, use the "download, inspect, run" method from the [README](README.md#try-it-in-5-minutes).
+Use `rtspwall_bookworm_arm64.deb` on Bookworm. The attestations also cover `get.sh` and `SHA256SUMS`:
+
+```bash
+gh attestation verify get.sh --repo Hovhas/rtspwall
+```
+
+If you do not want to pipe a script into a shell, use the "download, inspect, run" method from the [README](README.md#try-it-in-5-minutes).
