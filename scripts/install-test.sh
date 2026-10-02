@@ -24,9 +24,18 @@ apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg >/dev/
 if [[ $PIOS == --pios ]]; then
     # shellcheck source=/dev/null
     codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-    curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key \
-        | gpg --dearmor -o /usr/share/keyrings/raspberrypi-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.gpg] http://archive.raspberrypi.com/debian/ $codename main" \
+    # Use the key from the archive's own keyring package, as Raspberry Pi OS
+    # does. The loose raspberrypi.gpg.key only has a SHA1 binding signature,
+    # which apt's sqv on trixie rejects since 2026-02-01. Pinned by checksum.
+    kr=raspberrypi-archive-keyring_2025.1+rpt1_all.deb
+    kr_sha256=2e727149d7acb8cc7f604e66d0049161039c8aa1eaf1175e54f9e69d963d60e4
+    curl -fsSLo "/tmp/$kr" \
+        "https://archive.raspberrypi.com/debian/pool/main/r/raspberrypi-archive-keyring/$kr"
+    echo "$kr_sha256  /tmp/$kr" | sha256sum -c -
+    dpkg-deb --fsys-tarfile "/tmp/$kr" \
+        | tar -xO ./usr/share/keyrings/raspberrypi-archive-keyring.pgp \
+        >/usr/share/keyrings/raspberrypi-archive-keyring.pgp
+    echo "deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.pgp] http://archive.raspberrypi.com/debian/ $codename main" \
         >/etc/apt/sources.list.d/raspi.list
     apt-get update -qq
 fi
