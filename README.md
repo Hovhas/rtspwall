@@ -6,7 +6,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform: Raspberry Pi 4](https://img.shields.io/badge/platform-Raspberry%20Pi%204-c51a4a.svg)
 
-<!-- hero: docs/media/demo.gif (rendered illustration from the bundled demo clips, labelled as such) + docs/media/wall.jpg (photo of a real wall) -->
+![Rendered illustration of a 2x2 wall with four test patterns labelled CAM 1–4 and running timecodes; the lower-right tile switches from CAM 4 to CAM 5.](docs/media/demo.gif)
+
+<sub>Rendered illustration made from the bundled demo clips (`sudo rtspwall demo` shows the same wall on your TV). The rotation is shortened to fit the 10 s loop. Photos of real walls are welcome in [Discussions](https://github.com/Hovhas/rtspwall/discussions). [Smaller video](docs/media/demo.mp4).</sub>
 
 <sub>Formerly named rpi4-rtsp (renamed before the first release).</sub>
 
@@ -24,6 +26,14 @@ Not sure? Run the demo below first. It needs no cameras.
 ## Try it in 5 minutes
 
 You need a Pi 4 with Raspberry Pi OS Lite 64-bit, a TV and an SSH login. [Getting started](docs/getting-started.md) covers flashing the card.
+
+> **Testing the release candidate?** v0.1.0 is not out yet. Install v0.1.0-rc1 with:
+>
+> ```bash
+> curl -fsSL https://github.com/Hovhas/rtspwall/releases/download/v0.1.0-rc1/get.sh | sudo RTSPWALL_VERSION=v0.1.0-rc1 bash
+> ```
+>
+> Reports are welcome through the [issue forms](https://github.com/Hovhas/rtspwall/issues/new/choose), especially the camera report.
 
 1. **Install** (about 2 to 4 minutes). It checks your board and OS, verifies the download, installs the package, and never reboots or changes `gpu_mem`:
 

@@ -45,6 +45,14 @@ Use the user name and hostname you set in Step 0. If `.local` names do not work 
 curl -fsSL https://github.com/Hovhas/rtspwall/releases/latest/download/get.sh | sudo bash
 ```
 
+> **Testing the release candidate?** v0.1.0 is not out yet, so the command above does not work until it is. Install v0.1.0-rc1 with:
+>
+> ```bash
+> curl -fsSL https://github.com/Hovhas/rtspwall/releases/download/v0.1.0-rc1/get.sh | sudo RTSPWALL_VERSION=v0.1.0-rc1 bash
+> ```
+>
+> Reports are welcome through the [issue forms](https://github.com/Hovhas/rtspwall/issues/new/choose), especially the camera report.
+
 The script refuses to continue on a Pi 5, a 32-bit system or an unsupported OS. It waits if another package job is running, checks the download against `SHA256SUMS` and installs the package for your OS. It never reboots, never starts the wall and never changes `gpu_mem`. The options `--yes` and `--no-gpu-mem` are accepted, but they do nothing.
 
 If you prefer to read the script first, see [Other ways to install](../README.md#try-it-in-5-minutes).

@@ -45,6 +45,21 @@ Formerly named rpi4-rtsp (renamed before the first release).
 - `probe` refuses a URL with a password, query string or token on the command line. Use the hidden prompt or `-`. `--insecure-argv` allows it.
 - `get.sh` never changes `gpu_mem` and no longer runs `doctor`. `--yes` and `--no-gpu-mem` are accepted and do nothing. It ends with `After adding cameras: sudo rtspwall doctor`, and so does the message of the package. Run `doctor` after you add cameras.
 - `install.sh` accepts only a `PREFIX` that matches `^/[A-Za-z0-9._/-]+$`.
+- GitHub Actions upgraded to Node 24 versions: `actions/checkout` v7, `actions/upload-artifact` v7, `actions/download-artifact` v8, `actions/attest-build-provenance` v4.
+- Build-provenance attestation is skipped for private repositories.
+- The README has a rendered demo illustration (`docs/media/demo.gif`).
+
+### Fixed
+
+- The issue form `bug.yml` was invalid YAML and is corrected.
+- Without `CONNECTOR`, the wall follows the HDMI cable to the other port after 10 s instead of waiting on a disconnected one, moves back when the original port returns, and never moves to (or starts on) DSI or composite outputs while an HDMI/DVI/DP output exists.
+- `MODE=auto` no longer stays on a reserve mode (e.g. 1024x768) when the TV was in standby at boot; it switches once the real modes appear.
+- DNS failures are reported as `unreachable` with a hint instead of a generic error.
+- `probe` and the wall now pick the same video stream (first H.264 stream) when a source offers several.
+- Local video files with an audio track no longer log codec errors.
+- Retries after refused vblank waits back off up to 60 s instead of re-setting the mode every second.
+- Reconnects while the display is off no longer wait 5 s for a plane that cannot detach; abandoned page flips can no longer lose decoder buffers.
+- `rtspwall add` keeps the config file's extended attributes and ACLs.
 
 ### Security
 
