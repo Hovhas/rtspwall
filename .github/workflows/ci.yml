@@ -72,7 +72,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: deb-${{ matrix.dist }}
           path: dist
