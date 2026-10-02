@@ -46,7 +46,7 @@ jobs:
           ./scripts/build-tarball.sh "$VERSION"
       - name: Install-test the .deb
         run: ./scripts/install-test.sh dist/rtspwall_*.deb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.dist }}
           path: |
