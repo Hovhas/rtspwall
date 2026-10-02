@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-TABLE=rpi4_rtsp_reconnect_test
+TABLE=rtspwall_reconnect_test
 
 usage() {
     echo "Usage: $0 HOST PORT [SECONDS]" >&2
@@ -40,7 +40,7 @@ mapfile -t ADDRS < <(getent ahosts "$HOST" | awk '{print $1}' | sort -u)
 
 cleanup() {
     nft delete table inet "$TABLE" 2>/dev/null || true
-    logger -t rpi4-rtsp-reconnect-test "DROP off" 2>/dev/null || true
+    logger -t rtspwall-reconnect-test "DROP off" 2>/dev/null || true
     echo "Block removed."
 }
 trap cleanup EXIT
@@ -56,6 +56,6 @@ for a in "${ADDRS[@]}"; do
         nft add rule inet "$TABLE" out ip daddr "$a" tcp dport "$PORT" drop
     fi
 done
-logger -t rpi4-rtsp-reconnect-test "DROP on: ${ADDRS[*]} port $PORT for ${SECS}s" 2>/dev/null || true
+logger -t rtspwall-reconnect-test "DROP on: ${ADDRS[*]} port $PORT for ${SECS}s" 2>/dev/null || true
 echo "Dropping traffic to ${ADDRS[*]} port $PORT for ${SECS}s ..."
 sleep "$SECS"

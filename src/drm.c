@@ -1,7 +1,7 @@
 /*
  * drm.c — DRM helpers: finds the display (connector, CRTC, mode) and the
  * overlay planes, reads the atomic properties, creates the black primary
- * plane. See rpi4rtsp.h for the structs.
+ * plane. See rtspwall.h for the structs.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -17,7 +17,7 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 
-#include "rpi4rtsp.h"
+#include "rtspwall.h"
 
 /* ------------------------------------------------------------- DRM helpers */
 

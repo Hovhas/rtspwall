@@ -251,7 +251,7 @@ int64_t pacing_target_time(int64_t pts_us, int64_t anchor_us, int buffer_ms, int
 
 /* ---------------------------------------------------------------- rotation */
 
-/* Generous: MAX_CAMERAS (rpi4rtsp.h) is 16, and a rotation group can never
+/* Generous: MAX_CAMERAS (rtspwall.h) is 16, and a rotation group can never
  * be larger than that. */
 #define PACING_MAX_GROUP_SIZE 16
 

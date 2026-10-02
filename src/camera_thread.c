@@ -2,7 +2,7 @@
  * camera_thread.c — the free-index ring + the whole camera thread: RTSP
  * demux (libavformat), feeding the decoder, collecting decoded frames into
  * the jitter buffer, and the full connect/read/close loop per camera. See
- * rpi4rtsp.h for the structs.
+ * rtspwall.h for the structs.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -23,7 +23,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 
-#include "rpi4rtsp.h"
+#include "rtspwall.h"
 
 /* -------------------------------------------------------- free-index ring */
 

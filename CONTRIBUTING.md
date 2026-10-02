@@ -6,7 +6,7 @@ Thanks for helping. Bug reports, hardware reports ("works on X") and pull reques
 
 ```bash
 sudo apt install build-essential pkg-config libdrm-dev libavformat-dev libavcodec-dev libavutil-dev
-make                  # builds src/rpi4-rtsp
+make                  # builds src/rtspwall
 make test             # unit tests; no Pi hardware or DRM/FFmpeg libraries needed
 make test SANITIZE=1  # with AddressSanitizer and UBSan
 ```
@@ -30,14 +30,14 @@ CI runs `make test` and ShellCheck on all shell scripts, then builds and tests o
 - Test on a real Raspberry Pi 4 when the change touches decoding, DRM or timing, and paste the 60 s statistics lines into the pull request:
 
   ```bash
-  journalctl -u rpi4-rtsp | grep ': 60s'
+  journalctl -u rtspwall | grep ': 60s'
   ```
 
   Check the lines before pasting; they may contain camera names you do not want to publish.
 
 ## Reporting bugs and requesting features
 
-Use the issue templates. For bugs we need the Pi model, OS, `rpi4-rtsp --version`, `--check-config` output, 60 s lines and the `dmesg` output listed in the template. Report security problems privately, see [SECURITY.md](SECURITY.md).
+Use the issue templates. For bugs we need the Pi model, OS, `rtspwall --version`, `--check-config` output, 60 s lines and the `dmesg` output listed in the template. Report security problems privately, see [SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -1,7 +1,7 @@
 /*
  * v4l2.c — V4L2 helpers: opens the decoder, sets up the OUTPUT buffers
  * (compressed H.264 in) and the CAPTURE buffers (decoded NV12 out, exported
- * as dmabuf and bound to DRM framebuffers). See rpi4rtsp.h for the structs.
+ * as dmabuf and bound to DRM framebuffers). See rtspwall.h for the structs.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -17,7 +17,7 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 
-#include "rpi4rtsp.h"
+#include "rtspwall.h"
 
 /* ------------------------------------------------------------ V4L2 helpers */
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # build-deb.sh [VERSION]
 #
-# Builds dist/rpi4-rtsp_VERSION_DIST_ARCH.deb from the current checkout.
+# Builds dist/rtspwall_VERSION_DIST_ARCH.deb from the current checkout.
 # DIST comes from /etc/os-release (VERSION_CODENAME, e.g. bookworm or trixie),
 # ARCH from dpkg. VERSION defaults to the latest git tag (without "v"), or 0.0.0.
 # Build dependencies: build-essential pkg-config libdrm-dev libavformat-dev
 # libavcodec-dev libavutil-dev (+ dpkg-dev for accurate Depends).
 #
 # Design notes:
-#  - /etc/rpi4-rtsp/cameras.conf is NOT a conffile. It holds credentials, and
+#  - /etc/rtspwall/cameras.conf is NOT a conffile. It holds credentials, and
 #    dpkg conffile prompts/purge semantics are a poor fit. postinst installs the
 #    example only when no config exists; postrm purge removes it.
 #  - The unit goes to /usr/lib/systemd/system (correct on bookworm and trixie,
@@ -30,7 +30,7 @@ fi
 ARCH=$(dpkg --print-architecture)
 # shellcheck source=/dev/null
 DIST=$(. /etc/os-release && echo "${VERSION_CODENAME:-unknown}")
-NAME=rpi4-rtsp
+NAME=rtspwall
 OUT=$ROOT/dist
 STAGE=$OUT/staging
 DEB=$OUT/${NAME}_${VERSION}_${DIST}_${ARCH}.deb
@@ -45,7 +45,7 @@ make VERSION="$VERSION" DESTDIR="$STAGE" PREFIX=/usr install
 strip --strip-unneeded "$STAGE/usr/bin/$NAME"
 
 # --- Files ---
-install -D -m 0644 systemd/rpi4-rtsp.service "$STAGE/usr/lib/systemd/system/rpi4-rtsp.service"
+install -D -m 0644 systemd/rtspwall.service "$STAGE/usr/lib/systemd/system/rtspwall.service"
 DOC=$STAGE/usr/share/doc/$NAME
 install -d -m 0755 "$DOC/examples"
 install -m 0644 examples/* "$DOC/examples/"
@@ -56,7 +56,7 @@ if [[ -f README.md ]]; then install -m 0644 README.md "$DOC/README.md"; fi
     echo
     echo "  * Release $VERSION."
     echo
-    echo " -- rpi4-rtsp contributors <noreply@users.noreply.github.com>  $(date -R)"
+    echo " -- rtspwall contributors <noreply@users.noreply.github.com>  $(date -R)"
 } | gzip -9n >"$DOC/changelog.gz"
 find "$DOC" -type f -name '*.md' -exec gzip -9nf {} +
 
@@ -91,10 +91,10 @@ Version: $VERSION
 Section: video
 Priority: optional
 Architecture: $ARCH
-Maintainer: rpi4-rtsp contributors <noreply@users.noreply.github.com>
+Maintainer: rtspwall contributors <noreply@users.noreply.github.com>
 Installed-Size: $SIZE
 Depends: $DEPENDS
-Homepage: https://github.com/Hovhas/rpi4-rtsp
+Homepage: https://github.com/Hovhas/rtspwall
 Description: RTSP video wall for the Raspberry Pi 4 (DRM/KMS, V4L2 hardware decode)
  Shows several RTSP camera streams on one HDMI display. Decodes H.264 with
  the Pi 4 V4L2 hardware decoder and puts every stream on its own hardware

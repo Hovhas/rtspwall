@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# uninstall.sh - remove a source install of rpi4-rtsp (see install.sh).
+# uninstall.sh - remove a source install of rtspwall (see install.sh).
 #
 #   sudo ./uninstall.sh [--purge]
 #
-# Removes the binary and the systemd unit. The config in /etc/rpi4-rtsp is kept
+# Removes the binary and the systemd unit. The config in /etc/rtspwall is kept
 # unless --purge is given (which also removes the system user).
 # gpu_mem in config.txt is never changed back. Environment: PREFIX (default /usr/local).
 
@@ -23,17 +23,17 @@ done
 [[ $EUID -eq 0 ]] || { echo "Run as root: sudo $0" >&2; exit 1; }
 
 if command -v systemctl >/dev/null; then
-    systemctl disable --now rpi4-rtsp.service 2>/dev/null || true
+    systemctl disable --now rtspwall.service 2>/dev/null || true
 fi
-rm -f /etc/systemd/system/rpi4-rtsp.service "$PREFIX/bin/rpi4-rtsp"
+rm -f /etc/systemd/system/rtspwall.service "$PREFIX/bin/rtspwall"
 if command -v systemctl >/dev/null; then systemctl daemon-reload || true; fi
 echo "Removed binary and unit."
 
 if [[ $PURGE -eq 1 ]]; then
-    rm -rf /etc/rpi4-rtsp
-    if getent passwd rpi4-rtsp >/dev/null; then userdel rpi4-rtsp 2>/dev/null || true; fi
-    if getent group rpi4-rtsp >/dev/null; then groupdel rpi4-rtsp 2>/dev/null || true; fi
+    rm -rf /etc/rtspwall
+    if getent passwd rtspwall >/dev/null; then userdel rtspwall 2>/dev/null || true; fi
+    if getent group rtspwall >/dev/null; then groupdel rtspwall 2>/dev/null || true; fi
     echo "Purged config and system user."
 else
-    echo "Kept /etc/rpi4-rtsp (use --purge to remove it and the system user)."
+    echo "Kept /etc/rtspwall (use --purge to remove it and the system user)."
 fi

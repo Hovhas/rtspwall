@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 First public release.
 
+Formerly named rpi4-rtsp (renamed before the first release).
+
 ### Added
 
 - RTSP to V4L2 M2M H.264 hardware decode to DRM/KMS overlay planes, one plane per camera, zero copy, no display server.

@@ -1,5 +1,5 @@
 /*
- * rpi4-rtsp — RTSP camera streams, each on its own hardware plane, without X.
+ * rtspwall — RTSP camera streams, each on its own hardware plane, without X.
  *
  * Background. On the Raspberry Pi 3, omxplayer decoded in the VideoCore
  * hardware and handed the frame to a DispmanX layer; the hardware video
@@ -51,10 +51,10 @@
  * unique tile forms its own one-member group and never rotates.
  *
  * Here: main(), command line, signal handling and the three small helpers
- * (log_msg/xioctl/monotonic_us) every other file uses. See rpi4rtsp.h for
+ * (log_msg/xioctl/monotonic_us) every other file uses. See rtspwall.h for
  * the file map.
  *
- * Run: sudo rpi4-rtsp [/etc/rpi4-rtsp/cameras.conf]
+ * Run: sudo rtspwall [/etc/rtspwall/cameras.conf]
  *      (requires that no X server/compositor runs — only one client can be
  *      DRM master)
  */
@@ -81,13 +81,13 @@
 #include <libavformat/avformat.h>
 #include <libavutil/log.h>
 
-#include "rpi4rtsp.h"
+#include "rtspwall.h"
 
 #ifndef VERSION
 #define VERSION "0.1.0-dev"
 #endif
 
-#define DEFAULT_CONFIG "/etc/rpi4-rtsp/cameras.conf"
+#define DEFAULT_CONFIG "/etc/rtspwall/cameras.conf"
 
 /* ------------------------------------------------------------------ logging */
 
@@ -197,9 +197,9 @@ static int ffmpeg_level(enum layout_ffmpeg_log l)
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"Usage: rpi4-rtsp [CONFIG]\n"
-		"       rpi4-rtsp --check-config [--mode WxH] [CONFIG]\n"
-		"       rpi4-rtsp --help | --version\n"
+		"Usage: rtspwall [CONFIG]\n"
+		"       rtspwall --check-config [--mode WxH] [CONFIG]\n"
+		"       rtspwall --help | --version\n"
 		"\n"
 		"Shows RTSP camera streams on a Raspberry Pi 4 display, each on its own\n"
 		"hardware plane (V4L2 M2M decoder -> dmabuf -> DRM/KMS, zero copy).\n"
@@ -233,7 +233,7 @@ int main(int argc, char **argv)
 			usage(stdout);
 			return 0;
 		case 'V':
-			printf("rpi4-rtsp %s\n", VERSION);
+			printf("rtspwall %s\n", VERSION);
 			return 0;
 		case 'c':
 			check = true;
@@ -247,20 +247,20 @@ int main(int argc, char **argv)
 		}
 	}
 	if (argc - optind > 1) {
-		fprintf(stderr, "rpi4-rtsp: too many arguments\n");
+		fprintf(stderr, "rtspwall: too many arguments\n");
 		usage(stderr);
 		return 2;
 	}
 	const char *conf = optind < argc ? argv[optind] : DEFAULT_CONFIG;
 
 	if (mode_arg && !check) {
-		fprintf(stderr, "rpi4-rtsp: --mode is only valid with --check-config\n");
+		fprintf(stderr, "rtspwall: --mode is only valid with --check-config\n");
 		return 2;
 	}
 	if (check) {
 		int w = 1920, h = 1080;
 		if (mode_arg && layout_parse_size(mode_arg, &w, &h) < 0) {
-			fprintf(stderr, "rpi4-rtsp: --mode expects WxH (e.g. 1920x1080), got \"%s\"\n",
+			fprintf(stderr, "rtspwall: --mode expects WxH (e.g. 1920x1080), got \"%s\"\n",
 				mode_arg);
 			return 2;
 		}
@@ -275,7 +275,7 @@ int main(int argc, char **argv)
 	signal(SIGTERM, signal_handler);
 	signal(SIGPIPE, SIG_IGN);
 
-	log_msg("rpi4-rtsp %s starting, config %s", VERSION, conf);
+	log_msg("rtspwall %s starting, config %s", VERSION, conf);
 	av_log_set_level(AV_LOG_ERROR);
 	av_log_set_callback(av_log_masked);
 	avformat_network_init();

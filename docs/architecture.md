@@ -1,12 +1,12 @@
 # Architecture
 
-How rpi4-rtsp gets from an RTSP stream to a smooth picture without copying a frame. Read the [README](../README.md) first for the overview.
+How rtspwall gets from an RTSP stream to a smooth picture without copying a frame. Read the [README](../README.md) first for the overview.
 
 ## Why a single DRM client
 
 On the Pi 3, omxplayer decoded in the VideoCore and handed frames to DispmanX layers, which the hardware video scaler (HVS) composited during scanout. DispmanX is gone under KMS, and the display's hardware planes can be used by one DRM master at a time. Several independent players therefore cannot each get a plane of their own; going through X11 and XVideo costs a copy and a format conversion per frame and stream.
 
-rpi4-rtsp is that one client. It becomes DRM master, gives each camera an overlay plane and lets the HVS scale and compose.
+rtspwall is that one client. It becomes DRM master, gives each camera an overlay plane and lets the HVS scale and compose.
 
 ## Pipeline
 

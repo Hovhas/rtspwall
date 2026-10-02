@@ -13,7 +13,7 @@
 ## Tested on hardware
 
 <!-- For changes to decoding, DRM or timing: Pi model, OS, number of cameras, and the 60 s lines
-     (journalctl -u rpi4-rtsp | grep ': 60s'). Write "not applicable" for docs or pure-logic changes. -->
+     (journalctl -u rtspwall | grep ': 60s'). Write "not applicable" for docs or pure-logic changes. -->
 
 ```
 ```

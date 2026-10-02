@@ -1,33 +1,33 @@
 #!/bin/sh
-# postinst for rpi4-rtsp. Does not enable or start the service and never
+# postinst for rtspwall. Does not enable or start the service and never
 # modifies config.txt.
 set -e
 
-CONF_DIR=/etc/rpi4-rtsp
+CONF_DIR=/etc/rtspwall
 CONF=$CONF_DIR/cameras.conf
-EXAMPLE=/usr/share/doc/rpi4-rtsp/examples/cameras.conf
+EXAMPLE=/usr/share/doc/rtspwall/examples/cameras.conf
 
 case "$1" in
     configure)
-        if ! getent passwd rpi4-rtsp >/dev/null; then
+        if ! getent passwd rtspwall >/dev/null; then
             adduser --system --group --no-create-home --home /nonexistent \
-                --shell /usr/sbin/nologin --quiet rpi4-rtsp
+                --shell /usr/sbin/nologin --quiet rtspwall
         fi
-        adduser --quiet rpi4-rtsp video
-        if getent group render >/dev/null; then adduser --quiet rpi4-rtsp render; fi
+        adduser --quiet rtspwall video
+        if getent group render >/dev/null; then adduser --quiet rtspwall render; fi
 
-        install -d -m 0750 -o root -g rpi4-rtsp "$CONF_DIR"
+        install -d -m 0750 -o root -g rtspwall "$CONF_DIR"
         if [ -e "$CONF" ]; then
-            chown root:rpi4-rtsp "$CONF"
+            chown root:rtspwall "$CONF"
             chmod 0640 "$CONF"
         elif [ -f "$EXAMPLE" ]; then
-            install -m 0640 -o root -g rpi4-rtsp "$EXAMPLE" "$CONF"
+            install -m 0640 -o root -g rtspwall "$EXAMPLE" "$CONF"
         fi
 
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload || true
             # Upgrade: restart only if it was already running.
-            systemctl try-restart rpi4-rtsp.service || true
+            systemctl try-restart rtspwall.service || true
         fi
 
         gpu=""
@@ -38,13 +38,13 @@ case "$1" in
             fi
         done
         if [ -z "$gpu" ] || [ "$gpu" -lt 256 ]; then
-            echo "rpi4-rtsp: WARNING: gpu_mem is ${gpu:-unset (default)} in config.txt." >&2
-            echo "rpi4-rtsp: 4 or more concurrent 1080p decoders need gpu_mem=256." >&2
-            echo "rpi4-rtsp: Add 'gpu_mem=256' to /boot/firmware/config.txt and reboot." >&2
+            echo "rtspwall: WARNING: gpu_mem is ${gpu:-unset (default)} in config.txt." >&2
+            echo "rtspwall: 4 or more concurrent 1080p decoders need gpu_mem=256." >&2
+            echo "rtspwall: Add 'gpu_mem=256' to /boot/firmware/config.txt and reboot." >&2
         fi
 
-        echo "rpi4-rtsp: edit $CONF, run 'sudo rpi4-rtsp --check-config $CONF'," >&2
-        echo "rpi4-rtsp: then 'systemctl enable --now rpi4-rtsp'. It is not started automatically." >&2
+        echo "rtspwall: edit $CONF, run 'sudo rtspwall --check-config $CONF'," >&2
+        echo "rtspwall: then 'systemctl enable --now rtspwall'. It is not started automatically." >&2
         ;;
     abort-upgrade | abort-remove | abort-deconfigure) ;;
     *)

@@ -1,5 +1,5 @@
 # Build artefacts
-src/rpi4-rtsp
+src/rtspwall
 src/test_pacing
 src/test_layout
 src/.version

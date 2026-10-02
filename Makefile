@@ -1,10 +1,10 @@
-# rpi4-rtsp — build, test and install.
+# rtspwall — build, test and install.
 #
 # Build dependencies (Raspberry Pi OS / Debian):
 #   sudo apt install build-essential pkg-config libdrm-dev \
 #                    libavformat-dev libavcodec-dev libavutil-dev
 #
-#   make                       build src/rpi4-rtsp
+#   make                       build src/rtspwall
 #   make test                  build and run the unit tests (no hardware needed)
 #   make install               install to $(DESTDIR)$(PREFIX)/bin
 #   make VERSION=1.2.3         override the version string
@@ -49,10 +49,10 @@ DEPS_CFLAGS = $(shell $(PKG_CONFIG) --cflags libdrm libavformat libavcodec libav
 DEPS_LIBS   = $(shell $(PKG_CONFIG) --libs libdrm libavformat libavcodec libavutil)
 LDLIBS  += $(DEPS_LIBS) -lpthread
 
-BIN  = src/rpi4-rtsp
+BIN  = src/rtspwall
 SRCS = src/main.c src/drm.c src/v4l2.c src/camera_thread.c src/compositor.c \
        src/config.c src/layout.c src/pacing.c
-HDRS = src/rpi4rtsp.h src/layout.h src/pacing.h
+HDRS = src/rtspwall.h src/layout.h src/pacing.h
 
 all: $(BIN)
 
@@ -69,7 +69,7 @@ $(BIN): $(SRCS) $(HDRS) $(VERSION_STAMP)
 # busy executable fails with "Text file busy", install writes a new inode.
 install: $(BIN)
 	install -d $(DESTDIR)$(BINDIR)
-	install -m 755 $(BIN) $(DESTDIR)$(BINDIR)/rpi4-rtsp
+	install -m 755 $(BIN) $(DESTDIR)$(BINDIR)/rtspwall
 
 # The pure logic (pacing.c, layout.c) is built with just the C compiler —
 # no pkg-config, no DRM/V4L2/FFmpeg — so the tests run on any development

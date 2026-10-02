@@ -2,7 +2,7 @@
  * compositor.c — the atomic commit loop: waits for vblank/flip, picks ripe
  * frames from each camera's jitter buffer (including the rotation
  * decision), builds ONE atomic commit per vblank and writes the 60-second
- * statistics lines. See rpi4rtsp.h for the structs.
+ * statistics lines. See rtspwall.h for the structs.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -17,7 +17,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-#include "rpi4rtsp.h"
+#include "rtspwall.h"
 
 /* -------------------------------------------------------------- compositor */
 

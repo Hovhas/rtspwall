@@ -1,20 +1,22 @@
-# rpi4-rtsp
+# rtspwall
 
 An RTSP camera wall for the Raspberry Pi 4. Every camera is hardware-decoded and shown on its own display plane, with no X11, no Wayland and no frame copies.
 
-[![CI](https://github.com/Hovhas/rpi4-rtsp/actions/workflows/ci.yml/badge.svg)](https://github.com/Hovhas/rpi4-rtsp/actions/workflows/ci.yml)
+[![CI](https://github.com/Hovhas/rtspwall/actions/workflows/ci.yml/badge.svg)](https://github.com/Hovhas/rtspwall/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform: Raspberry Pi 4](https://img.shields.io/badge/platform-Raspberry%20Pi%204-c51a4a.svg)
 
 <!-- TODO: add demo GIF (docs/demo.gif) and reference it here with an image link once it exists. -->
 *Demo GIF coming soon.*
 
+<sub>Formerly named rpi4-rtsp (renamed before the first release).</sub>
+
 Measured on a Pi 4 (8 GB) with six cameras on one 1080p60 HDMI display (four tiles, two of them rotating): **CPU 2-13 % (typically 6-9 %), 0.0-0.2 % dropped frames, about 150 ms latency** from the network to the screen.
 
 ## Why
 
 - **The Pi 4 can do this in hardware.** The H.264 decoder and the display's hardware video scaler (HVS) do all the pixel work. The CPU only demuxes RTSP and schedules frames.
-- **No display server.** rpi4-rtsp is the DRM/KMS client. You can run it on a Raspberry Pi OS Lite install that has no desktop.
+- **No display server.** rtspwall is the DRM/KMS client. You can run it on a Raspberry Pi OS Lite install that has no desktop.
 - **Smooth, not just live.** Each camera has its own jitter buffer, and a PLL evens out recorders that timestamp frames in pairs. Details in [docs/architecture.md](docs/architecture.md).
 - **Built to run unattended.** A watchdog reconnects a silent stream after 5 s. In a test that blocked all cameras for 15 s, the wall recovered 4-6 s after the block was lifted.
 
@@ -22,7 +24,7 @@ Measured on a Pi 4 (8 GB) with six cameras on one 1080p60 HDMI display (four til
 
 Short and, we hope, fair. Other projects solve different problems, and we only claim what we have measured or can read from the code.
 
-| | rpi4-rtsp | [displaycameras](https://github.com/Anonymousdog/displaycameras) | mpv / VLC wall | Frigate Birdseye |
+| | rtspwall | [displaycameras](https://github.com/Anonymousdog/displaycameras) | mpv / VLC wall | Frigate Birdseye |
 |---|---|---|---|---|
 | What it is | Video wall for the Pi 4 | Video wall for the Pi 3 | General players, one per camera | View inside an NVR |
 | Decode | Pi 4 V4L2 hardware decoder | omxplayer (VideoCore) | Depends on setup; often software on a Pi 4 | Not a display path for a Pi |
@@ -31,7 +33,7 @@ Short and, we hope, fair. Other projects solve different problems, and we only c
 | Frame copies per stream | None | None | At least one in our X11 tests | n/a |
 | Rotating cameras in one tile | Yes, no black frame | Not covered here | Scripted by hand | n/a |
 
-Frigate is an NVR with a web UI, not a wall renderer, and the two work well together: point rpi4-rtsp at a go2rtc/Frigate restream so the NVR and the wall share one camera connection.
+Frigate is an NVR with a web UI, not a wall renderer, and the two work well together: point rtspwall at a go2rtc/Frigate restream so the NVR and the wall share one camera connection.
 
 ## Features
 
@@ -50,7 +52,7 @@ Frigate is an NVR with a web UI, not a wall renderer, and the two work well toge
 |---|---|
 | Board | Raspberry Pi 4 Model B (tested). Pi 400 and CM4 should work but are **untested**. |
 | Pi 5 | **Not supported.** It has no H.264 hardware decoder. |
-| OS | Raspberry Pi OS Bookworm or Trixie, 64-bit **Lite**. Tested on Trixie. A desktop session that holds DRM master on the same output will block rpi4-rtsp. |
+| OS | Raspberry Pi OS Bookworm or Trixie, 64-bit **Lite**. Tested on Trixie. A desktop session that holds DRM master on the same output will block rtspwall. |
 | Video | H.264 only. H.265/HEVC is not supported yet. |
 | Libraries | FFmpeg 5.1-7.1 and libdrm >= 2.4.113 (what Bookworm and Trixie ship). Bullseye is not supported. |
 | Firmware | `gpu_mem=256` in `config.txt` for 4 or more concurrent 1080p streams. The source `install.sh` sets it; the `.deb` and the tarball only warn (see [Quick start](#quick-start)). |
@@ -58,32 +60,32 @@ Frigate is an NVR with a web UI, not a wall renderer, and the two work well toge
 
 ## Quick start
 
-Download the package for your OS from [GitHub Releases](https://github.com/Hovhas/rpi4-rtsp/releases). The file is named `rpi4-rtsp_<version>_<bookworm|trixie>_arm64.deb`.
+Download the package for your OS from [GitHub Releases](https://github.com/Hovhas/rtspwall/releases). The file is named `rtspwall_<version>_<bookworm|trixie>_arm64.deb`.
 
 ```bash
-sudo apt install ./rpi4-rtsp_<version>_<bookworm|trixie>_arm64.deb
+sudo apt install ./rtspwall_<version>_<bookworm|trixie>_arm64.deb
 printf '[all]\ngpu_mem=256\n' | sudo tee -a /boot/firmware/config.txt && sudo reboot   # skip if already >= 256
-sudo nano /etc/rpi4-rtsp/cameras.conf          # add your camera URLs
-sudo rpi4-rtsp --check-config /etc/rpi4-rtsp/cameras.conf
-sudo systemctl enable --now rpi4-rtsp
-journalctl -u rpi4-rtsp -f
+sudo nano /etc/rtspwall/cameras.conf          # add your camera URLs
+sudo rtspwall --check-config /etc/rtspwall/cameras.conf
+sudo systemctl enable --now rtspwall
+journalctl -u rtspwall -f
 ```
 
-The package does not start the service and does not edit `config.txt`; it prints a warning if `gpu_mem` is too low. The service runs as the system user `rpi4-rtsp` (groups `video` and `render`).
+The package does not start the service and does not edit `config.txt`; it prints a warning if `gpu_mem` is too low. The service runs as the system user `rtspwall` (groups `video` and `render`).
 
 Other ways to install:
 
-- **Tarball** from the same Releases page (`rpi4-rtsp_<version>_<dist>_arm64.tar.gz`): extract it and run the `install.sh` inside.
+- **Tarball** from the same Releases page (`rtspwall_<version>_<dist>_arm64.tar.gz`): extract it and run the `install.sh` inside.
 - **From source:**
   ```bash
-  git clone https://github.com/Hovhas/rpi4-rtsp && cd rpi4-rtsp
+  git clone https://github.com/Hovhas/rtspwall && cd rtspwall
   sudo ./install.sh          # options: --no-gpu-mem, --no-build-deps
   ```
   `install.sh` installs build dependencies, builds, runs the tests, installs the binary and the unit, and sets `gpu_mem=256` (backing up `config.txt`; a reboot is needed). It does not enable or start the service. Remove a source install with `sudo ./uninstall.sh [--purge]`.
 
 ## Configuration
 
-The config file is `/etc/rpi4-rtsp/cameras.conf` (mode 0640, `root:rpi4-rtsp`). A commented example is in [examples/cameras.conf](examples/cameras.conf). Lines starting with `#` are comments. Global settings are `KEY=VALUE` lines and can appear anywhere; an unknown key gives a warning, not an error.
+The config file is `/etc/rtspwall/cameras.conf` (mode 0640, `root:rtspwall`). A commented example is in [examples/cameras.conf](examples/cameras.conf). Lines starting with `#` are comments. Global settings are `KEY=VALUE` lines and can appear anywhere; an unknown key gives a warning, not an error.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -139,18 +141,18 @@ driveway  |rtsp://viewer:CHANGE_ME@192.168.1.11:554/stream1|960|540|960|0
 ### Check a config
 
 ```bash
-sudo rpi4-rtsp --check-config /etc/rpi4-rtsp/cameras.conf
-sudo rpi4-rtsp --check-config --mode 1280x720 /etc/rpi4-rtsp/cameras.conf   # other screen size
+sudo rtspwall --check-config /etc/rtspwall/cameras.conf
+sudo rtspwall --check-config --mode 1280x720 /etc/rtspwall/cameras.conf   # other screen size
 ```
 
-`sudo` is needed only because the config is readable by root and the `rpi4-rtsp` user. It prints the interpreted layout (credentials masked), one tile per line, and a summary such as `OK: 6 cameras, 4 tiles, 2 rotation groups; needs 6 overlay planes and 6 concurrent decoder instances`. It exits non-zero on errors, with a `line N: ...` message.
+`sudo` is needed only because the config is readable by root and the `rtspwall` user. It prints the interpreted layout (credentials masked), one tile per line, and a summary such as `OK: 6 cameras, 4 tiles, 2 rotation groups; needs 6 overlay planes and 6 concurrent decoder instances`. It exits non-zero on errors, with a `line N: ...` message.
 
 Full command line:
 
 ```
-Usage: rpi4-rtsp [CONFIG]
-       rpi4-rtsp --check-config [--mode WxH] [CONFIG]
-       rpi4-rtsp --help | --version
+Usage: rtspwall [CONFIG]
+       rtspwall --check-config [--mode WxH] [CONFIG]
+       rtspwall --help | --version
 ```
 
 ## Camera URL cheat sheet
@@ -165,7 +167,7 @@ Replace the placeholders. Sub-streams are strongly recommended (see [Requirement
 | Dahua / Amcrest | `rtsp://<user>:<pass>@<ip>:554/cam/realmonitor?channel=1&subtype=1` (`subtype=0` is the main stream) |
 | go2rtc / Frigate restream | `rtsp://<host>:8554/<stream-name>` |
 
-The camera must deliver H.264. If a camera offers both codecs, pick H.264 for the stream you give to rpi4-rtsp.
+The camera must deliver H.264. If a camera offers both codecs, pick H.264 for the stream you give to rtspwall.
 
 ## How it works
 
@@ -183,8 +185,8 @@ No frame is copied by the CPU or GPU and no GPU textures are involved: the decod
 ## Monitoring
 
 ```bash
-journalctl -u rpi4-rtsp -f
-journalctl -u rpi4-rtsp | grep ': 60s'
+journalctl -u rtspwall -f
+journalctl -u rtspwall | grep ': 60s'
 ```
 
 Every 60 s each camera logs one line:
@@ -217,7 +219,7 @@ Common problems, with fixes, are in [docs/troubleshooting.md](docs/troubleshooti
 
 ```bash
 sudo apt install build-essential pkg-config libdrm-dev libavformat-dev libavcodec-dev libavutil-dev
-make                 # builds src/rpi4-rtsp (-Werror)
+make                 # builds src/rtspwall (-Werror)
 make test            # unit tests for the pure logic, no Pi hardware needed
 make test SANITIZE=1 # with AddressSanitizer and UBSan (off by default on the Pi, where ASan may not start)
 make WERROR=0        # packagers: build without -Werror (warnings stay on)
@@ -242,4 +244,4 @@ These are ideas, not promises.
 
 ## Acknowledgements
 
-[displaycameras](https://github.com/Anonymousdog/displaycameras) showed how good a hardware-decoded Pi camera wall can be on the Pi 3 with omxplayer and DispmanX. rpi4-rtsp exists because that approach cannot follow the Pi to current Raspberry Pi OS, and it aims to bring the same idea to the Pi 4 through V4L2 and DRM/KMS.
+[displaycameras](https://github.com/Anonymousdog/displaycameras) showed how good a hardware-decoded Pi camera wall can be on the Pi 3 with omxplayer and DispmanX. rtspwall exists because that approach cannot follow the Pi to current Raspberry Pi OS, and it aims to bring the same idea to the Pi 4 through V4L2 and DRM/KMS.

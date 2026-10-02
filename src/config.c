@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "rpi4rtsp.h"
+#include "rtspwall.h"
 
 #define CONFIG_MAX_BYTES (1024 * 1024)
 
@@ -55,7 +55,7 @@ static void warn_to_log(void *ctx, const char *msg)
 
 static void warn_to_stderr(void *ctx, const char *msg)
 {
-	fprintf(stderr, "rpi4-rtsp: %s: warning: %s\n", (const char *)ctx, msg);
+	fprintf(stderr, "rtspwall: %s: warning: %s\n", (const char *)ctx, msg);
 }
 
 static int parse_file(struct layout_config *cfg, const char *path,
@@ -196,12 +196,12 @@ int check_config(const char *path, int screen_w, int screen_h)
 	char err[768];
 
 	if (parse_file(&cfg, path, warn_to_stderr, err, sizeof err) < 0) {
-		fprintf(stderr, "rpi4-rtsp: %s\n", err);
+		fprintf(stderr, "rtspwall: %s\n", err);
 		return 1;
 	}
 	if (layout_apply(&cfg, screen_w, screen_h, warn_to_stderr, (void *)path,
 			 err, sizeof err) < 0) {
-		fprintf(stderr, "rpi4-rtsp: %s: %s\n", path, err);
+		fprintf(stderr, "rtspwall: %s: %s\n", path, err);
 		return 1;
 	}
 

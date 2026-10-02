@@ -1,5 +1,5 @@
 /*
- * rpi4rtsp.h — shared structs and function declarations for rpi4-rtsp.
+ * rtspwall.h — shared structs and function declarations for rtspwall.
  *
  *   main.c           main(), command line, log/xioctl/monotonic_us, signals
  *   drm.c            DRM helpers (display, connector, planes, properties,
@@ -12,8 +12,8 @@
  *   layout.{c,h}     pure config parsing and tile geometry (testable)
  *   pacing.{c,h}     pure pacing/rotation logic (testable)
  */
-#ifndef RPI4RTSP_H
-#define RPI4RTSP_H
+#ifndef RTSPWALL_H
+#define RTSPWALL_H
 
 #include <pthread.h>
 #include <signal.h>

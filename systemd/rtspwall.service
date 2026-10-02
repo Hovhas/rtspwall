@@ -1,6 +1,6 @@
 [Unit]
-Description=rpi4-rtsp - RTSP video wall on the Raspberry Pi 4 (DRM/KMS, V4L2 hardware decode)
-Documentation=https://github.com/Hovhas/rpi4-rtsp
+Description=rtspwall - RTSP video wall on the Raspberry Pi 4 (DRM/KMS, V4L2 hardware decode)
+Documentation=https://github.com/Hovhas/rtspwall
 After=network-online.target
 Wants=network-online.target
 # Never give up restarting: a camera or network outage must not leave the
@@ -10,16 +10,16 @@ StartLimitIntervalSec=0
 # Deliberately no Conflicts=getty@tty1.service: a text getty on tty1 is not a
 # DRM master, so it does not get in the way. Only a competing display server
 # (X11, Wayland compositor, another KMS client) on the same output does.
-# Do not run one on the screen you give to rpi4-rtsp.
+# Do not run one on the screen you give to rtspwall.
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/rpi4-rtsp /etc/rpi4-rtsp/cameras.conf
+ExecStart=/usr/bin/rtspwall /etc/rtspwall/cameras.conf
 # NOTE: /usr/bin is the packaged path. install.sh rewrites it to
 # $PREFIX/bin (default /usr/local/bin) for source installs.
 
-User=rpi4-rtsp
-Group=rpi4-rtsp
+User=rtspwall
+Group=rtspwall
 # video: /dev/dri/card*, /dev/video10; render: /dev/dri/renderD*, /dev/dma_heap/*
 SupplementaryGroups=video render
 
@@ -33,8 +33,8 @@ TimeoutStopSec=10
 #
 # Safe core: none of these touch DRM master, V4L2 or dmabuf, and they are
 # expected to work as-is. Still, verify on a real Pi 4 before a release:
-#   systemctl start rpi4-rtsp; journalctl -u rpi4-rtsp -b
-#   systemd-analyze security rpi4-rtsp
+#   systemctl start rtspwall; journalctl -u rtspwall -b
+#   systemd-analyze security rtspwall
 # ---------------------------------------------------------------------------
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -67,7 +67,7 @@ SystemCallFilter=~@privileged
 # ---------------------------------------------------------------------------
 # Opt-in hardening. Left OFF because it can break DRM/V4L2/dmabuf or
 # FFmpeg in ways that cannot be tested off-device. Enable one at a time
-# (systemctl edit rpi4-rtsp, or uncomment here), restart, and confirm that
+# (systemctl edit rtspwall, or uncomment here), restart, and confirm that
 # all camera tiles still show live video.
 # ---------------------------------------------------------------------------
 # UNVERIFIED: FFmpeg/libdrm may map W+X memory on some builds.

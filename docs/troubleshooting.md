@@ -3,9 +3,9 @@
 Start with the logs:
 
 ```bash
-journalctl -u rpi4-rtsp -b
+journalctl -u rtspwall -b
 dmesg | grep -iE 'vc4|bcm2835|codec'
-sudo rpi4-rtsp --check-config /etc/rpi4-rtsp/cameras.conf
+sudo rtspwall --check-config /etc/rtspwall/cameras.conf
 ```
 
 ## Only the first few cameras start, `REQBUFS OUTPUT: Invalid argument`
@@ -23,14 +23,14 @@ Fix: add `gpu_mem=256` to `/boot/firmware/config.txt` (older systems: `/boot/con
 
 ## Black screen, or the wrong screen
 
-- Check which connectors exist. With a `CONNECTOR` that does not match, rpi4-rtsp logs every DRM card it scanned and the connectors on each, with their status.
+- Check which connectors exist. With a `CONNECTOR` that does not match, rtspwall logs every DRM card it scanned and the connectors on each, with their status.
 - Set `CONNECTOR=HDMI-A-1` (or `HDMI-A-2`) in the config to pick the output.
 - On a Pi 4 with two HDMI outputs there may be more than one DRM card. Set `DRM_DEVICE` (for example `/dev/dri/card1`) if the automatic choice is wrong.
 - Make sure the display is connected and powered on at boot, then restart the service.
 
 ## `cannot become DRM master`
 
-Only one client can be DRM master on a display. Something else holds it: an X server, a Wayland compositor, or another KMS program. rpi4-rtsp logs `is an X server or another compositor running?`.
+Only one client can be DRM master on a display. Something else holds it: an X server, a Wayland compositor, or another KMS program. rtspwall logs `is an X server or another compositor running?`.
 
 Use Raspberry Pi OS **Lite**, or stop the desktop session (`sudo systemctl stop lightdm`, or the display manager your system uses) and disable it if you want the wall permanently. A plain text login on `tty1` is not a problem.
 
@@ -74,4 +74,4 @@ Requires `nft` (`sudo apt install nftables`). In our test on a Pi 4 with six cam
 
 ## Reporting a problem
 
-Open an issue using the bug report template. Include the Pi model, OS version, `rpi4-rtsp --version`, `--check-config` output, a few 60 s lines and the `dmesg` output above. Check your logs before pasting them: passwords, query strings and token-like path segments (for example UniFi Protect tokens) are masked, but masking is heuristic, so read what you paste.
+Open an issue using the bug report template. Include the Pi model, OS version, `rtspwall --version`, `--check-config` output, a few 60 s lines and the `dmesg` output above. Check your logs before pasting them: passwords, query strings and token-like path segments (for example UniFi Protect tokens) are masked, but masking is heuristic, so read what you paste.

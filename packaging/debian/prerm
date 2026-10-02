@@ -4,8 +4,8 @@ set -e
 case "$1" in
     remove | deconfigure)
         if [ -d /run/systemd/system ]; then
-            systemctl stop rpi4-rtsp.service || true
-            systemctl disable rpi4-rtsp.service >/dev/null 2>&1 || true
+            systemctl stop rtspwall.service || true
+            systemctl disable rtspwall.service >/dev/null 2>&1 || true
         fi
         ;;
     upgrade | failed-upgrade) ;; # postinst does try-restart

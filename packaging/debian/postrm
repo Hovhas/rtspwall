@@ -8,9 +8,9 @@ case "$1" in
 esac
 
 if [ "$1" = purge ]; then
-    rm -rf /etc/rpi4-rtsp
-    if getent passwd rpi4-rtsp >/dev/null; then deluser --system --quiet rpi4-rtsp || true; fi
-    if getent group rpi4-rtsp >/dev/null; then delgroup --system --quiet rpi4-rtsp || true; fi
+    rm -rf /etc/rtspwall
+    if getent passwd rtspwall >/dev/null; then deluser --system --quiet rtspwall || true; fi
+    if getent group rtspwall >/dev/null; then delgroup --system --quiet rtspwall || true; fi
 fi
 
 exit 0

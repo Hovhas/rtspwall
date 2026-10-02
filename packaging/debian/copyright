@@ -1,9 +1,9 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: rpi4-rtsp
-Source: https://github.com/Hovhas/rpi4-rtsp
+Upstream-Name: rtspwall
+Source: https://github.com/Hovhas/rtspwall
 
 Files: *
-Copyright: 2026 rpi4-rtsp contributors
+Copyright: 2026 rtspwall contributors
 License: MIT
 
 License: MIT
