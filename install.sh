@@ -4,11 +4,13 @@
 #   git clone https://github.com/Hovhas/rtspwall && cd rtspwall
 #   sudo ./install.sh
 #
-# Idempotent: safe to re-run (upgrades the binary and unit, never overwrites
-# an existing config). Does NOT enable or start the service.
+# Idempotent: safe to re-run (upgrades the binary and units, never overwrites
+# an existing config). Does NOT enable or start the service, and never touches
+# config.txt: run 'sudo rtspwall doctor --fix' to set gpu_mem (it asks first
+# and makes a backup).
 #
 # Options:
-#   --no-gpu-mem      do not touch config.txt (gpu_mem)
+#   --no-gpu-mem      accepted and ignored (kept for backward compatibility)
 #   --no-build-deps   do not run apt-get (build dependencies already present)
 #   -h, --help        show this help
 #
@@ -20,17 +22,15 @@ PREFIX=${PREFIX:-/usr/local}
 SVC_USER=rtspwall
 CONF_DIR=/etc/rtspwall
 CONF=$CONF_DIR/cameras.conf
-UNIT_DST=/etc/systemd/system/rtspwall.service
-GPU_MEM_MIN=256
-DO_GPU_MEM=1
+UNIT_DIR=/etc/systemd/system
+UNITS=(rtspwall.service rtspwall-demo.service rtspwall-config.service rtspwall-config.path)
 DO_DEPS=1
-NEED_REBOOT=0
 
 usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 for arg in "$@"; do
     case $arg in
-        --no-gpu-mem) DO_GPU_MEM=0 ;;
+        --no-gpu-mem) ;; # no-op: config.txt is no longer modified here
         --no-build-deps) DO_DEPS=0 ;;
         -h | --help) usage; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
@@ -41,7 +41,10 @@ done
 
 SRC_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SRC_DIR"
-[[ -f Makefile && -f systemd/rtspwall.service ]] || {
+complete=1
+[[ -f Makefile ]] || complete=0
+for u in "${UNITS[@]}"; do [[ -f systemd/$u ]] || complete=0; done
+[[ $complete -eq 1 ]] || {
     echo "Run this from a complete rtspwall checkout." >&2
     exit 1
 }
@@ -74,13 +77,18 @@ if [[ $DO_DEPS -eq 1 ]]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y --no-install-recommends \
-        build-essential pkg-config libdrm-dev \
+        build-essential pkg-config libdrm-dev ffmpeg \
         libavformat-dev libavcodec-dev libavutil-dev
 fi
 
 echo "== Building and installing =="
 make
 make test
+if command -v ffmpeg >/dev/null; then
+    make demo-clips
+else
+    echo "  WARNING: ffmpeg not found; 'rtspwall demo' clips will be missing." >&2
+fi
 make PREFIX="$PREFIX" install
 
 echo "== System user and config =="
@@ -102,45 +110,27 @@ else
     echo "  installed example config: $CONF"
 fi
 
-echo "== systemd unit =="
-# The unit file uses the packaged path /usr/bin; point it at $PREFIX/bin.
-sed "s|/usr/bin/rtspwall|$PREFIX/bin/rtspwall|g" systemd/rtspwall.service >"$UNIT_DST"
-chmod 0644 "$UNIT_DST"
+echo "== systemd units =="
+# The unit files use packaged paths (/usr/bin, /usr/share); point them at $PREFIX.
+for u in "${UNITS[@]}"; do
+    sed -e "s|/usr/bin/rtspwall|$PREFIX/bin/rtspwall|g" \
+        -e "s|/usr/share/rtspwall|$PREFIX/share/rtspwall|g" "systemd/$u" >"$UNIT_DIR/$u"
+    chmod 0644 "$UNIT_DIR/$u"
+    echo "  installed $UNIT_DIR/$u"
+done
 systemctl daemon-reload
-echo "  installed $UNIT_DST (ExecStart=$PREFIX/bin/rtspwall)"
+# Watch cameras.conf for edits. This does not start the wall itself.
+systemctl enable --now rtspwall-config.path >/dev/null 2>&1 || true
 
-if [[ $DO_GPU_MEM -eq 1 ]]; then
-    echo "== Firmware GPU memory =="
-    CONFTXT=/boot/firmware/config.txt
-    [[ -f $CONFTXT ]] || CONFTXT=/boot/config.txt
-    if [[ ! -f $CONFTXT ]]; then
-        echo "  no config.txt found; set gpu_mem=$GPU_MEM_MIN yourself (>=4 concurrent 1080p decoders)."
-    else
-        CUR=$(sed -n 's/^gpu_mem=\([0-9]\+\)[[:space:]]*$/\1/p' "$CONFTXT" | tail -n1)
-        if [[ -n $CUR && $CUR -ge $GPU_MEM_MIN ]]; then
-            echo "  gpu_mem=$CUR in $CONFTXT (ok)"
-        else
-            BACKUP="$CONFTXT.rtspwall.bak"
-            [[ -e $BACKUP ]] || cp -p "$CONFTXT" "$BACKUP"
-            if [[ -n $CUR ]]; then
-                sed -i "s/^gpu_mem=[0-9]\\+[[:space:]]*\$/gpu_mem=$GPU_MEM_MIN/" "$CONFTXT"
-            else
-                printf '\n# rtspwall: firmware heap for several concurrent H.264 decoders\n[all]\ngpu_mem=%s\n' \
-                    "$GPU_MEM_MIN" >>"$CONFTXT"
-            fi
-            echo "  set gpu_mem=$GPU_MEM_MIN in $CONFTXT (backup: $BACKUP)"
-            NEED_REBOOT=1
-        fi
-    fi
+if [[ -x /usr/bin/rtspwall && $PREFIX != /usr ]]; then
+    echo "  WARNING: /usr/bin/rtspwall exists too; check 'command -v rtspwall'." >&2
 fi
 
 echo
 echo "Done. The service was NOT enabled or started. Next steps:"
-if [[ $NEED_REBOOT -eq 1 ]]; then
-    echo "  0. REBOOT: gpu_mem was changed and only takes effect after a restart."
-fi
-echo "  1. Edit the config:        sudo nano $CONF"
-echo "  2. Validate it:            sudo rtspwall --check-config $CONF"
-echo "  3. Start the video wall:   sudo systemctl enable --now rtspwall"
-echo "     Logs:                   journalctl -u rtspwall -f"
+echo "  sudo rtspwall demo          # 2x2 test wall, no cameras needed"
+echo "  sudo rtspwall probe         # check a camera URL (codec, size, decoder budget)"
+echo "  sudo rtspwall add NAME      # add a camera and start the wall"
+echo "Config: $CONF   Logs: journalctl -u rtspwall -f"
+echo "Check gpu_mem and the rest of the system: sudo rtspwall doctor   (--fix to repair)"
 echo "Note: no other display server may run on the output used by rtspwall."

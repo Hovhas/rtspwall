@@ -1,6 +1,6 @@
 #!/bin/sh
-# postinst for rtspwall. Does not enable or start the service and never
-# modifies config.txt.
+# postinst for rtspwall. Does not enable or start rtspwall.service (only the
+# rtspwall-config.path watcher, on first install) and never modifies config.txt.
 set -e
 
 CONF_DIR=/etc/rtspwall
@@ -24,8 +24,28 @@ case "$1" in
             install -m 0640 -o root -g rtspwall "$EXAMPLE" "$CONF"
         fi
 
+        # A source/tarball install shadows the package: /etc/systemd/system
+        # overrides /usr/lib/systemd/system and /usr/local/bin precedes /usr/bin.
+        for f in /etc/systemd/system/rtspwall.service \
+                 /etc/systemd/system/rtspwall-demo.service \
+                 /etc/systemd/system/rtspwall-config.service \
+                 /etc/systemd/system/rtspwall-config.path \
+                 /usr/local/bin/rtspwall; do
+            if [ -e "$f" ]; then
+                echo "rtspwall: WARNING: $f exists and shadows this package" >&2
+                echo "rtspwall: (left over from a source/tarball install)." >&2
+                echo "rtspwall: Remove it ('sudo ./uninstall.sh' from that checkout, or 'sudo rm $f')." >&2
+            fi
+        done
+
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload || true
+            # First install: watch cameras.conf for edits. Enabling the .path
+            # unit does not start the wall; rtspwall.service stays disabled.
+            # (On upgrade an administrator's choice to disable it is kept.)
+            if [ -z "$2" ]; then
+                systemctl enable --now rtspwall-config.path >/dev/null 2>&1 || true
+            fi
             # Upgrade: restart only if it was already running.
             systemctl try-restart rtspwall.service || true
         fi
@@ -38,13 +58,17 @@ case "$1" in
             fi
         done
         if [ -z "$gpu" ] || [ "$gpu" -lt 256 ]; then
-            echo "rtspwall: WARNING: gpu_mem is ${gpu:-unset (default)} in config.txt." >&2
-            echo "rtspwall: 4 or more concurrent 1080p decoders need gpu_mem=256." >&2
-            echo "rtspwall: Add 'gpu_mem=256' to /boot/firmware/config.txt and reboot." >&2
+            echo "rtspwall: WARNING: gpu_mem is ${gpu:-unset (default)} in config.txt;" >&2
+            echo "rtspwall: 4 or more concurrent 1080p decoders need 256. Run" >&2
+            echo "rtspwall: 'sudo rtspwall doctor --fix' (asks first, makes a backup), then reboot." >&2
         fi
 
-        echo "rtspwall: edit $CONF, run 'sudo rtspwall --check-config $CONF'," >&2
-        echo "rtspwall: then 'systemctl enable --now rtspwall'. It is not started automatically." >&2
+        cat >&2 <<'NEXT'
+rtspwall: installed. The wall is NOT started automatically. Next steps:
+  sudo rtspwall demo          # 2x2 test wall, no cameras needed
+  sudo rtspwall probe         # check a camera URL (codec, size, decoder budget)
+  sudo rtspwall add NAME      # add a camera and start the wall
+NEXT
         ;;
     abort-upgrade | abort-remove | abort-deconfigure) ;;
     *)

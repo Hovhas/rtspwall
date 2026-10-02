@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <poll.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -65,8 +66,8 @@ static int interrupt_cb(void *arg)
 
 	int64_t since = monotonic_us() - k->last_packet_us;
 	if (since > k->watchdog_limit_us) {
-		log_msg("%s: no data for %.1f s - dropping the connection",
-			k->name, since / 1e6);
+		/* logged by camera_thread as PACING_FAULT_STALL (collapsed) */
+		k->stalled = true;
 		return 1;
 	}
 	return 0;
@@ -135,40 +136,42 @@ static int get_free_output(struct wall *v, struct camera *k)
 /* Converts pkt->pts to microseconds and handles anomalies. A missing pts
  * (AV_NOPTS_VALUE) is replaced by the packet's arrival time directly, no
  * re-anchoring (just a gap in the pts series, nothing broken). A backwards
- * jump also replaces pts with the arrival time — it is no longer reliable
- * as an anchor base — AND re-anchors, just like a large forward jump
- * (> 1 s), where the pts value itself is still used but the old jitter
- * measurement says nothing about the new situation. last_pts_us is always
- * saved as exactly the value the function returns (never the discarded,
- * deviating pts value) — otherwise the next packet is compared against a
- * reference already rejected, forcing a needless extra re-anchor even if
- * the next pts is perfectly fine.
+ * jump (a looped file, a camera that restarted its RTP clock) or a large
+ * forward jump (> 1 s) starts a new pts series: anchor and PLL are reset
+ * and the NEW pts becomes both the returned value and the reference for
+ * the next packet (pacing_pts_classify). An earlier version returned and
+ * stored the arrival time on a backwards jump; the next packet was then
+ * compared against a monotonic-clock value and every later packet counted
+ * as "went backwards" again — one re-anchor and log line per packet.
  *
  * Re-anchoring also resets the PLL (pacing_pll_init) — an old regulated
- * timeline from the previous pts base says nothing about the new one. */
+ * timeline from the previous pts base says nothing about the new one.
+ * Local files loop every few seconds, so their re-anchors are not logged;
+ * a live camera's are, collapsed through k->logdd. */
 static int64_t compute_pts(struct camera *k, const AVPacket *pkt,
-			   AVRational tb, int64_t arrival_us)
+			   AVRational tb, int64_t arrival_us, bool log_reanchor)
 {
 	if (pkt->pts == AV_NOPTS_VALUE)
 		return arrival_us;
 
 	int64_t pts_us = av_rescale_q(pkt->pts, tb, AV_TIME_BASE_Q);
-	int64_t used_us = pts_us;
+	enum pacing_pts_event ev = pacing_pts_classify(k->last_pts_us, pts_us);
 
-	if (k->last_pts_us >= 0) {
-		int64_t diff = pts_us - k->last_pts_us;
-		if (diff < 0 || diff > 1000000) {
-			log_msg("%s: pts %s (%.3f s) - re-anchoring",
-				k->name, diff < 0 ? "went backwards" : "jumped", diff / 1e6);
-			pacing_anchor_init(&k->anchor, ANCHOR_WINDOW_US);
-			pacing_pll_init(&k->pll);
-			k->r_prev_frame_us = -1;
-			if (diff < 0)
-				used_us = arrival_us;
-		}
+	if (ev != PACING_PTS_OK) {
+		const char *what = ev == PACING_PTS_BACKWARDS ? "went backwards" : "jumped";
+		char key[96];
+		unsigned rep;
+		snprintf(key, sizeof key, "pts %s - re-anchoring", what);
+		if (log_reanchor && pacing_dedup_check(&k->logdd, key, arrival_us, &rep))
+			log_msg("%s: pts %s (%.3f s) - re-anchoring%s", k->name, what,
+				(pts_us - k->last_pts_us) / 1e6,
+				rep ? " (and more times since the last such line)" : "");
+		pacing_anchor_init(&k->anchor, ANCHOR_WINDOW_US);
+		pacing_pll_init(&k->pll);
+		k->r_prev_frame_us = -1;
 	}
-	k->last_pts_us = used_us;
-	return used_us;
+	k->last_pts_us = pts_us;
+	return pts_us;
 }
 
 /* pts_us: set in the OUTPUT buffer's timestamp field, which bcm2835-codec
@@ -237,6 +240,11 @@ static void collect_decoded(struct wall *v, struct camera *k)
 		k->m_decoded++;
 
 		int64_t now = monotonic_us();
+		if (!k->live_since_us) {
+			k->live_since_us = now;
+			atomic_store(&k->st_state, PACING_CAM_LIVE);
+			atomic_store(&k->st_fault, PACING_FAULT_NONE);
+		}
 		int64_t pts_captured_us = (int64_t)b.timestamp.tv_sec * 1000000
 					  + b.timestamp.tv_usec;
 
@@ -536,6 +544,98 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	}
 }
 
+/* Maps a libavformat error to a fault class. */
+static enum pacing_fault fault_from_averror(const struct camera *k, int err)
+{
+	if (k->stalled)
+		return PACING_FAULT_STALL;
+	if (err == AVERROR_HTTP_UNAUTHORIZED)
+		return PACING_FAULT_UNAUTHORIZED;
+	if (err == AVERROR_HTTP_FORBIDDEN || err == AVERROR(EACCES) || err == AVERROR(EPERM))
+		return PACING_FAULT_FORBIDDEN;
+	if (err == AVERROR_HTTP_NOT_FOUND || err == AVERROR(ENOENT))
+		return PACING_FAULT_NOT_FOUND;
+	if (err == AVERROR(ECONNREFUSED))
+		return PACING_FAULT_REFUSED;
+	if (err == AVERROR(ETIMEDOUT))
+		return PACING_FAULT_TIMEOUT;
+	if (err == AVERROR(EHOSTUNREACH) || err == AVERROR(ENETUNREACH)
+	    || err == AVERROR(EHOSTDOWN) || err == AVERROR(ENETDOWN))
+		return PACING_FAULT_UNREACHABLE;
+	if (err == AVERROR_EOF || err == AVERROR(ECONNRESET) || err == AVERROR(EPIPE))
+		return PACING_FAULT_EOF;
+	if (err == AVERROR_EXIT)
+		return PACING_FAULT_STALL;   /* interrupt callback, not by quit */
+	return PACING_FAULT_OTHER;
+}
+
+/* Logs a failure through the camera's log collapse: the first occurrence
+ * of a line, then at most one copy per LOG_COLLAPSE_US with the number of
+ * suppressed repeats. `next_ms` (the backoff) is not part of the collapse
+ * key, so a growing backoff does not defeat it. */
+#define LOG_COLLAPSE_US (300 * 1000000LL)
+
+static void log_fault(struct camera *k, enum pacing_fault fault, const char *what,
+		      int64_t next_ms)
+{
+	char key[PACING_DEDUP_KEY_MAX + 128];
+	const char *hint = pacing_fault_hint(fault);
+	unsigned rep;
+
+	if (fault == PACING_FAULT_OTHER || fault == PACING_FAULT_NONE)
+		snprintf(key, sizeof key, "%s", what);
+	else
+		snprintf(key, sizeof key, "%s: %s%s%s", pacing_fault_short(fault), what,
+			 *hint ? " - " : "", hint);
+	if (!pacing_dedup_check(&k->logdd, key, monotonic_us(), &rep))
+		return;
+
+	char again[64] = "";
+	if (rep)
+		snprintf(again, sizeof again, " [repeated %u times in the last %d min]",
+			 rep, (int)(LOG_COLLAPSE_US / 60000000));
+	if (next_ms > 0)
+		log_msg("%s: %s; next attempt in %lld s%s", k->name, key,
+			(long long)((next_ms + 999) / 1000), again);
+	else
+		log_msg("%s: %s; reconnecting%s", k->name, key, again);
+}
+
+/* File inputs (demo clips) only: waits until the packet is due at the
+ * clip's natural speed (like ffmpeg -re), keeping the decoder serviced
+ * meanwhile. Uses dts (monotonic in decode order), else pts. */
+static void pace_file_packet(struct wall *v, struct camera *k, struct pacing_filepace *fp,
+			     const AVPacket *pkt, AVRational tb)
+{
+	int64_t ts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+
+	if (ts == AV_NOPTS_VALUE)
+		return;   /* no timing at all: nothing to pace by */
+	int64_t due = pacing_filepace_due(fp, av_rescale_q(ts, tb, AV_TIME_BASE_Q),
+					  monotonic_us());
+	for (;;) {
+		int64_t now = monotonic_us();
+		if (quit || now >= due)
+			break;
+		if (k->capture_on) {
+			collect_decoded(v, k);
+			requeue_returned(k);
+		}
+		int64_t wait = due - now;
+		usleep((useconds_t)(wait > 5000 ? 5000 : wait));
+	}
+	k->last_packet_us = monotonic_us();   /* the wait is not a stall */
+}
+
+/* Rewinds a file input to its start for the next loop. */
+static bool rewind_file(AVFormatContext *fc, int vstream)
+{
+	int64_t start = fc->streams[vstream]->start_time;
+	if (start == AV_NOPTS_VALUE)
+		start = 0;
+	return av_seek_frame(fc, vstream, start, AVSEEK_FLAG_BACKWARD) >= 0;
+}
+
 void *camera_thread(void *arg)
 {
 	struct thread_arg *ta = arg;
@@ -543,15 +643,37 @@ void *camera_thread(void *arg)
 	struct camera *k = ta->k;
 	free(ta);
 
+	/* Decided once: a local file is paced and looped, a network stream
+	 * never is; RTSP options only for rtsp(s)://. */
+	const bool live_src = layout_url_is_live(k->url);
+	const bool rtsp = layout_url_is_rtsp(k->url);
+	char masked[LAYOUT_URL_MAX];
+	layout_mask_url(k->url, masked, sizeof masked);
+
+	unsigned failures = 0;          /* failed attempts in a row */
+	pacing_dedup_init(&k->logdd, LOG_COLLAPSE_US);
+	atomic_store(&k->st_state, PACING_CAM_CONNECTING);
+	if (!live_src)
+		log_msg("%s: local file - played at its natural speed and looped", k->name);
+
 	while (!quit) {
 		AVFormatContext *fc = NULL;
 		AVDictionary *opt = NULL;
 		AVBSFContext *bsf = NULL;
+		AVPacket *pkt = NULL;
 		int vstream = -1;
+		enum pacing_fault fault = PACING_FAULT_NONE;
+		char what[LAYOUT_URL_MAX + 160] = "";
+		struct pacing_filepace fp;
+
+		pacing_filepace_reset(&fp);
+		k->stalled = false;
+		k->live_since_us = 0;
 
 		fc = avformat_alloc_context();
 		if (!fc) {
-			log_msg("%s: avformat_alloc_context failed", k->name);
+			fault = PACING_FAULT_OTHER;
+			snprintf(what, sizeof what, "avformat_alloc_context failed");
 			goto retry;
 		}
 		fc->interrupt_callback.callback = interrupt_cb;
@@ -562,15 +684,20 @@ void *camera_thread(void *arg)
 		k->watchdog_limit_us = 10 * 1000000;
 		k->last_packet_us = monotonic_us();
 
-		av_dict_set(&opt, "rtsp_transport", "tcp", 0);
-		/* "stimeout" does not exist in FFmpeg 7.1 — the right option is
-		 * "timeout" (µs, default 0 = no limit); older code using
-		 * "stimeout" had it silently ignored. Our own watchdog above
-		 * (interrupt_callback) is what actually protects us, but we still
-		 * set the real option as a first line of defence. */
-		av_dict_set(&opt, "timeout", "5000000", 0);        /* 5 s */
-		av_dict_set(&opt, "max_delay", "500000", 0);
-		av_dict_set(&opt, "fflags", "nobuffer", 0);
+		if (rtsp) {
+			av_dict_set(&opt, "rtsp_transport", "tcp", 0);
+			/* "stimeout" does not exist in FFmpeg 7.1 — the right
+			 * option is "timeout" (µs, default 0 = no limit); older
+			 * code using "stimeout" had it silently ignored. Our own
+			 * watchdog above (interrupt_callback) is what actually
+			 * protects us, but we still set the real option as a
+			 * first line of defence. */
+			av_dict_set(&opt, "timeout", "5000000", 0);        /* 5 s */
+		}
+		if (live_src) {
+			av_dict_set(&opt, "max_delay", "500000", 0);
+			av_dict_set(&opt, "fflags", "nobuffer", 0);
+		}
 
 		k->connections++;
 
@@ -589,12 +716,11 @@ void *camera_thread(void *arg)
 		pacing_pll_init(&k->pll);
 		k->r_prev_frame_us = -1;
 
-		int open_err = avformat_open_input(&fc, k->url, NULL, &opt);
-		if (open_err < 0) {
+		int r = avformat_open_input(&fc, k->url, NULL, &opt);
+		if (r < 0) {
 			/* Only ever log the masked URL — it may carry credentials. */
-			char masked[LAYOUT_URL_MAX];
-			layout_mask_url(k->url, masked, sizeof masked);
-			log_msg("%s: cannot open %s: %s", k->name, masked, av_err2str(open_err));
+			fault = fault_from_averror(k, r);
+			snprintf(what, sizeof what, "cannot open %s (%s)", masked, av_err2str(r));
 			av_dict_free(&opt);
 			goto retry;
 		}
@@ -602,16 +728,20 @@ void *camera_thread(void *arg)
 		/* avformat_open_input removes the keys it recognises from opt —
 		 * what remains are misspelt or non-existent options (like
 		 * "stimeout" on FFmpeg 7.1). Silently ignored options are exactly
-		 * the kind of bug that creeps back in, so log them. */
+		 * the kind of bug that creeps back in, so log them (once). */
 		{
 			const AVDictionaryEntry *e = NULL;
 			while ((e = av_dict_get(opt, "", e, AV_DICT_IGNORE_SUFFIX)))
-				log_msg("%s: unknown option ignored: %s", k->name, e->key);
+				if (k->connections == 1)
+					log_msg("%s: unknown option ignored: %s", k->name, e->key);
 		}
 		av_dict_free(&opt);
 
-		if (avformat_find_stream_info(fc, NULL) < 0) {
-			log_msg("%s: find_stream_info failed", k->name);
+		r = avformat_find_stream_info(fc, NULL);
+		if (r < 0) {
+			fault = fault_from_averror(k, r);
+			snprintf(what, sizeof what, "no stream information from %s (%s)", masked,
+				 av_err2str(r));
 			goto retry;
 		}
 
@@ -620,21 +750,42 @@ void *camera_thread(void *arg)
 		k->watchdog_limit_us = 5 * 1000000;
 		k->last_packet_us = monotonic_us();
 
-		for (unsigned i = 0; i < fc->nb_streams; i++)
-			if (fc->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO
-			    && fc->streams[i]->codecpar->codec_id == AV_CODEC_ID_H264)
-				vstream = i;
-
+		int other_video = -1;
+		for (unsigned i = 0; i < fc->nb_streams; i++) {
+			const AVCodecParameters *p = fc->streams[i]->codecpar;
+			if (p->codec_type != AVMEDIA_TYPE_VIDEO)
+				continue;
+			if (p->codec_id == AV_CODEC_ID_H264)
+				vstream = (int)i;
+			else if (other_video < 0)
+				other_video = (int)i;
+		}
 		if (vstream < 0) {
-			log_msg("%s: no H.264 video in the stream", k->name);
+			if (other_video >= 0) {
+				fault = PACING_FAULT_CODEC;
+				snprintf(what, sizeof what, "the stream is %s, not H.264",
+					 avcodec_get_name(fc->streams[other_video]->codecpar->codec_id));
+			} else {
+				fault = PACING_FAULT_OTHER;
+				snprintf(what, sizeof what, "no video in the stream from %s", masked);
+			}
 			goto retry;
 		}
 
 		AVCodecParameters *cp = fc->streams[vstream]->codecpar;
-		log_msg("%s: connected, %dx%d", k->name, cp->width, cp->height);
+		if (cp->width > 1920 || cp->height > 1920) {
+			fault = PACING_FAULT_TOO_LARGE;
+			snprintf(what, sizeof what, "the stream is %dx%d", cp->width, cp->height);
+			goto retry;
+		}
+		if (failures)
+			log_msg("%s: connected, %dx%d (after %u failed attempt%s)", k->name,
+				cp->width, cp->height, failures, failures == 1 ? "" : "s");
+		else
+			log_msg("%s: connected, %dx%d", k->name, cp->width, cp->height);
 
 		/* RTSP normally delivers Annex-B already. If the extradata is AVCC
-		 * (starts with 1) the packets must be converted. */
+		 * (starts with 1) the packets must be converted (MP4 files). */
 		if (cp->extradata_size > 0 && cp->extradata[0] == 1) {
 			const AVBitStreamFilter *f = av_bsf_get_by_name("h264_mp4toannexb");
 			if (f && av_bsf_alloc(f, &bsf) == 0) {
@@ -647,8 +798,12 @@ void *camera_thread(void *arg)
 		}
 
 		if (open_decoder(v->cfg.decoder, k, cp->width ? cp->width : 1024,
-				 cp->height ? cp->height : 576) < 0)
+				 cp->height ? cp->height : 576) < 0) {
+			fault = PACING_FAULT_DECODER;
+			snprintf(what, sizeof what, "the hardware decoder %s could not be set up",
+				 v->cfg.decoder);
 			goto retry;
+		}
 
 		/* SPS/PPS first, otherwise the decoder knows nothing. Never goes
 		 * into arrival_queue (arrival_us = -1) — that packet never
@@ -662,16 +817,27 @@ void *camera_thread(void *arg)
 			av_packet_free(&ex);
 		}
 
-		AVPacket *pkt = av_packet_alloc();
+		pkt = av_packet_alloc();
 		if (!pkt) {
-			log_msg("%s: av_packet_alloc failed", k->name);
+			fault = PACING_FAULT_OTHER;
+			snprintf(what, sizeof what, "av_packet_alloc failed");
 			goto retry;
 		}
 
 		while (!quit) {
-			int r = av_read_frame(fc, pkt);
+			r = av_read_frame(fc, pkt);
 			if (r < 0) {
-				log_msg("%s: stream broke (%s)", k->name, av_err2str(r));
+				/* A clip loops: rewind and continue in the same
+				 * connection (compute_pts re-anchors on the
+				 * backwards pts, the file pacing re-bases). */
+				if (!live_src && r == AVERROR_EOF && rewind_file(fc, vstream))
+					continue;
+				fault = fault_from_averror(k, r);
+				if (fault == PACING_FAULT_STALL)
+					snprintf(what, sizeof what, "no data for %lld s",
+						 (long long)(k->watchdog_limit_us / 1000000));
+				else
+					snprintf(what, sizeof what, "stream broke (%s)", av_err2str(r));
 				break;
 			}
 			k->last_packet_us = monotonic_us();   /* sign of life for the watchdog */
@@ -680,16 +846,19 @@ void *camera_thread(void *arg)
 				continue;
 			}
 
+			if (!live_src)
+				pace_file_packet(v, k, &fp, pkt, fc->streams[vstream]->time_base);
+
 			int64_t arrival_us = monotonic_us();
 			int64_t pts_us = compute_pts(k, pkt, fc->streams[vstream]->time_base,
-						     arrival_us);
+						     arrival_us, live_src);
 
 			if (bsf) {
 				if (av_bsf_send_packet(bsf, pkt) == 0) {
 					while (av_bsf_receive_packet(bsf, pkt) == 0) {
 						if (feed_packet(v, k, pkt, pts_us, arrival_us) < 0) {
 							av_packet_unref(pkt);
-							goto close_stream;
+							goto decoder_failed;
 						}
 						av_packet_unref(pkt);
 					}
@@ -697,36 +866,59 @@ void *camera_thread(void *arg)
 			} else {
 				if (feed_packet(v, k, pkt, pts_us, arrival_us) < 0) {
 					av_packet_unref(pkt);
-					goto close_stream;
+					goto decoder_failed;
 				}
 			}
 			av_packet_unref(pkt);
 
 			if (!check_events(v, k))
-				goto close_stream;
+				goto decoder_failed;
 
 			if (k->capture_on) {
 				collect_decoded(v, k);
 				requeue_returned(k);
 			}
 		}
+		goto retry;
 
-close_stream:
+decoder_failed:
+		fault = PACING_FAULT_OTHER;
+		snprintf(what, sizeof what, "decoder error while streaming");
+
+retry:
 		av_packet_free(&pkt);
 		if (bsf)
 			av_bsf_free(&bsf);
 		teardown_stream(v, k);
 		if (fc)
 			avformat_close_input(&fc);
-		continue;
+		if (quit)
+			break;
 
-retry:
-		if (bsf)
-			av_bsf_free(&bsf);
-		teardown_stream(v, k);
-		if (fc)
-			avformat_close_input(&fc);
-		for (int i = 0; i < 10 && !quit; i++)
+		/* A stream that was live for a while and then broke reconnects
+		 * at once (fast recovery after a camera/NVR blip), and a long
+		 * healthy period also forgets the collapsed log lines. Anything
+		 * else counts as a failed attempt and backs off by fault class. */
+		int64_t now = monotonic_us();
+		bool was_healthy = k->live_since_us && now - k->live_since_us >= 10 * 1000000LL;
+		if (k->live_since_us && now - k->live_since_us >= 60 * 1000000LL)
+			pacing_dedup_reset(&k->logdd);
+		k->live_since_us = 0;
+
+		if (fault == PACING_FAULT_NONE)
+			fault = PACING_FAULT_OTHER;
+		atomic_store(&k->st_fault, fault);
+		atomic_store(&k->st_state, PACING_CAM_FAILING);
+
+		if (was_healthy) {
+			failures = 0;
+			log_fault(k, fault, what, 0);
+			continue;
+		}
+		failures++;
+		int64_t delay_ms = pacing_backoff_ms(fault, failures);
+		log_fault(k, fault, what, delay_ms);
+		for (int64_t waited = 0; waited < delay_ms && !quit; waited += 100)
 			usleep(100000);
 	}
 	return NULL;

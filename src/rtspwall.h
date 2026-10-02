@@ -17,6 +17,7 @@
 
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -295,6 +296,17 @@ struct camera {
 
 	/* statistics accumulated since start (never reset) */
 	unsigned long    connections;
+
+	/* Health, for STATUS= (sd_notify) and the log. st_state/st_fault are
+	 * written by the camera thread and read by the compositor's status
+	 * update — atomics, no lock. stalled is set by interrupt_cb (camera
+	 * thread) when the watchdog fires. logdd collapses the camera thread's
+	 * repeated failure lines (camera thread only). */
+	_Atomic int      st_state;          /* enum pacing_cam_state */
+	_Atomic int      st_fault;          /* enum pacing_fault */
+	int64_t          live_since_us;     /* camera thread only; 0 = not live */
+	bool             stalled;
+	struct pacing_dedup logdd;
 };
 
 struct wall {
@@ -318,6 +330,7 @@ struct wall {
 	/* black primary plane — some drivers reject a CRTC without one */
 	uint32_t         primary_plane;
 	uint32_t         primary_fb;
+	uint32_t         primary_handle;   /* dumb buffer behind primary_fb */
 	uint32_t         pp_fb, pp_crtc, pp_crtc_x, pp_crtc_y, pp_crtc_w, pp_crtc_h;
 	uint32_t         pp_src_x, pp_src_y, pp_src_w, pp_src_h;
 
@@ -363,6 +376,17 @@ struct wall {
 	 *   than before), summed over all groups. 0 if there are no rotation
 	 *   groups.
 	 */
+	/* Display health, owned by the compositor thread after startup (by
+	 * main() before). See display_poll in drm.c. */
+	char             conn_name[32];        /* e.g. "HDMI-A-1" */
+	bool             display_connected;
+	bool             remodeset_pending;    /* reconnected, mode not yet set again */
+	int              commit_failures;      /* failed atomic commits in a row */
+	int64_t          last_display_poll_us;
+	int64_t          last_forced_probe_us;
+	int64_t          last_recovery_log_us;
+	unsigned         recoveries;           /* forced re-probes, for the log */
+
 	int64_t          diag_commit_target_vblank_us;
 	unsigned long    diag_late1_plus;
 	unsigned long    diag_busy_drops;
@@ -384,15 +408,35 @@ int64_t monotonic_us(void);
 
 /* ------------------------------------------------------------------- drm.c */
 
+/* Return convention for the startup steps below: 0 = ok, -1 = error (exit
+ * 1, systemd restarts), -2 = config error (exit RTSPWALL_EXIT_CONFIG),
+ * 1 = quit was requested while waiting (exit 0). */
 int open_drm_device(struct wall *v);
-int find_display(struct wall *v);
+/* Opens the DRM device, sets the atomic caps and becomes DRM master. If
+ * another program (a desktop) holds master: names it, prints the fix once
+ * and keeps retrying every 2 s (re-opening the device each time). */
+int acquire_drm(struct wall *v);
+/* Waits (logging once, polling every 2 s) until a display is connected,
+ * then picks the mode (MODE) and hands out the planes. */
+int wait_for_display(struct wall *v);
 int read_plane_props(struct wall *v);
 int create_primary_fb(struct wall *v);
+/* Compositor thread, only while no page flip is pending: notices a
+ * connector going away/coming back (cheap cached status, at most once a
+ * second) or ~10 failed commits in a row (forced re-probe, at most every
+ * 5 s), and then re-reads the modes and sets the mode again. Returns true
+ * if a modeset was made. */
+bool display_poll(struct wall *v);
 
 /* ------------------------------------------------------------------ v4l2.c */
 
 void close_buffers(struct camera *k, int keep_a, int keep_b);
 int open_decoder(const char *device, struct camera *k, unsigned width, unsigned height);
+/* VIDIOC_QUERYCAP + ENUM_FMT on the decoder before any camera starts.
+ * Waits up to 15 s for the device node to appear (boot race). Returns 0,
+ * RTSPWALL_EXIT_NO_DECODER if there is no usable H.264 M2M decoder there
+ * (restarting will not help), or 1 for other errors. */
+int decoder_preflight(const char *device);
 int start_capture(struct wall *v, struct camera *k);
 
 /* --------------------------------------------------------- camera_thread.c */
@@ -405,6 +449,15 @@ void *camera_thread(void *arg);
 
 int initial_commit(struct wall *v);
 void compositor(struct wall *v);
+
+/* sd_notify without libsystemd: sends `msg` (e.g. "READY=1") to
+ * $NOTIFY_SOCKET; does nothing when not run by systemd. Thread-safe. */
+void notify_systemd(const char *msg);
+/* notify_systemd("STATUS=...") with printf formatting. Never pass a URL. */
+void notify_status(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* Sends STATUS= with the cameras' live count and problems (plus the
+ * display state) if it changed, at most once a second. */
+void update_status(struct wall *v, int64_t now_us);
 
 /* ---------------------------------------------------------------- config.c */
 

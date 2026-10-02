@@ -1,0 +1,195 @@
+/*
+ * clilogic.h — pure helpers behind the user commands (probe, add, doctor,
+ * demo). No Linux, DRM or FFmpeg dependencies: everything here works on
+ * strings and numbers handed in by cli.c/probe.c/add.c/doctor.c, so it is
+ * unit-tested by test_clilogic.c on any machine. The only dependency is
+ * layout.c (config line parsing and URL masking), which is pure as well.
+ */
+#ifndef CLILOGIC_H
+#define CLILOGIC_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <sys/types.h>
+
+#include "budget.h"
+
+/* ------------------------------------------------------------- H.264 SPS */
+
+struct h264_sps_info {
+	int    profile_idc;      /* 66 baseline, 77 main, 100 high, ... */
+	int    constraint_flags; /* constraint_set0..5 flags byte */
+	int    level_idc;        /* 42 = level 4.2 */
+	int    width, height;    /* displayed size (after cropping) */
+	int    chroma_format_idc;
+	int    bit_depth;        /* luma */
+	double fps;              /* from VUI timing, 0 if not present */
+};
+
+/* Parses one SPS NAL unit (starting with the NAL header byte, type 7,
+ * emulation prevention bytes still in place). Returns 0, or -1 if it is
+ * not an SPS or is truncated/invalid. */
+int h264_parse_sps(const unsigned char *nal, size_t len, struct h264_sps_info *out);
+
+/* Finds and parses the first SPS in codec extradata, which is either an
+ * avcC record (MP4/Matroska, first byte 1) or Annex B (RTSP
+ * sprop-parameter-sets as decoded by libavformat: 00 00 01 / 00 00 00 01
+ * start codes). Returns 0, or -1 if no valid SPS is found. */
+int h264_parse_extradata(const unsigned char *data, size_t len, struct h264_sps_info *out);
+
+/* "Baseline", "Constrained Baseline", "Main", "High", "High 10", ... */
+const char *h264_profile_name(int profile_idc, int constraint_flags);
+
+/* ------------------------------------------------------- probe verdicts */
+
+enum probe_codec {
+	PROBE_CODEC_UNKNOWN,
+	PROBE_CODEC_H264,
+	PROBE_CODEC_HEVC,
+	PROBE_CODEC_OTHER,
+};
+
+/* Why a probe could not read the stream description. */
+enum probe_error {
+	PROBE_OK,
+	PROBE_ERR_AUTH,        /* 401/403 */
+	PROBE_ERR_NOT_FOUND,   /* 404 / 454 Session Not Found */
+	PROBE_ERR_REFUSED,     /* TCP connection refused */
+	PROBE_ERR_TIMEOUT,     /* no answer within the timeout */
+	PROBE_ERR_UNREACHABLE, /* no route / host unreachable / DNS failure */
+	PROBE_ERR_NO_VIDEO,    /* answered, but no video stream */
+	PROBE_ERR_OTHER,
+};
+
+struct probe_stream {
+	enum probe_codec codec;
+	int    profile_idc, constraint_flags, level_idc;   /* H.264 only, 0 = unknown */
+	int    width, height;
+	double fps;
+};
+
+/* Largest stream the bcm2835-codec decoder accepts in either dimension. */
+#define PROBE_MAX_DIMENSION 1920
+
+/* Verdict for ONE stream on its own: FAIL for H.265/other codecs, sizes
+ * above 1920x1920, H.264 profiles the decoder cannot do (High 10, 4:2:2,
+ * 4:4:4) or a single stream above 100 % of the budget; WARN when the size
+ * or frame rate is unknown or the stream alone uses > 90 %; else PASS.
+ * A one-line, user-facing hint is written to `hint` (empty on PASS). */
+enum budget_verdict probe_stream_verdict(const struct probe_stream *s,
+					 char *hint, size_t hintlen);
+
+/* The fix to print for a failed probe. `masked_url` is used to tailor the
+ * hint (e.g. UniFi port 7441/7447). Never empty for err != PROBE_OK. */
+const char *probe_error_hint(enum probe_error err, const char *masked_url);
+
+/* Short label: "login failed (401)", "not found (404)", ... */
+const char *probe_error_label(enum probe_error err);
+
+/* Classifies an RTSP status code (as seen in an error) into a probe_error. */
+enum probe_error probe_error_from_status(int status_code);
+
+/* ---------------------------------------------------------- doctor helpers */
+
+enum board_kind {
+	BOARD_UNKNOWN,       /* not a Raspberry Pi (e.g. CI) */
+	BOARD_PI4,           /* Raspberry Pi 4 Model B */
+	BOARD_PI4_FAMILY,    /* Pi 400 / Compute Module 4: same SoC, untested */
+	BOARD_PI5,           /* Pi 5 / Pi 500 / CM5: no H.264 hardware decoder */
+	BOARD_OLDER_PI,      /* Pi 3 and older: different display stack */
+};
+
+/* Classifies the text of /proc/device-tree/model. */
+enum board_kind board_classify(const char *model);
+
+/* gpu_mem in MB from the text of config.txt, as the firmware on a Pi 4
+ * would see it: plain `gpu_mem=` lines in the global part, [all] and [pi4]
+ * sections count; other conditional sections ([pi5], [pi3], [cm4], [none],
+ * ...) and comments are ignored. The last applicable line wins. Returns
+ * -1 if unset (firmware default, 76 MB on a Pi 4). */
+int configtxt_gpu_mem(const char *text);
+
+/* Writes `text` to `out` with gpu_mem set to `mb`: an applicable existing
+ * gpu_mem= line (see configtxt_gpu_mem) is rewritten in place, otherwise
+ * "[all]\ngpu_mem=MB\n" is appended (an [all] header is needed because
+ * the file may end inside a conditional section). Nothing else changes.
+ * Returns 0, or -1 if `out` is too small. */
+int configtxt_set_gpu_mem(const char *text, int mb, char *out, size_t outlen);
+
+/* gpu_mem in MB the current camera load needs, or 0 if the firmware
+ * default is enough. `total_mbps` is the budget sum (budget.h). */
+int doctor_gpu_mem_needed(long total_mbps, int n_cameras);
+
+/* dmesg patterns worth reporting: returns a short label for the line, or
+ * NULL. Patterns: "Not enough GPU mem", vb2 "driver bug", MMAL timeouts. */
+const char *dmesg_match(const char *line);
+
+/* Unix permission check: can a process with uid/gid/supplementary groups
+ * open a file with st_mode/st_uid/st_gid for reading (and writing if
+ * want_write)? uid 0 can always. ACLs are not considered. */
+/* The rwx bits (4/2/1) that apply to that process: owner, group or other
+ * class, as the kernel picks them (no ACLs). uid 0 gets 7. */
+unsigned perm_bits(mode_t st_mode, uid_t st_uid, gid_t st_gid,
+		   uid_t uid, gid_t gid, const gid_t *groups, int ngroups);
+
+bool perm_allows(mode_t st_mode, uid_t st_uid, gid_t st_gid,
+		 uid_t uid, gid_t gid, const gid_t *groups, int ngroups, bool want_write);
+
+/* ------------------------------------------------------------ add helpers */
+
+/* What add needs to know about an existing config file. */
+struct cfg_scan {
+	int  grid_cols, grid_rows;   /* 0/0 = no GRID line */
+	bool manual_mode;            /* a camera line with 6-7 fields was seen */
+	int  n_cameras;              /* active (uncommented) camera lines */
+	bool cell_used[64 + 1];      /* 1-based; grid is at most 8x8 */
+	bool name_taken;             /* `name` passed to cfg_scan() exists */
+};
+
+/* Scans a config file's text for GRID, used cells and whether `name` is
+ * already in use (name may be NULL). Never fails: lines that do not parse
+ * are skipped (--check-config reports those). */
+void cfg_scan_text(const char *text, const char *name, struct cfg_scan *out);
+
+/* First free cell of the grid (1-based), or 0 if the grid is full or no
+ * GRID is set. */
+int cfg_first_free_cell(const struct cfg_scan *s);
+
+/* Validates a camera name for a config line: 1-63 characters from
+ * [A-Za-z0-9._-]. Returns NULL if fine, else the reason. */
+const char *cfg_check_name(const char *name);
+
+/* Validates a URL for a config line: non-empty, shorter than the config's
+ * URL limit, no '|' (field separator; the message suggests %7C), no
+ * whitespace or control characters. Returns NULL if fine, else the reason. */
+const char *cfg_check_url(const char *url);
+
+/* Returns `text` with "name|url|cell\n" appended, making sure the
+ * previous last line ends with a newline. Nothing else is touched.
+ * Returns 0, or -1 if `out` is too small. */
+int cfg_append_camera(const char *text, const char *name, const char *url, int cell,
+		      char *out, size_t outlen);
+
+/* --------------------------------------------------------- report masking */
+
+/* A growable text buffer for doctor --report. Every line that goes in is
+ * masked (all scheme:// URLs through layout_mask_urls_in_text, plus
+ * password/token/secret=VALUE pairs) and control characters are replaced,
+ * so nothing appended can leak a credential or inject escape sequences. */
+struct report_buf {
+	char  *data;
+	size_t len, cap;
+	bool   oom;     /* an allocation failed; the content is truncated */
+};
+
+void report_init(struct report_buf *r);
+void report_free(struct report_buf *r);
+/* Appends "== title ==\n" (unmasked; titles are constant strings). */
+void report_section(struct report_buf *r, const char *title);
+/* Appends `text` (any number of lines), masking each line. */
+void report_append_masked(struct report_buf *r, const char *text);
+
+/* Masks one line in place-to-out: URLs plus key=value secrets. */
+void report_mask_line(const char *in, char *out, size_t outlen);
+
+#endif

@@ -3,7 +3,7 @@
 #
 #   sudo ./uninstall.sh [--purge]
 #
-# Removes the binary and the systemd unit. The config in /etc/rtspwall is kept
+# Removes the binary, demo files and the systemd units. The config in /etc/rtspwall is kept
 # unless --purge is given (which also removes the system user).
 # gpu_mem in config.txt is never changed back. Environment: PREFIX (default /usr/local).
 
@@ -23,11 +23,16 @@ done
 [[ $EUID -eq 0 ]] || { echo "Run as root: sudo $0" >&2; exit 1; }
 
 if command -v systemctl >/dev/null; then
+    systemctl disable --now rtspwall-config.path 2>/dev/null || true
+    systemctl stop rtspwall-config.service rtspwall-demo.service 2>/dev/null || true
     systemctl disable --now rtspwall.service 2>/dev/null || true
 fi
-rm -f /etc/systemd/system/rtspwall.service "$PREFIX/bin/rtspwall"
+rm -f /etc/systemd/system/rtspwall.service /etc/systemd/system/rtspwall-demo.service \
+    /etc/systemd/system/rtspwall-config.service /etc/systemd/system/rtspwall-config.path \
+    "$PREFIX/bin/rtspwall"
+rm -rf "$PREFIX/share/rtspwall"
 if command -v systemctl >/dev/null; then systemctl daemon-reload || true; fi
-echo "Removed binary and unit."
+echo "Removed binary, demo files and units."
 
 if [[ $PURGE -eq 1 ]]; then
     rm -rf /etc/rtspwall

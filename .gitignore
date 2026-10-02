@@ -2,6 +2,8 @@
 src/rtspwall
 src/test_pacing
 src/test_layout
+src/test_budget
+src/test_clilogic
 src/.version
 src/*.dSYM/
 *.o
@@ -13,3 +15,7 @@ build/
 
 # Package build output (scripts/build-deb.sh)
 dist/
+
+# Generated demo clips (make demo-clips)
+demo/cam[1-5].mp4
+demo/.cam*.tmp.mp4

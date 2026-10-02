@@ -1,52 +1,29 @@
 [Unit]
-Description=rtspwall - RTSP video wall on the Raspberry Pi 4 (DRM/KMS, V4L2 hardware decode)
+Description=rtspwall demo - 2x2 wall from bundled test clips (no cameras needed)
 Documentation=https://github.com/Hovhas/rtspwall
-After=network-online.target
-Wants=network-online.target
-# Never give up permanently on transient failures: a camera or network outage
-# must not leave the screen dead. (Must live in [Unit]; systemd ignores it in
-# [Service].) Permanent failures (exit 2/3) are excluded via
-# RestartPreventExitStatus below instead of via a start limit.
-StartLimitIntervalSec=0
-
-# Deliberately no Conflicts=getty@tty1.service: a text getty on tty1 is not a
-# DRM master, so it does not get in the way. Only a competing display server
-# (X11, Wayland compositor, another KMS client) on the same output does.
-# Do not run one on the screen you give to rtspwall.
+# Started and stopped only by `sudo rtspwall demo`; deliberately has no
+# [Install] section. Conflicts= makes the demo and the real wall mutually
+# exclusive (starting one stops the other), as both need the DRM master.
+Conflicts=rtspwall.service
+After=rtspwall.service
 
 [Service]
-# Type=notify: the daemon sends READY=1 and STATUS=... (e.g. "5/6 live; garage:
-# 401") through $NOTIFY_SOCKET, visible in `systemctl status rtspwall`.
 Type=notify
 NotifyAccess=main
-# The daemon waits for a screen instead of crashing, and sends READY=1 once it
-# is up; 120 s is a generous upper bound for slow boots/cold HDMI links.
-TimeoutStartSec=120
-ExecStart=/usr/bin/rtspwall /etc/rtspwall/cameras.conf
-# NOTE: /usr/bin is the packaged path. install.sh rewrites it to
-# $PREFIX/bin (default /usr/local/bin) for source installs.
+ExecStart=/usr/bin/rtspwall /usr/share/rtspwall/demo/demo.conf
+# NOTE: install.sh rewrites /usr/bin and /usr/share to $PREFIX for source installs.
 
 User=rtspwall
 Group=rtspwall
-# video: /dev/dri/card*, /dev/video10; render: /dev/dri/renderD*, /dev/dma_heap/*
 SupplementaryGroups=video render
 
-# Restart on crashes and other failures, never on a clean stop. Exit codes the
-# daemon uses for problems a restart cannot fix are excluded, so there is no
-# restart loop:
-#   2 = config error / no cameras configured   (fix cameras.conf)
-#   3 = no H.264 hardware decoder (e.g. Pi 5)  (unsupported hardware)
-Restart=on-failure
-RestartPreventExitStatus=2 3
-RestartSec=2
-# Exponential backoff 2 s -> 60 s over 5 steps. RestartSteps/RestartMaxDelaySec
-# need systemd >= 254; Bookworm ships 252, which ignores them (a harmless
-# "Unknown key" warning) and keeps the flat RestartSec=2 there.
-RestartSteps=5
-RestartMaxDelaySec=60
+# A demo that fails should say so, not loop.
+Restart=no
 KillSignal=SIGTERM
 TimeoutStopSec=10
 
+# Same hardening as rtspwall.service (keep the two in sync). The demo only
+# reads /usr/share/rtspwall/demo, which ProtectSystem=strict leaves readable.
 # ---------------------------------------------------------------------------
 # Hardening.
 #
@@ -103,6 +80,3 @@ SystemCallFilter=~@privileged
 
 StandardOutput=journal
 StandardError=journal
-
-[Install]
-WantedBy=multi-user.target

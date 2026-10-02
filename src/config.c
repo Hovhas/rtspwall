@@ -58,7 +58,23 @@ static void warn_to_stderr(void *ctx, const char *msg)
 	fprintf(stderr, "rtspwall: %s: warning: %s\n", (const char *)ctx, msg);
 }
 
-static int parse_file(struct layout_config *cfg, const char *path,
+/* "1920x1080@60" / "1920x1080" / "auto" for MODE. */
+static void mode_text(const struct layout_config *cfg, char *buf, size_t n)
+{
+	if (!cfg->mode_w)
+		snprintf(buf, n, "auto");
+	else if (cfg->mode_mhz % 1000)
+		snprintf(buf, n, "%dx%d@%d.%03d", cfg->mode_w, cfg->mode_h,
+			 cfg->mode_mhz / 1000, cfg->mode_mhz % 1000);
+	else if (cfg->mode_mhz)
+		snprintf(buf, n, "%dx%d@%d", cfg->mode_w, cfg->mode_h, cfg->mode_mhz / 1000);
+	else
+		snprintf(buf, n, "%dx%d", cfg->mode_w, cfg->mode_h);
+}
+
+#define UNIFI_NOTE "UniFi Protect rtsps URL rewritten to plain RTSP on port 7447"
+
+static int parse_file(struct layout_config *cfg, const char *path, unsigned flags,
 		      layout_warn_fn warn, char *err, size_t errlen)
 {
 	char msg[512];
@@ -67,7 +83,7 @@ static int parse_file(struct layout_config *cfg, const char *path,
 		snprintf(err, errlen, "%s", msg);
 		return -1;
 	}
-	int r = layout_parse(cfg, text, warn, (void *)path, msg, sizeof msg);
+	int r = layout_parse_flags(cfg, text, flags, warn, (void *)path, msg, sizeof msg);
 	free(text);
 	if (r < 0)
 		snprintf(err, errlen, "%s: %s", path, msg);
@@ -80,8 +96,13 @@ int load_config(struct wall *v, const char *path)
 {
 	char err[768];
 
-	if (parse_file(&v->cfg, path, warn_to_log, err, sizeof err) < 0) {
+	if (parse_file(&v->cfg, path, 0, warn_to_log, err, sizeof err) < 0) {
+		char masked[sizeof err];
 		log_msg("config: %s", err);
+		log_msg("config: fix the file and check it with: sudo rtspwall --check-config %s",
+			path);
+		layout_mask_urls_in_text(err, masked, sizeof masked);
+		notify_status("config error: %s", masked);
 		return -1;
 	}
 
@@ -115,8 +136,15 @@ int load_config(struct wall *v, const char *path)
 		char masked[LAYOUT_URL_MAX];
 		layout_mask_url(k->url, masked, sizeof masked);
 		log_msg("camera %d: %-10s %s delay=%dms", v->count, k->name, masked, k->delay_ms);
+		if (c->unifi_rewritten)
+			log_msg("%s: " UNIFI_NOTE " (%s); set UNIFI_REWRITE=off to keep rtsps",
+				k->name, masked);
 		v->count++;
 	}
+
+	char mode[48];
+	mode_text(&v->cfg, mode, sizeof mode);
+	log_msg("config: MODE=%s UNIFI_REWRITE=%s", mode, v->cfg.unifi_rewrite ? "auto" : "off");
 
 	if (v->cfg.grid_cols > 0)
 		log_msg("config: grid %dx%d, buffer=%dms rotate=%ds decoder=%s connector=%s drm=%s ffmpeg_log=%s",
@@ -188,22 +216,25 @@ void build_rotation(struct wall *v)
 /* -------------------------------------------------------------- --check-config */
 
 /* Validates the config and prints the interpreted layout for a screen of
- * screen_w x screen_h, without touching DRM, V4L2 or the network. Returns
- * the process exit status (0 = valid). */
+ * screen_w x screen_h, without touching DRM, V4L2 or the network. Strict:
+ * unknown keys are errors here (the daemon only warns). Returns the
+ * process exit status (0 = valid, RTSPWALL_EXIT_CONFIG = invalid). */
 int check_config(const char *path, int screen_w, int screen_h)
 {
 	static struct layout_config cfg;
 	char err[768];
 
-	if (parse_file(&cfg, path, warn_to_stderr, err, sizeof err) < 0) {
+	if (parse_file(&cfg, path, LAYOUT_PARSE_STRICT, warn_to_stderr, err, sizeof err) < 0) {
 		fprintf(stderr, "rtspwall: %s\n", err);
-		return 1;
+		return RTSPWALL_EXIT_CONFIG;
 	}
 	if (layout_apply(&cfg, screen_w, screen_h, warn_to_stderr, (void *)path,
 			 err, sizeof err) < 0) {
 		fprintf(stderr, "rtspwall: %s: %s\n", path, err);
-		return 1;
+		return RTSPWALL_EXIT_CONFIG;
 	}
+	char mode[48];
+	mode_text(&cfg, mode, sizeof mode);
 
 	printf("config:          %s\n", path);
 	printf("screen:          %dx%d\n", screen_w, screen_h);
@@ -218,6 +249,9 @@ int check_config(const char *path, int screen_w, int screen_h)
 	printf("CONNECTOR:       %s\n", cfg.connector[0] ? cfg.connector : "(first connected)");
 	printf("DRM_DEVICE:      %s\n", cfg.drm_device[0] ? cfg.drm_device : "(auto)");
 	printf("FFMPEG_LOGLEVEL: %s\n", layout_ffmpeg_log_name(cfg.ffmpeg_loglevel));
+	printf("MODE:            %s%s\n", mode,
+	       cfg.mode_w ? "" : " (preferred mode; 1080p60 instead of 4K or < 50 Hz)");
+	printf("UNIFI_REWRITE:   %s\n", cfg.unifi_rewrite ? "auto" : "off");
 
 	printf("\ncameras:\n");
 	for (int i = 0; i < cfg.count; i++) {
@@ -232,6 +266,8 @@ int check_config(const char *path, int screen_w, int screen_h)
 		snprintf(geometry, sizeof geometry, "%dx%d+%d+%d", c->width, c->height, c->x, c->y);
 		printf("  %-12s %s%-16s delay %3d ms  %s\n", c->name, where, geometry,
 		       c->delay_ms, masked);
+		if (c->unifi_rewritten)
+			printf("  %-12s note: " UNIFI_NOTE " (UNIFI_REWRITE=off keeps rtsps)\n", "");
 	}
 
 	struct pacing_tile tiles[LAYOUT_MAX_CAMERAS];
@@ -271,5 +307,10 @@ int check_config(const char *path, int screen_w, int screen_h)
 	       rotating, rotating == 1 ? "" : "s",
 	       cfg.count, cfg.count == 1 ? "" : "s",
 	       cfg.count, cfg.count == 1 ? "" : "s");
+	if (cfg.mode_w && (cfg.mode_w != screen_w || cfg.mode_h != screen_h))
+		printf("note: MODE=%s differs from the screen size used above (%dx%d); "
+		       "run with --mode %dx%d to see that layout. Whether the display offers "
+		       "the mode is checked at startup.\n",
+		       mode, screen_w, screen_h, cfg.mode_w, cfg.mode_h);
 	return 0;
 }

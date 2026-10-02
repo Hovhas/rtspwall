@@ -5,7 +5,9 @@
 # DIST comes from /etc/os-release (VERSION_CODENAME, e.g. bookworm or trixie),
 # ARCH from dpkg. VERSION defaults to the latest git tag (without "v"), or 0.0.0.
 # Build dependencies: build-essential pkg-config libdrm-dev libavformat-dev
-# libavcodec-dev libavutil-dev (+ dpkg-dev for accurate Depends).
+# libavcodec-dev libavutil-dev ffmpeg (ffmpeg generates the demo clips with
+# `make demo-clips`; build-time only, not a runtime Depends) (+ dpkg-dev for
+# accurate Depends).
 #
 # Design notes:
 #  - /etc/rtspwall/cameras.conf is NOT a conffile. It holds credentials, and
@@ -35,17 +37,32 @@ OUT=$ROOT/dist
 STAGE=$OUT/staging
 DEB=$OUT/${NAME}_${VERSION}_${DIST}_${ARCH}.deb
 
+UNITS=(rtspwall.service rtspwall-demo.service rtspwall-config.service rtspwall-config.path)
+
+command -v ffmpeg >/dev/null || {
+    echo "ffmpeg is required to generate the demo clips (apt install ffmpeg)." >&2
+    exit 1
+}
+
 rm -rf "$STAGE"
 mkdir -p "$STAGE" "$OUT"
 
 echo "== Building $NAME $VERSION ($DIST/$ARCH) =="
 make VERSION="$VERSION"
 make test
+make demo-clips
 make VERSION="$VERSION" DESTDIR="$STAGE" PREFIX=/usr install
 strip --strip-unneeded "$STAGE/usr/bin/$NAME"
 
 # --- Files ---
-install -D -m 0644 systemd/rtspwall.service "$STAGE/usr/lib/systemd/system/rtspwall.service"
+for u in "${UNITS[@]}"; do
+    install -D -m 0644 "systemd/$u" "$STAGE/usr/lib/systemd/system/$u"
+done
+# `make install` must have put the demo config and clips in place.
+[[ -f $STAGE/usr/share/rtspwall/demo/demo.conf ]] || {
+    echo "demo files missing from $STAGE/usr/share/rtspwall/demo (make install)." >&2
+    exit 1
+}
 DOC=$STAGE/usr/share/doc/$NAME
 install -d -m 0755 "$DOC/examples"
 install -m 0644 examples/* "$DOC/examples/"
@@ -102,7 +119,8 @@ Description: RTSP video wall for the Raspberry Pi 4 (DRM/KMS, V4L2 hardware deco
  .
  Needs exclusive access to the display (no X11/Wayland on that output) and
  gpu_mem=256 in config.txt for four or more concurrent 1080p streams.
- The service is not enabled or started automatically.
+ The service is not enabled or started automatically; try
+ "sudo rtspwall demo" first.
 CTRL
 
 dpkg-deb --build --root-owner-group "$STAGE" "$DEB"

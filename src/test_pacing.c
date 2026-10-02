@@ -784,6 +784,232 @@ static void test_anchor_full_queue_does_not_overflow(void)
 	ASSERT(v > 0 && v < PACING_ANCHOR_MAX * 3);
 }
 
+/* ------------------------------------------------- MMP-3: fault classes */
+
+static void test_fault_classes(void)
+{
+	ASSERT(pacing_fault_is_deterministic(PACING_FAULT_UNAUTHORIZED));
+	ASSERT(pacing_fault_is_deterministic(PACING_FAULT_FORBIDDEN));
+	ASSERT(pacing_fault_is_deterministic(PACING_FAULT_NOT_FOUND));
+	ASSERT(pacing_fault_is_deterministic(PACING_FAULT_CODEC));
+	ASSERT(pacing_fault_is_deterministic(PACING_FAULT_TOO_LARGE));
+	ASSERT(pacing_fault_is_deterministic(PACING_FAULT_DECODER));
+	ASSERT(!pacing_fault_is_deterministic(PACING_FAULT_REFUSED));
+	ASSERT(!pacing_fault_is_deterministic(PACING_FAULT_TIMEOUT));
+	ASSERT(!pacing_fault_is_deterministic(PACING_FAULT_EOF));
+	ASSERT(!pacing_fault_is_deterministic(PACING_FAULT_STALL));
+	ASSERT(!pacing_fault_is_deterministic(PACING_FAULT_UNREACHABLE));
+	ASSERT(!pacing_fault_is_deterministic(PACING_FAULT_OTHER));
+
+	/* every fault has a short text and a hint, none mentions a URL */
+	for (int f = PACING_FAULT_NONE; f <= PACING_FAULT_OTHER; f++) {
+		ASSERT(pacing_fault_short(f) != NULL && *pacing_fault_short(f));
+		ASSERT(pacing_fault_hint(f) != NULL);
+		ASSERT(strstr(pacing_fault_short(f), "://") == NULL);
+	}
+	ASSERT(strstr(pacing_fault_short(PACING_FAULT_UNAUTHORIZED), "401") != NULL);
+	ASSERT(strstr(pacing_fault_short(PACING_FAULT_FORBIDDEN), "403") != NULL);
+	ASSERT(strstr(pacing_fault_short(PACING_FAULT_NOT_FOUND), "404") != NULL);
+	ASSERT(strstr(pacing_fault_hint(PACING_FAULT_UNAUTHORIZED), "%7C") != NULL);
+}
+
+static void test_backoff_deterministic_grows_to_60s(void)
+{
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_UNAUTHORIZED, 1), 5000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_UNAUTHORIZED, 2), 10000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_UNAUTHORIZED, 3), 20000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_UNAUTHORIZED, 4), 40000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_UNAUTHORIZED, 5), 60000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_CODEC, 50), 60000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_CODEC, 4000000000u), 60000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_CODEC, 0), 5000);
+}
+
+static void test_backoff_transient_stays_fast(void)
+{
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_REFUSED, 1), 2000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_REFUSED, 2), 3000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_TIMEOUT, 3), 4000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_EOF, 4), 5000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_STALL, 1000), 5000);
+	ASSERT_EQ_I(pacing_backoff_ms(PACING_FAULT_OTHER, 4000000000u), 5000);
+}
+
+static void test_backoff_wrong_password_ten_minutes(void)
+{
+	/* acceptance (d): a wrong password for 10 minutes gives at most 15
+	 * attempts (and, with the log collapse below, far fewer lines) */
+	int64_t t = 0;
+	unsigned attempts = 0;
+	while (t < 600000) {
+		attempts++;
+		t += pacing_backoff_ms(PACING_FAULT_UNAUTHORIZED, attempts);
+	}
+	ASSERT(attempts <= 15);
+}
+
+/* -------------------------------------------------- MMP-3: log collapse */
+
+static void test_dedup_collapses_identical_lines(void)
+{
+	struct pacing_dedup d;
+	unsigned rep = 99;
+	pacing_dedup_init(&d, 300 * 1000000LL);
+
+	ASSERT(pacing_dedup_check(&d, "login failed", 0, &rep));
+	ASSERT_EQ_I(rep, 0);
+	/* repeats inside the interval are suppressed */
+	for (int i = 1; i <= 10; i++)
+		ASSERT(!pacing_dedup_check(&d, "login failed", i * 20 * 1000000LL, &rep));
+	/* a different line is emitted at once */
+	ASSERT(pacing_dedup_check(&d, "connection refused", 210 * 1000000LL, &rep));
+	ASSERT_EQ_I(rep, 0);
+	/* after the interval: emitted again with the number suppressed */
+	ASSERT(pacing_dedup_check(&d, "login failed", 301 * 1000000LL, &rep));
+	ASSERT_EQ_I(rep, 10);
+	ASSERT(!pacing_dedup_check(&d, "login failed", 302 * 1000000LL, &rep));
+
+	/* no repeats in between: after the interval emitted plainly */
+	ASSERT(pacing_dedup_check(&d, "connection refused", 600 * 1000000LL, &rep));
+	ASSERT_EQ_I(rep, 0);
+
+	/* reset forgets everything */
+	pacing_dedup_reset(&d);
+	ASSERT(pacing_dedup_check(&d, "login failed", 603 * 1000000LL, &rep));
+	ASSERT_EQ_I(rep, 0);
+}
+
+static void test_dedup_wrong_password_line_budget(void)
+{
+	/* 10 minutes of a wrong password: attempts follow the backoff, each
+	 * produces the same line — at most a handful are actually logged */
+	struct pacing_dedup d;
+	unsigned rep;
+	int lines = 0;
+	int64_t t = 0;
+	pacing_dedup_init(&d, 300 * 1000000LL);
+	for (unsigned a = 1; t < 600 * 1000000LL; a++) {
+		if (pacing_dedup_check(&d, "garage: login failed (401)", t, &rep))
+			lines++;
+		t += pacing_backoff_ms(PACING_FAULT_UNAUTHORIZED, a) * 1000;
+	}
+	ASSERT(lines <= 3);
+	ASSERT(lines >= 2);
+}
+
+static void test_dedup_slots_evict_oldest(void)
+{
+	struct pacing_dedup d;
+	unsigned rep;
+	char key[32];
+	pacing_dedup_init(&d, 300 * 1000000LL);
+	for (int i = 0; i < PACING_DEDUP_SLOTS + 2; i++) {
+		snprintf(key, sizeof key, "line %d", i);
+		ASSERT(pacing_dedup_check(&d, key, i, &rep));
+	}
+	/* the newest are still remembered */
+	snprintf(key, sizeof key, "line %d", PACING_DEDUP_SLOTS + 1);
+	ASSERT(!pacing_dedup_check(&d, key, 100, &rep));
+	/* the oldest was evicted, so it counts as new again */
+	ASSERT(pacing_dedup_check(&d, "line 0", 101, &rep));
+}
+
+static void test_dedup_normalize_pointers(void)
+{
+	char out[128];
+	pacing_dedup_normalize("[rtsp @ 0x55d4c2a1b2c0] method DESCRIBE failed: 401 Unauthorized",
+			       out, sizeof out);
+	ASSERT(strcmp(out, "[rtsp @ 0x] method DESCRIBE failed: 401 Unauthorized") == 0);
+	pacing_dedup_normalize("no pointer here 0x", out, sizeof out);
+	ASSERT(strcmp(out, "no pointer here 0x") == 0);
+	char small[8];
+	pacing_dedup_normalize("abcdefghijkl", small, sizeof small);
+	ASSERT(strcmp(small, "abcdefg") == 0);
+}
+
+/* -------------------------------------------------- MMP-3: STATUS text */
+
+static void test_status_text(void)
+{
+	char out[256];
+	struct pacing_cam_status s[6] = {
+		{ "front", PACING_CAM_LIVE, PACING_FAULT_NONE },
+		{ "drive", PACING_CAM_LIVE, PACING_FAULT_NONE },
+		{ "garage", PACING_CAM_FAILING, PACING_FAULT_UNAUTHORIZED },
+		{ "yard", PACING_CAM_LIVE, PACING_FAULT_NONE },
+		{ "gate", PACING_CAM_LIVE, PACING_FAULT_NONE },
+		{ "shed", PACING_CAM_LIVE, PACING_FAULT_NONE },
+	};
+	pacing_format_status(s, 6, out, sizeof out);
+	ASSERT(strcmp(out, "5/6 live; garage: login failed (401)") == 0);
+
+	s[0].state = PACING_CAM_CONNECTING;
+	s[5].state = PACING_CAM_FAILING;
+	s[5].fault = PACING_FAULT_CODEC;
+	s[4].state = PACING_CAM_FAILING;
+	s[4].fault = PACING_FAULT_REFUSED;
+	s[3].state = PACING_CAM_FAILING;
+	s[3].fault = PACING_FAULT_STALL;
+	pacing_format_status(s, 6, out, sizeof out);
+	ASSERT(strncmp(out, "1/6 live; front: connecting; garage: login failed (401); ", 57) == 0);
+	ASSERT(strstr(out, "+2 more") != NULL);
+
+	for (int i = 0; i < 6; i++)
+		s[i].state = PACING_CAM_LIVE;
+	pacing_format_status(s, 6, out, sizeof out);
+	ASSERT(strcmp(out, "6/6 live") == 0);
+
+	char small[12];
+	pacing_format_status(s, 6, small, sizeof small);
+	ASSERT(strlen(small) < sizeof small);
+}
+
+/* -------------------------------------- MMP-7: pts tracking / file loops */
+
+static void test_pts_classify(void)
+{
+	ASSERT_EQ_I(pacing_pts_classify(-1, 123), PACING_PTS_OK);
+	ASSERT_EQ_I(pacing_pts_classify(1000000, 1040000), PACING_PTS_OK);
+	ASSERT_EQ_I(pacing_pts_classify(1000000, 1000000), PACING_PTS_OK);
+	ASSERT_EQ_I(pacing_pts_classify(1000000, 2000001), PACING_PTS_JUMP);
+	ASSERT_EQ_I(pacing_pts_classify(1000000, 999999), PACING_PTS_BACKWARDS);
+}
+
+static void test_pts_loop_reanchors_once(void)
+{
+	/* a 10 s clip at 25 fps played twice: exactly ONE re-anchor at the
+	 * loop point, none afterwards (the new series is the new reference) */
+	int64_t last = -1;
+	int reanchors = 0;
+	for (int loop = 0; loop < 2; loop++)
+		for (int i = 0; i < 250; i++) {
+			int64_t pts = (int64_t)i * 40000;
+			if (pacing_pts_classify(last, pts) != PACING_PTS_OK)
+				reanchors++;
+			last = pts;
+		}
+	ASSERT_EQ_I(reanchors, 1);
+}
+
+static void test_filepace(void)
+{
+	struct pacing_filepace p;
+	pacing_filepace_reset(&p);
+	/* first packet: due now, establishes the base */
+	ASSERT_EQ_I(pacing_filepace_due(&p, 5000000, 100), 100);
+	/* 40 ms of pts later: due 40 ms after the base */
+	ASSERT_EQ_I(pacing_filepace_due(&p, 5040000, 110), 40100);
+	ASSERT_EQ_I(pacing_filepace_due(&p, 5080000, 50000), 80100);
+	/* loop: pts back to 0 -> re-based on now */
+	ASSERT_EQ_I(pacing_filepace_due(&p, 0, 200000), 200000);
+	ASSERT_EQ_I(pacing_filepace_due(&p, 40000, 200001), 240000);
+	/* a forward jump of more than 2 s re-bases instead of sleeping */
+	ASSERT_EQ_I(pacing_filepace_due(&p, 10000000, 300000), 300000);
+	/* fell more than 1 s behind (e.g. stalled storage): re-base */
+	ASSERT_EQ_I(pacing_filepace_due(&p, 10040000, 2000000), 2000000);
+	ASSERT_EQ_I(pacing_filepace_due(&p, 10080000, 2000001), 2040000);
+}
+
 int main(void)
 {
 	test_anchor_sliding_minimum();
@@ -828,6 +1054,20 @@ int main(void)
 	test_build_groups_sixteen_on_one_tile();
 	test_rotation_forced_reaches_last_of_sixteen();
 	test_anchor_full_queue_does_not_overflow();
+
+	/* MMP-3 / MMP-7 */
+	test_fault_classes();
+	test_backoff_deterministic_grows_to_60s();
+	test_backoff_transient_stays_fast();
+	test_backoff_wrong_password_ten_minutes();
+	test_dedup_collapses_identical_lines();
+	test_dedup_wrong_password_line_budget();
+	test_dedup_slots_evict_oldest();
+	test_dedup_normalize_pointers();
+	test_status_text();
+	test_pts_classify();
+	test_pts_loop_reanchors_once();
+	test_filepace();
 
 	return test_summary("test_pacing");
 }

@@ -24,6 +24,7 @@
 #define PACING_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* ------------------------------------------------------------------ anchor */
@@ -343,5 +344,127 @@ void pacing_rotation_init(struct pacing_rotation *r, int64_t now_us);
 int pacing_rotation_update(struct pacing_rotation *r, const bool *healthy, int count,
 			   int rotate_s, bool forced, int64_t now_us,
 			   bool *skipped);
+
+/* ----------------------------------------------------- camera fault classes
+ *
+ * Why a camera connection failed, decided by camera_thread.c from the
+ * libavformat error (or its own checks). Deterministic faults will not go
+ * away by retrying quickly (wrong password, wrong path, H.265 stream,
+ * stream too large for the decoder): they are logged once with a hint and
+ * retried with exponential backoff up to 60 s. Transient faults (camera or
+ * NVR rebooting, network glitch, stall) are retried every 2-5 s so the
+ * wall recovers quickly. */
+enum pacing_fault {
+	PACING_FAULT_NONE,
+	PACING_FAULT_UNAUTHORIZED,   /* 401 */
+	PACING_FAULT_FORBIDDEN,      /* 403 */
+	PACING_FAULT_NOT_FOUND,      /* 404 / no such file */
+	PACING_FAULT_CODEC,          /* video is not H.264 */
+	PACING_FAULT_TOO_LARGE,      /* larger than 1920x1920 */
+	PACING_FAULT_DECODER,        /* the hardware decoder could not be set up */
+	PACING_FAULT_REFUSED,        /* connection refused */
+	PACING_FAULT_TIMEOUT,        /* connect/read timeout */
+	PACING_FAULT_EOF,            /* the server closed the stream */
+	PACING_FAULT_STALL,          /* no data for several seconds (watchdog) */
+	PACING_FAULT_UNREACHABLE,    /* host/network unreachable */
+	PACING_FAULT_OTHER,          /* anything else: treated as transient */
+};
+
+bool pacing_fault_is_deterministic(enum pacing_fault f);
+
+/* Short text for STATUS= and log lines, e.g. "login failed (401)". */
+const char *pacing_fault_short(enum pacing_fault f);
+
+/* What to do about it, one sentence ("" for NONE/OTHER). */
+const char *pacing_fault_hint(enum pacing_fault f);
+
+/* Delay before reconnect attempt `attempt` (1 = first failure in a row).
+ * Deterministic: 5, 10, 20, 40, then 60 s. Transient: 2, 3, 4, then 5 s. */
+int64_t pacing_backoff_ms(enum pacing_fault f, unsigned attempt);
+
+/* ------------------------------------------------------------ log collapse
+ *
+ * Collapses repeated identical log lines: the first occurrence of a line is
+ * emitted, repeats within `interval_us` of the last emitted copy are
+ * suppressed and counted, and the next occurrence after the interval is
+ * emitted together with the count ("repeated N times"). A few slots so
+ * that lines alternating between two or three texts collapse as well. */
+#define PACING_DEDUP_SLOTS    16
+#define PACING_DEDUP_KEY_MAX 192
+
+struct pacing_dedup_slot {
+	char     key[PACING_DEDUP_KEY_MAX];
+	bool     used;
+	unsigned suppressed;
+	int64_t  last_emit_us, last_seen_us;
+};
+
+struct pacing_dedup {
+	struct pacing_dedup_slot slot[PACING_DEDUP_SLOTS];
+	int64_t interval_us;
+};
+
+void pacing_dedup_init(struct pacing_dedup *d, int64_t interval_us);
+void pacing_dedup_reset(struct pacing_dedup *d);
+
+/* Returns true if the line should be logged now; *repeats is then the
+ * number of copies suppressed since it was last logged (0 = none). Keys
+ * longer than PACING_DEDUP_KEY_MAX - 1 are compared on their prefix. When
+ * all slots are taken the least recently seen one is reused. */
+bool pacing_dedup_check(struct pacing_dedup *d, const char *key, int64_t now_us,
+			unsigned *repeats);
+
+/* Copies `in` to `out` with every hexadecimal pointer ("0x55d4c2a1b2c0",
+ * as in FFmpeg's "[rtsp @ 0x...]" prefix) cut down to "0x", so lines from
+ * different contexts collapse. Always NUL-terminates. */
+void pacing_dedup_normalize(const char *in, char *out, size_t outlen);
+
+/* ------------------------------------------------------------ STATUS text */
+
+enum pacing_cam_state {
+	PACING_CAM_CONNECTING,
+	PACING_CAM_LIVE,
+	PACING_CAM_FAILING,
+};
+
+struct pacing_cam_status {
+	const char           *name;
+	enum pacing_cam_state state;
+	enum pacing_fault     fault;
+};
+
+/* "5/6 live; garage: login failed (401)" — the live count, then up to
+ * three cameras that are not live ("connecting" or their fault), then
+ * "+N more". Never contains a URL. Always NUL-terminates. */
+void pacing_format_status(const struct pacing_cam_status *s, int n, char *out, size_t outlen);
+
+/* ------------------------------------------------- pts continuity, file pace */
+
+enum pacing_pts_event {
+	PACING_PTS_OK,          /* continues the series (or the first pts) */
+	PACING_PTS_BACKWARDS,   /* went backwards: new series (loop, camera restart) */
+	PACING_PTS_JUMP,        /* jumped forward more than 1 s */
+};
+
+/* Classifies pts_us against the previous pts (last_us < 0 = none yet).
+ * The caller re-anchors on anything but OK and then uses pts_us itself as
+ * the new reference, so a looped clip re-anchors exactly once. */
+enum pacing_pts_event pacing_pts_classify(int64_t last_us, int64_t pts_us);
+
+/* Reads a local file at its natural speed (like ffmpeg -re): the wall
+ * clock time a packet is due is base_wall + (pts - base_pts). Re-based on
+ * the first packet, when pts goes backwards (loop), when a packet would be
+ * due more than 2 s from now (forward jump), or when reading has fallen
+ * more than 1 s behind. So the caller never waits more than 2 s. */
+struct pacing_filepace {
+	bool    init;
+	int64_t base_wall_us, base_pts_us;
+};
+
+void pacing_filepace_reset(struct pacing_filepace *p);
+
+/* Wall clock time (same clock as now_us) at which the packet with pts_us
+ * is due; <= now_us means "feed it now". */
+int64_t pacing_filepace_due(struct pacing_filepace *p, int64_t pts_us, int64_t now_us);
 
 #endif

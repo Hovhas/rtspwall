@@ -8,10 +8,15 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <xf86drm.h>
@@ -19,20 +24,95 @@
 
 #include "rtspwall.h"
 
+/* -------------------------------------------------------- systemd notify */
+
+void notify_systemd(const char *msg)
+{
+	struct sockaddr_un sa = { .sun_family = AF_UNIX };
+	size_t len;
+
+	if (layout_notify_sockaddr(getenv("NOTIFY_SOCKET"), sa.sun_path, sizeof sa.sun_path,
+				   &len) < 0)
+		return;
+	int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return;
+	if (sendto(fd, msg, strlen(msg), MSG_NOSIGNAL, (struct sockaddr *)&sa,
+		   (socklen_t)(offsetof(struct sockaddr_un, sun_path) + len)) < 0) {
+		static bool warned;   /* benign race: at worst logged twice */
+		if (!warned) {
+			warned = true;
+			log_msg("sd_notify: cannot send to $NOTIFY_SOCKET: %s", strerror(errno));
+		}
+	}
+	close(fd);
+}
+
+void notify_status(const char *fmt, ...)
+{
+	char msg[512] = "STATUS=";
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(msg + 7, sizeof msg - 7, fmt, ap);
+	va_end(ap);
+	for (char *p = msg; *p; p++)   /* one line, no injected assignments */
+		if (*p == '\n' || *p == '\r')
+			*p = ' ';
+	notify_systemd(msg);
+}
+
+void update_status(struct wall *v, int64_t now_us)
+{
+	static int64_t last_us;
+	static char last[400];
+	struct pacing_cam_status st[MAX_CAMERAS];
+	char text[400];
+
+	if (last_us && now_us - last_us < 1000000)
+		return;
+	for (int i = 0; i < v->count; i++)
+		st[i] = (struct pacing_cam_status){
+			.name = v->cam[i].name,
+			.state = (enum pacing_cam_state)atomic_load(&v->cam[i].st_state),
+			.fault = (enum pacing_fault)atomic_load(&v->cam[i].st_fault),
+		};
+	if (v->display_connected) {
+		pacing_format_status(st, v->count, text, sizeof text);
+	} else {
+		int n = snprintf(text, sizeof text, "display %s disconnected (waiting); ", v->conn_name);
+		if (n > 0 && (size_t)n < sizeof text)
+			pacing_format_status(st, v->count, text + n, sizeof text - (size_t)n);
+	}
+	if (!strcmp(text, last))
+		return;
+	last_us = now_us;
+	memcpy(last, text, sizeof last);
+	notify_status("%s", text);
+}
+
 /* -------------------------------------------------------------- compositor */
 
+/* Each page-flip commit carries a sequence number as its user data, so a
+ * late event for a commit the compositor already gave up on (see the flip
+ * timeout in compositor()) cannot complete a newer one. */
 struct flip_data {
-	bool     done;
-	int64_t  time_us;    /* the event's timestamp, set by flip_handler */
+	bool      done;
+	uintptr_t seq;        /* sequence number of the pending commit */
+	int64_t   time_us;    /* the event's timestamp, set by flip_handler */
+	int64_t   commit_us;  /* monotonic time of the commit */
 };
+
+static struct flip_data flip_state = { .done = true };
 
 static void flip_handler(int fd, unsigned seq, unsigned s, unsigned us,
 			 unsigned crtc, void *data)
 {
 	(void)fd; (void)seq; (void)crtc;
-	struct flip_data *flip = data;
-	flip->time_us = (int64_t)s * 1000000 + us;
-	flip->done = true;
+	if ((uintptr_t)data != flip_state.seq || flip_state.done)
+		return;   /* stale event of an abandoned commit */
+	flip_state.time_us = (int64_t)s * 1000000 + us;
+	flip_state.done = true;
 }
 
 static void vblank_handler(int fd, unsigned seq, unsigned s, unsigned us, void *data)
@@ -273,17 +353,49 @@ static void report(struct wall *v)
  * commit is made, but the compositor still wakes at the next vblank. */
 void compositor(struct wall *v)
 {
-	struct flip_data flip = { .done = true };
+	struct flip_data *const fl = &flip_state;
 	drmEventContext evctx = {
 		.version = 3,
 		.vblank_handler = vblank_handler,
 		.page_flip_handler2 = flip_handler,
 	};
 	bool vblank_pending = false;
+	int64_t vblank_request_us = 0;
 	int64_t last_report_us = monotonic_us();
+	int64_t last_flip_warn_us = 0;
 
 	while (!quit) {
-		bool awaiting_flip = !flip.done;
+		int64_t loop_us = monotonic_us();
+
+		/* A page flip that never completes (display gone, driver stuck)
+		 * would freeze the wall for good. After 2 s give up on it: its
+		 * frames count as shown (the buffers stay valid either way),
+		 * and the display recovery below gets a forced re-probe. */
+		if (!fl->done && loop_us - fl->commit_us > 2 * 1000000LL) {
+			if (!last_flip_warn_us || loop_us - last_flip_warn_us >= 60 * 1000000LL) {
+				log_msg("display: no page-flip event for 2 s on %s - recovering",
+					v->conn_name);
+				last_flip_warn_us = loop_us;
+			}
+			fl->done = true;
+			complete_flip(v, loop_us);
+			if (v->commit_failures < 10)
+				v->commit_failures = 10;
+		}
+
+		/* Hotplug / standby / failed-commit recovery, only while no flip
+		 * is pending (a modeset next to a pending flip gets EBUSY). */
+		if (fl->done && display_poll(v))
+			vblank_pending = false;   /* the modeset ended that wait */
+
+		/* A requested vblank event that never arrives (CRTC was off)
+		 * must not stall the loop: ask again after 500 ms. */
+		if (vblank_pending && loop_us - vblank_request_us > 500000)
+			vblank_pending = false;
+
+		update_status(v, loop_us);
+
+		bool awaiting_flip = !fl->done;
 
 		if (!awaiting_flip && !vblank_pending) {
 			drmVBlank vbl = {
@@ -296,13 +408,15 @@ void compositor(struct wall *v)
 				},
 			};
 			if (drmWaitVBlank(v->drmfd, &vbl)) {
-				/* Rare (the driver refuses right now) — fall back
-				 * to a short sleep instead of spinning hot or
-				 * freezing the compositor. */
+				/* Rare (the driver refuses right now, e.g. the
+				 * CRTC is off) — fall back to a short sleep
+				 * instead of spinning hot or freezing the
+				 * compositor. */
 				usleep(4000);
 				continue;
 			}
 			vblank_pending = true;
+			vblank_request_us = loop_us;
 		}
 
 		struct pollfd pfd = { .fd = v->drmfd, .events = POLLIN };
@@ -312,10 +426,10 @@ void compositor(struct wall *v)
 		drmHandleEvent(v->drmfd, &evctx);
 
 		if (awaiting_flip) {
-			if (!flip.done)
+			if (!fl->done)
 				continue;      /* the event was not the flip yet */
 			int64_t flip_time_us = v->vblank_ts_monotonic
-				? flip.time_us : monotonic_us();
+				? fl->time_us : monotonic_us();
 
 			/* Warning (see diag_late1_plus in struct wall): how many
 			 * vblanks late did the flip land compared with the vblank
@@ -506,15 +620,18 @@ void compositor(struct wall *v)
 		if (!n_new) {
 			drmModeAtomicFree(req);
 		} else {
-			flip.done = false;
+			fl->done = false;
+			fl->seq++;
+			fl->commit_us = monotonic_us();
 			int r = drmModeAtomicCommit(v->drmfd, req,
 						    DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
-						    &flip);
+						    (void *)fl->seq);
 			int commit_errno = errno;
 			drmModeAtomicFree(req);
 
 			if (r) {
-				flip.done = true;
+				fl->done = true;
+				v->commit_failures++;
 				/* The frames were never shown — in_flight is never
 				 * confirmed by a flip, so they must go straight back
 				 * to the decoder instead of leaking. Also counted as
@@ -539,13 +656,17 @@ void compositor(struct wall *v)
 						v->diag_busy_drops++;
 					}
 				}
-				if (commit_errno == EBUSY)
+				if (commit_errno == EBUSY) {
 					usleep(1000);
-				else {
-					log_msg("atomic commit: %s", strerror(commit_errno));
+				} else {
+					/* the first of a run, then quiet until the
+					 * recovery in display_poll logs (rate-limited) */
+					if (v->commit_failures == 1)
+						log_msg("atomic commit: %s", strerror(commit_errno));
 					usleep(100000);
 				}
 			} else {
+				v->commit_failures = 0;
 				v->diag_commit_target_vblank_us = next_vblank_us;
 			}
 		}

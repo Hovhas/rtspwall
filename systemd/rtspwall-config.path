@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch /etc/rtspwall/cameras.conf and reload the wall on a valid change
+Documentation=https://github.com/Hovhas/rtspwall
+
+[Path]
+# Fires on every write/close of the file. rtspwall-config.service debounces
+# (editors often write twice) and validates before touching the running wall.
+PathModified=/etc/rtspwall/cameras.conf
+Unit=rtspwall-config.service
+
+[Install]
+WantedBy=multi-user.target

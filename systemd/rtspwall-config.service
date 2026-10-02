@@ -1,0 +1,26 @@
+[Unit]
+Description=Validate cameras.conf and restart rtspwall if it is valid
+Documentation=https://github.com/Hovhas/rtspwall
+# Never let rapid triggers put this unit (and thereby the .path unit) into a
+# failed start-limit state; debouncing is done by the sleep below instead.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+# Only act when the wall is enabled: a config edited before the first start
+# must not start the wall behind the user's back. (ExecCondition: a false
+# condition skips the unit cleanly, without a failure.)
+ExecCondition=/usr/bin/systemctl is-enabled --quiet rtspwall.service
+# Debounce: a trigger arriving while this unit is still activating is merged
+# into the current run, so editors' double writes (truncate + write, or
+# write + rename) cause one check and at most one restart of the final file.
+ExecStartPre=/usr/bin/sleep 2
+# An invalid file leaves the running wall untouched and logs one line; the
+# unit still ends successfully so the .path unit keeps watching.
+# NOTE: install.sh rewrites /usr/bin/rtspwall to $PREFIX/bin for source installs.
+ExecStart=/bin/sh -c 'if /usr/bin/rtspwall --check-config /etc/rtspwall/cameras.conf >/dev/null 2>&1; then echo "cameras.conf changed and is valid: restarting rtspwall.service"; /usr/bin/systemctl try-restart rtspwall.service; else echo "cameras.conf changed but is INVALID: rtspwall left running unchanged. Run: sudo rtspwall --check-config /etc/rtspwall/cameras.conf"; fi'
+# Runs as root (needs systemctl); keep the rest minimal.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict

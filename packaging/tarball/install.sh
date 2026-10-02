@@ -5,10 +5,11 @@
 #
 # The binary is linked against the libraries of the Debian release named in the
 # tarball, so use the tarball matching your OS (bookworm or trixie).
-# Installs to /usr/local/bin, creates the rtspwall system user, installs the
-# example config only if none exists, installs the systemd unit. Does NOT
-# enable or start the service and does not touch config.txt (set gpu_mem=256
-# in /boot/firmware/config.txt and reboot for 4+ concurrent 1080p streams).
+# Installs to /usr/local/bin (demo files to /usr/local/share/rtspwall/demo),
+# creates the rtspwall system user, installs the example config only if none
+# exists, installs the systemd units. Refuses to run if the .deb is installed.
+# Does NOT enable or start the service and does not touch config.txt: run
+# 'sudo rtspwall doctor --fix' to set gpu_mem (asks first, makes a backup).
 
 set -euo pipefail
 
@@ -16,6 +17,15 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 CONF_DIR=/etc/rtspwall
+PREFIX=/usr/local
+UNIT_DIR=/etc/systemd/system
+UNITS=(rtspwall.service rtspwall-demo.service rtspwall-config.service rtspwall-config.path)
+
+if command -v dpkg >/dev/null && dpkg -s rtspwall >/dev/null 2>&1; then
+    echo "The rtspwall .deb package is installed. Remove it first (apt remove rtspwall)" >&2
+    echo "or upgrade through the package instead of using this tarball." >&2
+    exit 1
+fi
 
 if command -v apt-get >/dev/null && [[ -s DEPENDS ]]; then
     # Strip version constraints; for alternatives (a | b) take the first.
@@ -24,7 +34,9 @@ if command -v apt-get >/dev/null && [[ -s DEPENDS ]]; then
     apt-get install -y --no-install-recommends "${PKGS[@]}"
 fi
 
-install -m 0755 rtspwall /usr/local/bin/rtspwall
+install -m 0755 rtspwall "$PREFIX/bin/rtspwall"
+install -d -m 0755 "$PREFIX/share/rtspwall/demo"
+install -m 0644 demo/* "$PREFIX/share/rtspwall/demo/"
 
 if ! getent passwd rtspwall >/dev/null; then
     useradd --system --user-group --no-create-home \
@@ -41,12 +53,17 @@ else
     install -m 0640 -o root -g rtspwall cameras.conf "$CONF_DIR/cameras.conf"
 fi
 
-sed 's|/usr/bin/rtspwall|/usr/local/bin/rtspwall|g' rtspwall.service \
-    >/etc/systemd/system/rtspwall.service
-chmod 0644 /etc/systemd/system/rtspwall.service
+for u in "${UNITS[@]}"; do
+    sed -e "s|/usr/bin/rtspwall|$PREFIX/bin/rtspwall|g" \
+        -e "s|/usr/share/rtspwall|$PREFIX/share/rtspwall|g" "$u" >"$UNIT_DIR/$u"
+    chmod 0644 "$UNIT_DIR/$u"
+done
 systemctl daemon-reload
+# Watch cameras.conf for edits. This does not start the wall itself.
+systemctl enable --now rtspwall-config.path >/dev/null 2>&1 || true
 
-echo "Installed. Next steps:"
-echo "  1. sudo nano $CONF_DIR/cameras.conf"
-echo "  2. sudo rtspwall --check-config $CONF_DIR/cameras.conf"
-echo "  3. sudo systemctl enable --now rtspwall"
+echo "Installed. The service was NOT enabled or started. Next steps:"
+echo "  sudo rtspwall demo          # 2x2 test wall, no cameras needed"
+echo "  sudo rtspwall probe         # check a camera URL (codec, size, decoder budget)"
+echo "  sudo rtspwall add NAME      # add a camera and start the wall"
+echo "Check gpu_mem and the system: sudo rtspwall doctor   (--fix to repair)"

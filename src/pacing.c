@@ -5,6 +5,8 @@
  */
 #include "pacing.h"
 
+#include <ctype.h>
+#include <stdio.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ anchor */
@@ -367,4 +369,235 @@ int pacing_rotation_update(struct pacing_rotation *r, const bool *healthy, int c
 		}
 	}
 	return r->active;
+}
+
+/* ----------------------------------------------------- camera fault classes */
+
+bool pacing_fault_is_deterministic(enum pacing_fault f)
+{
+	switch (f) {
+	case PACING_FAULT_UNAUTHORIZED:
+	case PACING_FAULT_FORBIDDEN:
+	case PACING_FAULT_NOT_FOUND:
+	case PACING_FAULT_CODEC:
+	case PACING_FAULT_TOO_LARGE:
+	case PACING_FAULT_DECODER:
+		return true;
+	default:
+		return false;
+	}
+}
+
+const char *pacing_fault_short(enum pacing_fault f)
+{
+	switch (f) {
+	case PACING_FAULT_NONE:         return "ok";
+	case PACING_FAULT_UNAUTHORIZED: return "login failed (401)";
+	case PACING_FAULT_FORBIDDEN:    return "access denied (403)";
+	case PACING_FAULT_NOT_FOUND:    return "stream not found (404)";
+	case PACING_FAULT_CODEC:        return "not H.264";
+	case PACING_FAULT_TOO_LARGE:    return "resolution too large";
+	case PACING_FAULT_DECODER:      return "decoder setup failed";
+	case PACING_FAULT_REFUSED:      return "connection refused";
+	case PACING_FAULT_TIMEOUT:      return "timeout";
+	case PACING_FAULT_EOF:          return "stream ended";
+	case PACING_FAULT_STALL:        return "stalled";
+	case PACING_FAULT_UNREACHABLE:  return "unreachable";
+	case PACING_FAULT_OTHER:        return "error";
+	}
+	return "error";
+}
+
+const char *pacing_fault_hint(enum pacing_fault f)
+{
+	switch (f) {
+	case PACING_FAULT_UNAUTHORIZED:
+		return "check the user name and password in the URL; encode special characters "
+		       "in the password (| as %7C, @ as %40, # as %23)";
+	case PACING_FAULT_FORBIDDEN:
+		return "the camera refused this user; check its user permissions (RTSP/live view "
+		       "must be allowed)";
+	case PACING_FAULT_NOT_FOUND:
+		return "the stream path is wrong; copy the exact RTSP URL from the camera or "
+		       "NVR settings";
+	case PACING_FAULT_CODEC:
+		return "the Raspberry Pi 4 decodes only H.264 in hardware; set the camera/NVR "
+		       "stream to H.264 (UniFi: turn off Enhanced encoding)";
+	case PACING_FAULT_TOO_LARGE:
+		return "the hardware decoder handles at most 1920x1920; use the camera's "
+		       "sub-stream";
+	case PACING_FAULT_DECODER:
+		return "out of decoder/GPU memory? see gpu_mem in /boot/firmware/config.txt "
+		       "(a reboot may be needed)";
+	case PACING_FAULT_REFUSED:
+		return "nothing listens on that port; is the camera/NVR up and RTSP enabled?";
+	case PACING_FAULT_TIMEOUT:
+	case PACING_FAULT_UNREACHABLE:
+		return "check the address and the network path to the camera";
+	case PACING_FAULT_EOF:
+	case PACING_FAULT_STALL:
+	case PACING_FAULT_NONE:
+	case PACING_FAULT_OTHER:
+		return "";
+	}
+	return "";
+}
+
+int64_t pacing_backoff_ms(enum pacing_fault f, unsigned attempt)
+{
+	if (attempt < 1)
+		attempt = 1;
+	if (pacing_fault_is_deterministic(f)) {
+		if (attempt >= 5)
+			return 60000;
+		return (int64_t)5000 << (attempt - 1);
+	}
+	if (attempt >= 4)
+		return 5000;
+	return 2000 + (int64_t)(attempt - 1) * 1000;
+}
+
+/* ------------------------------------------------------------ log collapse */
+
+void pacing_dedup_init(struct pacing_dedup *d, int64_t interval_us)
+{
+	memset(d, 0, sizeof *d);
+	d->interval_us = interval_us;
+}
+
+void pacing_dedup_reset(struct pacing_dedup *d)
+{
+	pacing_dedup_init(d, d->interval_us);
+}
+
+bool pacing_dedup_check(struct pacing_dedup *d, const char *key, int64_t now_us,
+			unsigned *repeats)
+{
+	size_t n = strlen(key);
+	if (n > PACING_DEDUP_KEY_MAX - 1)
+		n = PACING_DEDUP_KEY_MAX - 1;
+
+	*repeats = 0;
+	for (int i = 0; i < PACING_DEDUP_SLOTS; i++) {
+		struct pacing_dedup_slot *s = &d->slot[i];
+		if (!s->used || strncmp(s->key, key, n) || s->key[n])
+			continue;
+		s->last_seen_us = now_us;
+		if (now_us - s->last_emit_us < d->interval_us) {
+			s->suppressed++;
+			return false;
+		}
+		*repeats = s->suppressed;
+		s->suppressed = 0;
+		s->last_emit_us = now_us;
+		return true;
+	}
+
+	/* New line: a free slot, else the least recently seen one. */
+	int victim = 0;
+	for (int i = 0; i < PACING_DEDUP_SLOTS; i++) {
+		if (!d->slot[i].used) {
+			victim = i;
+			break;
+		}
+		if (d->slot[i].last_seen_us < d->slot[victim].last_seen_us)
+			victim = i;
+	}
+	struct pacing_dedup_slot *s = &d->slot[victim];
+	memcpy(s->key, key, n);
+	s->key[n] = '\0';
+	s->used = true;
+	s->suppressed = 0;
+	s->last_emit_us = s->last_seen_us = now_us;
+	return true;
+}
+
+void pacing_dedup_normalize(const char *in, char *out, size_t outlen)
+{
+	size_t o = 0;
+
+	if (!outlen)
+		return;
+	while (*in && o + 1 < outlen) {
+		if (in[0] == '0' && in[1] == 'x' && isxdigit((unsigned char)in[2])) {
+			out[o++] = '0';
+			if (o + 1 < outlen)
+				out[o++] = 'x';
+			in += 2;
+			while (isxdigit((unsigned char)*in))
+				in++;
+			continue;
+		}
+		out[o++] = *in++;
+	}
+	out[o] = '\0';
+}
+
+/* ------------------------------------------------------------ STATUS text */
+
+void pacing_format_status(const struct pacing_cam_status *s, int n, char *out, size_t outlen)
+{
+	int live = 0, shown = 0, more = 0;
+	size_t len;
+	int w;
+
+	if (!outlen)
+		return;
+	for (int i = 0; i < n; i++)
+		if (s[i].state == PACING_CAM_LIVE)
+			live++;
+	w = snprintf(out, outlen, "%d/%d live", live, n);
+	len = w < 0 ? 0 : (size_t)w;
+
+	for (int i = 0; i < n; i++) {
+		if (s[i].state == PACING_CAM_LIVE)
+			continue;
+		if (shown == 3) {
+			more++;
+			continue;
+		}
+		const char *what = s[i].state == PACING_CAM_CONNECTING
+			? "connecting" : pacing_fault_short(s[i].fault);
+		if (len < outlen) {
+			w = snprintf(out + len, outlen - len, "; %s: %s", s[i].name, what);
+			len = w < 0 ? outlen : len + (size_t)w;
+		}
+		shown++;
+	}
+	if (more && len < outlen)
+		snprintf(out + len, outlen - len, "; +%d more", more);
+}
+
+/* ------------------------------------------------- pts continuity, file pace */
+
+enum pacing_pts_event pacing_pts_classify(int64_t last_us, int64_t pts_us)
+{
+	if (last_us < 0)
+		return PACING_PTS_OK;
+	if (pts_us < last_us)
+		return PACING_PTS_BACKWARDS;
+	if (pts_us - last_us > 1000000)
+		return PACING_PTS_JUMP;
+	return PACING_PTS_OK;
+}
+
+void pacing_filepace_reset(struct pacing_filepace *p)
+{
+	memset(p, 0, sizeof *p);
+}
+
+int64_t pacing_filepace_due(struct pacing_filepace *p, int64_t pts_us, int64_t now_us)
+{
+	if (p->init) {
+		int64_t delta = pts_us - p->base_pts_us;
+		int64_t due = p->base_wall_us + delta;
+		/* Keep the base unless the packet would be due more than 2 s
+		 * from now (a forward jump) or is more than 1 s overdue. */
+		if (delta >= 0 && due <= now_us + 2000000 && now_us - due <= 1000000)
+			return due;
+	}
+	p->init = true;
+	p->base_wall_us = now_us;
+	p->base_pts_us = pts_us;
+	return now_us;
 }

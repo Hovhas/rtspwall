@@ -82,6 +82,7 @@
 #include <libavutil/log.h>
 
 #include "rtspwall.h"
+#include "cli.h"
 
 #ifndef VERSION
 #define VERSION "0.1.0-dev"
@@ -177,7 +178,24 @@ static void av_log_masked(void *avcl, int level, const char *fmt, va_list vl)
 	while (n > 0 && (masked[n - 1] == '\n' || masked[n - 1] == '\r'))
 		masked[--n] = '\0';
 	layout_sanitize_log_text(masked);
-	if (n)
+	if (!n)
+		return;
+
+	/* A camera retrying with a wrong password makes FFmpeg repeat the
+	 * same error on every attempt: collapse repeats (pointer addresses in
+	 * the "[rtsp @ 0x...]" prefix ignored), like camera_thread.c does for
+	 * its own lines. */
+	static pthread_mutex_t dd_lock = PTHREAD_MUTEX_INITIALIZER;
+	static struct pacing_dedup dd = { .interval_us = 300 * 1000000LL };
+	char key[PACING_DEDUP_KEY_MAX];
+	unsigned rep;
+	pacing_dedup_normalize(masked, key, sizeof key);
+	pthread_mutex_lock(&dd_lock);
+	bool emit = pacing_dedup_check(&dd, key, monotonic_us(), &rep);
+	pthread_mutex_unlock(&dd_lock);
+	if (emit && rep)
+		log_msg("ffmpeg: %s [repeated %u times in the last 5 min]", masked, rep);
+	else if (emit)
 		log_msg("ffmpeg: %s", masked);
 }
 
@@ -210,6 +228,7 @@ static void usage(FILE *out)
 		"  --mode WxH         screen size for --check-config (default 1920x1080)\n"
 		"  -h, --help         show this help\n"
 		"  -V, --version      show the version\n");
+	cli_usage(out);
 }
 
 /* -------------------------------------------------------------------- main */
@@ -226,6 +245,10 @@ int main(int argc, char **argv)
 	bool check = false;
 	const char *mode_arg = NULL;
 	int opt;
+
+	/* probe/add/doctor/demo: see cli.c */
+	if (argc > 1 && cli_is_subcommand(argv[1]))
+		return cli_main(argc, argv);
 
 	while ((opt = getopt_long(argc, argv, "hV", opts, NULL)) != -1) {
 		switch (opt) {
@@ -280,29 +303,41 @@ int main(int argc, char **argv)
 	av_log_set_callback(av_log_masked);
 	avformat_network_init();
 
+	/* Exit codes: RTSPWALL_EXIT_CONFIG (2) and RTSPWALL_EXIT_NO_DECODER
+	 * (3) are listed in the unit's RestartPreventExitStatus= — restarting
+	 * cannot fix them. 1 = restartable error, 0 = clean stop. */
 	if (load_config(&v, conf) < 0)
-		return 1;
+		return RTSPWALL_EXIT_CONFIG;
 	av_log_set_level(ffmpeg_level(v.cfg.ffmpeg_loglevel));
 
-	if (open_drm_device(&v) < 0)
-		return 1;
-
-	if (drmSetClientCap(v.drmfd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1)
-	    || drmSetClientCap(v.drmfd, DRM_CLIENT_CAP_ATOMIC, 1)) {
-		log_msg("driver lacks atomic/universal planes: %s", strerror(errno));
-		goto out;
+	r = decoder_preflight(v.cfg.decoder);
+	if (r) {
+		if (r == RTSPWALL_EXIT_NO_DECODER)
+			notify_status("no H.264 hardware decoder at %s (Raspberry Pi 5 has none)",
+				      v.cfg.decoder);
+		return quit ? 0 : r;
 	}
+	r = 1;
 
-	if (drmSetMaster(v.drmfd)) {
-		log_msg("cannot become DRM master: %s", strerror(errno));
-		log_msg("is an X server or another compositor running? Stop it first - only one client at a time.");
-		goto out;
-	}
+	/* Ready as soon as the config is loaded and the decoder exists:
+	 * waiting for DRM master or for a display can take arbitrarily long
+	 * (TV off) and must not run into the unit's TimeoutStartSec. */
+	notify_systemd("READY=1");
+	notify_status("starting");
 
 	/* Order matters: the display mode must be known before the grid tiles
 	 * can be computed, and the tiles before the rotation groups. */
-	if (find_display(&v) < 0 || apply_layout(&v) < 0)
+	int step = acquire_drm(&v);
+	if (step == 0)
+		step = wait_for_display(&v);
+	if (step == 0 && apply_layout(&v) < 0)
+		step = -2;
+	if (step != 0) {
+		r = step == -2 ? RTSPWALL_EXIT_CONFIG : step == 1 ? 0 : 1;
+		if (step == -2)
+			notify_status("config error - see the log");
 		goto out;
+	}
 	build_rotation(&v);
 
 	if (read_plane_props(&v) < 0 || create_primary_fb(&v) < 0 || initial_commit(&v) < 0)
@@ -332,6 +367,7 @@ int main(int argc, char **argv)
 
 out:
 	quit = 1;
+	notify_systemd("STOPPING=1");
 	/* A camera thread waiting in teardown_stream (pthread_cond_timedwait on
 	 * `detached`) would otherwise only wake after the full 2-second cap on
 	 * exit — needless delay of a shutdown already in progress. Broadcast
@@ -367,6 +403,7 @@ out:
 		drmModeDestroyPropertyBlob(v.drmfd, v.mode_blob);
 	if (v.primary_fb)
 		drmModeRmFB(v.drmfd, v.primary_fb);
+	/* (the dumb buffer behind it goes with the DRM fd below) */
 	if (v.drmfd >= 0) {
 		drmDropMaster(v.drmfd);
 		close(v.drmfd);

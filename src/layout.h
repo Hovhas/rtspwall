@@ -36,6 +36,13 @@
 #define LAYOUT_DEFAULT_DECODER        "/dev/video10"
 #define LAYOUT_MAX_DELAY_MS         10000     /* |delay_ms| limit */
 
+/* Process exit codes with a meaning for the service manager. The systemd
+ * unit lists 2 and 3 in RestartPreventExitStatus=, so a problem that a
+ * restart cannot fix ends the service with a readable status instead of a
+ * restart loop. */
+#define RTSPWALL_EXIT_CONFIG          2   /* config error, no cameras, bad usage */
+#define RTSPWALL_EXIT_NO_DECODER      3   /* no usable H.264 hardware decoder */
+
 /* FFMPEG_LOGLEVEL: how much of libav's own logging reaches the log. */
 enum layout_ffmpeg_log {
 	LAYOUT_FFMPEG_LOG_QUIET,
@@ -94,6 +101,7 @@ struct layout_camera {
 	int  width, height, x, y;     /* tile on screen; set by layout_apply in grid mode */
 	int  delay_ms;                /* optional last field, default 0 */
 	int  n_numbers;               /* internal: numeric fields seen on the line */
+	bool unifi_rewritten;         /* url was rewritten by layout_unifi_rewrite */
 };
 
 struct layout_config {
@@ -104,6 +112,9 @@ struct layout_config {
 	char connector[32];           /* CONNECTOR; "" = first connected */
 	char drm_device[LAYOUT_PATH_MAX];  /* DRM_DEVICE; "" = auto-detect */
 	enum layout_ffmpeg_log ffmpeg_loglevel;   /* FFMPEG_LOGLEVEL */
+	int  mode_w, mode_h;          /* MODE=WxH[@Hz]; 0/0 = auto */
+	int  mode_mhz;                /* refresh in mHz, 0 = any */
+	bool unifi_rewrite;           /* UNIFI_REWRITE=auto (true, default) | off */
 
 	struct layout_camera cam[LAYOUT_MAX_CAMERAS];
 	int  count;
@@ -119,6 +130,113 @@ typedef void (*layout_warn_fn)(void *ctx, const char *msg);
  * known — call layout_apply once the screen size is known. */
 int layout_parse(struct layout_config *cfg, const char *text,
 		 layout_warn_fn warn, void *warn_ctx, char *err, size_t errlen);
+
+/* Flags for layout_parse_flags. */
+#define LAYOUT_PARSE_STRICT  0x1u   /* an unknown key is an error, not a warning
+				     * (--check-config); the daemon stays lenient
+				     * so an upgrade never bricks a running wall */
+
+/* layout_parse with flags. layout_parse(...) == layout_parse_flags(..., 0, ...).
+ *
+ * Always errors, in both modes:
+ *   - a placeholder (see layout_has_placeholder) in a camera field or a
+ *     global value, reported with its line number;
+ *   - a file without a single camera line: "no cameras configured: ..."
+ *     (file-level message, no line number).
+ * Unknown keys: warning (default) or error (LAYOUT_PARSE_STRICT), with
+ * "did you mean X?" from layout_suggest_key when a known key is close.
+ * When UNIFI_REWRITE is auto (the default) every camera URL is passed
+ * through layout_unifi_rewrite after the whole file has been read;
+ * rewritten cameras get unifi_rewritten = true (the caller logs it). */
+int layout_parse_flags(struct layout_config *cfg, const char *text, unsigned flags,
+		       layout_warn_fn warn, void *warn_ctx, char *err, size_t errlen);
+
+/* True if `s` contains a template placeholder: "CHANGE_ME" (any case) or
+ * "<something>" (a '<', at least one character, then '>'). */
+bool layout_has_placeholder(const char *s);
+
+/* Case-insensitive Levenshtein distance (edit distance). Strings longer
+ * than 63 characters are compared on their first 63. */
+int layout_levenshtein(const char *a, const char *b);
+
+/* The known config key closest to `key`, or NULL if none is close enough
+ * (distance <= 1 for keys up to 5 characters, otherwise <= 2; a key that
+ * differs only in case always matches). */
+const char *layout_suggest_key(const char *key);
+
+/* ------------------------------------------------------------- display mode */
+
+/* Parses MODE: "auto" (w = h = mhz = 0), "WxH" (mhz = 0) or "WxH@Hz" with
+ * an integer or decimal refresh ("59.94" -> 59940). Returns 0 or -1. */
+int layout_parse_mode(const char *s, int *w, int *h, int *mhz);
+
+/* One connector mode, as the caller found it. */
+struct layout_mode {
+	int  width, height;
+	int  refresh_mhz;     /* refresh rate in mHz */
+	bool interlaced;
+	bool preferred;       /* DRM_MODE_TYPE_PREFERRED */
+};
+
+enum layout_mode_reason {
+	LAYOUT_MODE_PREFERRED,        /* auto: the display's preferred mode kept */
+	LAYOUT_MODE_AUTO_LOW_REFRESH, /* auto: preferred refresh < 50 Hz, replaced */
+	LAYOUT_MODE_AUTO_4K,          /* auto: preferred width >= 3840, replaced */
+	LAYOUT_MODE_EXPLICIT,         /* MODE=WxH[@Hz] matched */
+};
+
+/* Picks a mode. Interlaced modes are never chosen.
+ *
+ * Auto (want_w == 0): the preferred mode (the first progressive mode with
+ * the preferred flag, else the first progressive mode) is kept unless its
+ * refresh is under 50 Hz or its width is 3840 or more. Then the
+ * progressive mode with the same aspect ratio (1 % tolerance), width <=
+ * 1920 and refresh >= min(preferred refresh, 49.5 Hz) is chosen: the
+ * highest refresh up to 60 Hz first (a 100/120 Hz mode gains nothing for
+ * cameras and multiplies the commits), then the largest area, then the
+ * list order. If no such mode exists the preferred mode is kept.
+ *
+ * Explicit (want_w/want_h set): same size and, if want_mhz != 0, a refresh
+ * within 1 Hz (the closest wins); without a refresh the highest refresh up
+ * to 60 Hz, else the highest.
+ *
+ * Returns the index into m[], or -1 if nothing matches (the caller lists
+ * the available modes). */
+int layout_select_mode(const struct layout_mode *m, int n, int want_w, int want_h,
+		       int want_mhz, enum layout_mode_reason *reason);
+
+/* ------------------------------------------------------------ URL helpers */
+
+/* UniFi Protect shows its streams as rtsps://HOST:7441/TOKEN?enableSrtp.
+ * If `url` is such a URL (scheme rtsps, any case, port 7441) writes the
+ * plain-RTSP equivalent to `out`: scheme rtsp, port 7447, userinfo/host/
+ * path kept, every "enableSrtp" query parameter removed (the '?' too if
+ * nothing is left). Returns 1 if rewritten, 0 if `url` is not a UniFi
+ * Protect rtsps URL (out = copy of url), -1 if `out` is too small (out is
+ * NUL-terminated but incomplete). */
+int layout_unifi_rewrite(const char *url, char *out, size_t outlen);
+
+/* True for a network stream ("scheme://..." with any scheme but file),
+ * false for a local file (a plain path or a file: URL). Local files are
+ * read paced by pts and looped (demo clips); live streams never are. */
+bool layout_url_is_live(const char *url);
+
+/* True for rtsp:// and rtsps:// (any case) — only those get RTSP options. */
+bool layout_url_is_rtsp(const char *url);
+
+/* ------------------------------------------------------------ sd_notify */
+
+/* Converts $NOTIFY_SOCKET to the sun_path bytes of a sockaddr_un: an
+ * absolute path is copied (NUL-terminated); "@name" is the abstract
+ * namespace, written as a leading NUL followed by name. *len is the number
+ * of significant bytes in sun_path (for the sockaddr length: offsetof
+ * (struct sockaddr_un, sun_path) + *len). Returns 0, or -1 if env is NULL,
+ * empty, relative, a bare "@" or does not fit in cap - 1 bytes. */
+int layout_notify_sockaddr(const char *env, char *sun_path, size_t cap, size_t *len);
+
+/* True if `comm` (a /proc/PID/comm value, trailing newline allowed) is a
+ * desktop/display server process that typically holds DRM master. */
+bool layout_is_display_server(const char *comm);
 
 /* Computes each camera's tile for a screen of screen_w x screen_h pixels
  * (grid mode), or checks the manual tiles against the screen (manual mode:

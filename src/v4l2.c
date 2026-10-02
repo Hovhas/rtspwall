@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -248,5 +249,76 @@ int start_capture(struct wall *v, struct camera *k)
 		return -1;
 	}
 	k->capture_on = true;
+	return 0;
+}
+
+/* ----------------------------------------------------------- preflight */
+
+/* True if the M2M device takes H.264 on its OUTPUT (compressed) queue. */
+static bool takes_h264(int fd)
+{
+	for (uint32_t i = 0; i < 64; i++) {
+		struct v4l2_fmtdesc d = { .index = i, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE };
+		if (xioctl(fd, VIDIOC_ENUM_FMT, &d))
+			return false;
+		if (d.pixelformat == V4L2_PIX_FMT_H264)
+			return true;
+	}
+	return false;
+}
+
+int decoder_preflight(const char *device)
+{
+	int fd = -1;
+
+	/* The codec driver may still be loading at boot: give the device
+	 * node up to 15 s to appear before calling it missing. */
+	for (int i = 0; i < 150 && !quit; i++) {
+		fd = open(device, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+		if (fd >= 0 || errno != ENOENT)
+			break;
+		if (i == 0)
+			log_msg("decoder: %s does not exist yet - waiting up to 15 s", device);
+		usleep(100000);
+	}
+	if (quit && fd < 0)
+		return 1;
+	if (fd < 0) {
+		int e = errno;
+		if (e == ENOENT) {
+			log_msg("no H.264 hardware decoder found at %s (Raspberry Pi 5 has none)",
+				device);
+			log_msg("rtspwall needs the Raspberry Pi 4's (or 3's) H.264 hardware decoder; "
+				"if this is a Pi 4, check DECODER= in the config and that "
+				"/dev/video10 exists (bcm2835-codec)");
+			return RTSPWALL_EXIT_NO_DECODER;
+		}
+		if (e == EACCES || e == EPERM) {
+			log_msg("decoder: cannot open %s: %s - the service user needs access to "
+				"the video devices (group \"video\")", device, strerror(e));
+			return RTSPWALL_EXIT_NO_DECODER;
+		}
+		log_msg("decoder: cannot open %s: %s", device, strerror(e));
+		return 1;
+	}
+
+	struct v4l2_capability cap = { 0 };
+	bool ok = false;
+	if (xioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+		uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
+				? cap.device_caps : cap.capabilities;
+		ok = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) && takes_h264(fd);
+	}
+	close(fd);
+	if (!ok) {
+		log_msg("no H.264 hardware decoder found at %s (Raspberry Pi 5 has none)", device);
+		if (cap.driver[0])
+			log_msg("decoder: %s is \"%.32s\" (driver %.16s), not a multi-planar H.264 "
+				"memory-to-memory decoder - check DECODER= in the config",
+				device, (const char *)cap.card, (const char *)cap.driver);
+		return RTSPWALL_EXIT_NO_DECODER;
+	}
+	log_msg("decoder: %s is \"%.32s\" (driver %.16s), H.264 ok", device,
+		(const char *)cap.card, (const char *)cap.driver);
 	return 0;
 }

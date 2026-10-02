@@ -829,6 +829,437 @@ static void test_overlong_key_and_name_are_errors(void)
 	ASSERT_EQ_I(strlen(cfg.drm_device), LAYOUT_PATH_MAX - 1);
 }
 
+/* ------------------------------------------------ MMP-2: safe defaults */
+
+static int parse_strict(struct layout_config *cfg, const char *text)
+{
+	warnings = 0;
+	last_warning[0] = '\0';
+	err[0] = '\0';
+	return layout_parse_flags(cfg, text, LAYOUT_PARSE_STRICT, count_warning, NULL,
+				  err, sizeof err);
+}
+
+static void test_no_cameras_configured_message(void)
+{
+	struct layout_config cfg;
+	/* the shipped example: everything commented out, GRID active */
+	ASSERT_EQ_I(parse(&cfg,
+		"GRID=2x2\n"
+		"#front-door|rtsp://viewer:CHANGE_ME@192.168.1.10:554/stream1|1\n"), -1);
+	ASSERT(strstr(err, "no cameras configured") != NULL);
+	ASSERT(strncmp(err, "line ", 5) != 0);   /* file-level, no line number */
+}
+
+static void test_placeholder_change_me_is_error(void)
+{
+	struct layout_config cfg;
+	ASSERT_EQ_I(parse(&cfg,
+		"GRID=2x2\n"
+		"# comment with CHANGE_ME is fine\n"
+		"front|rtsp://viewer:CHANGE_ME@192.168.1.10/stream1|1\n"), -1);
+	ASSERT(strstr(err, "line 3:") != NULL);
+	ASSERT(strstr(err, "CHANGE_ME") != NULL);
+	ASSERT(strstr(err, "placeholder") != NULL);
+	/* the password must not be echoed beyond the placeholder itself */
+	ASSERT(strstr(err, "192.168.1.10") == NULL);
+
+	/* case-insensitive */
+	ASSERT_EQ_I(parse(&cfg, "GRID=2x2\nfront|rtsp://u:change_me@h/s|1\n"), -1);
+	ASSERT(strstr(err, "line 2:") != NULL);
+	/* strict mode too */
+	ASSERT_EQ_I(parse_strict(&cfg, "GRID=2x2\nfront|rtsp://u:CHANGE_ME@h/s|1\n"), -1);
+	ASSERT(strstr(err, "line 2:") != NULL);
+}
+
+static void test_placeholder_angle_brackets_is_error(void)
+{
+	struct layout_config cfg;
+	ASSERT_EQ_I(parse(&cfg,
+		"GRID=2x2\n"
+		"front|rtsp://<user>:<password>@<camera-ip>/stream1|1\n"), -1);
+	ASSERT(strstr(err, "line 2:") != NULL);
+	ASSERT(strstr(err, "<user>") != NULL);
+
+	ASSERT_EQ_I(parse(&cfg, "<name>|rtsp://u:p@h/s|1\nGRID=2x2\n"), -1);
+	ASSERT(strstr(err, "line 1:") != NULL);
+
+	/* in a global value too */
+	ASSERT_EQ_I(parse(&cfg, "CONNECTOR=<connector>\nGRID=1x1\nc|rtsp://h/s|1\n"), -1);
+	ASSERT(strstr(err, "line 1:") != NULL);
+
+	/* a lone '<' or '>' is not a placeholder (not valid in a URL anyway,
+	 * but we only reject the <...> pattern) */
+	ASSERT(!layout_has_placeholder("rtsp://h/a>b<c"));
+	ASSERT(layout_has_placeholder("rtsp://h/<x>"));
+	ASSERT(!layout_has_placeholder("rtsp://h/<>"));
+	ASSERT(layout_has_placeholder("CHANGE_ME"));
+	ASSERT(!layout_has_placeholder("rtsp://viewer:s3cret@h/stream1"));
+}
+
+static void test_unknown_key_strict_is_error_with_suggestion(void)
+{
+	struct layout_config cfg;
+	ASSERT_EQ_I(parse_strict(&cfg, "conector=HDMI-A-1\nGRID=1x1\nc|rtsp://h/s|1\n"), -1);
+	ASSERT(strstr(err, "line 1:") != NULL);
+	ASSERT(strstr(err, "conector") != NULL);
+	ASSERT(strstr(err, "did you mean CONNECTOR?") != NULL);
+
+	/* far from every key: no suggestion, still an error */
+	ASSERT_EQ_I(parse_strict(&cfg, "GRID=1x1\nSOMETHING=1\nc|rtsp://h/s|1\n"), -1);
+	ASSERT(strstr(err, "line 2:") != NULL);
+	ASSERT(strstr(err, "did you mean") == NULL);
+
+	/* daemon (non-strict): a warning with the same suggestion, no error */
+	ASSERT_EQ_I(parse(&cfg, "BUFER_MS=100\nGRID=1x1\nc|rtsp://h/s|1\n"), 0);
+	ASSERT_EQ_I(warnings, 1);
+	ASSERT(strstr(last_warning, "did you mean BUFFER_MS?") != NULL);
+	ASSERT_EQ_I(cfg.buffer_ms, LAYOUT_DEFAULT_BUFFER_MS);
+}
+
+static void test_suggest_key(void)
+{
+	ASSERT(layout_suggest_key("conector") && !strcmp(layout_suggest_key("conector"), "CONNECTOR"));
+	ASSERT(layout_suggest_key("connector") && !strcmp(layout_suggest_key("connector"), "CONNECTOR"));
+	ASSERT(layout_suggest_key("GRIDS") && !strcmp(layout_suggest_key("GRIDS"), "GRID"));
+	ASSERT(layout_suggest_key("MODES") && !strcmp(layout_suggest_key("MODES"), "MODE"));
+	ASSERT(layout_suggest_key("DECODR") && !strcmp(layout_suggest_key("DECODR"), "DECODER"));
+	ASSERT(layout_suggest_key("ROTATE_SECOND") && !strcmp(layout_suggest_key("ROTATE_SECOND"), "ROTATE_SECONDS"));
+	ASSERT(layout_suggest_key("UNIFI_REWITE") && !strcmp(layout_suggest_key("UNIFI_REWITE"), "UNIFI_REWRITE"));
+	ASSERT(layout_suggest_key("SOMETHING") == NULL);
+	ASSERT(layout_suggest_key("X") == NULL);
+	ASSERT(layout_suggest_key("") == NULL);
+
+	ASSERT_EQ_I(layout_levenshtein("kitten", "sitting"), 3);
+	ASSERT_EQ_I(layout_levenshtein("", "abc"), 3);
+	ASSERT_EQ_I(layout_levenshtein("abc", "ABC"), 0);   /* case-insensitive */
+}
+
+static void test_known_keys_are_accepted_strictly(void)
+{
+	struct layout_config cfg;
+	ASSERT_EQ_I(parse_strict(&cfg,
+		"BUFFER_MS=100\nROTATE_SECONDS=10\nGRID=1x1\nDECODER=/dev/video10\n"
+		"DRM_DEVICE=auto\nCONNECTOR=HDMI-A-1\nFFMPEG_LOGLEVEL=error\n"
+		"MODE=auto\nUNIFI_REWRITE=auto\nc|rtsp://h/s|1\n"), 0);
+	ASSERT_EQ_I(warnings, 0);
+}
+
+static void test_pipe_in_password_hint(void)
+{
+	struct layout_config cfg;
+	/* grid line, password "pa|ss" */
+	ASSERT_EQ_I(parse(&cfg, "GRID=2x2\ncam|rtsp://user:pa|ss@10.0.0.1/s|1\n"), -1);
+	ASSERT(strstr(err, "line 2:") != NULL);
+	ASSERT(strstr(err, "%7C") != NULL);
+
+	/* manual line, so many pipes the field count overflows */
+	ASSERT_EQ_I(parse(&cfg, "cam|rtsp://u:a|b|c|d@h/s|960|540|0|0\n"), -1);
+	ASSERT(strstr(err, "%7C") != NULL);
+
+	/* no '@' after the break: plain non-integer error without the hint */
+	ASSERT_EQ_I(parse(&cfg, "GRID=2x2\ncam|rtsp://h/s|one\n"), -1);
+	ASSERT(strstr(err, "%7C") == NULL);
+
+	/* %7C itself is accepted and kept verbatim */
+	ASSERT_EQ_I(parse(&cfg, "GRID=2x2\ncam|rtsp://user:pa%7Css@10.0.0.1/s|1\n"), 0);
+	ASSERT(strcmp(cfg.cam[0].url, "rtsp://user:pa%7Css@10.0.0.1/s") == 0);
+}
+
+/* ---------------------------------------------------------- MMP-5: MODE */
+
+static void test_parse_mode_key(void)
+{
+	int w, h, mhz;
+	ASSERT_EQ_I(layout_parse_mode("auto", &w, &h, &mhz), 0);
+	ASSERT_EQ_I(w, 0); ASSERT_EQ_I(h, 0); ASSERT_EQ_I(mhz, 0);
+	ASSERT_EQ_I(layout_parse_mode("1920x1080", &w, &h, &mhz), 0);
+	ASSERT_EQ_I(w, 1920); ASSERT_EQ_I(h, 1080); ASSERT_EQ_I(mhz, 0);
+	ASSERT_EQ_I(layout_parse_mode("1280x720@50", &w, &h, &mhz), 0);
+	ASSERT_EQ_I(w, 1280); ASSERT_EQ_I(h, 720); ASSERT_EQ_I(mhz, 50000);
+	ASSERT_EQ_I(layout_parse_mode("1920x1080@59.94", &w, &h, &mhz), 0);
+	ASSERT_EQ_I(mhz, 59940);
+	ASSERT_EQ_I(layout_parse_mode("1920x1080@", &w, &h, &mhz), -1);
+	ASSERT_EQ_I(layout_parse_mode("1920x1080@0", &w, &h, &mhz), -1);
+	ASSERT_EQ_I(layout_parse_mode("1920x1080@abc", &w, &h, &mhz), -1);
+	ASSERT_EQ_I(layout_parse_mode("1920", &w, &h, &mhz), -1);
+	ASSERT_EQ_I(layout_parse_mode("", &w, &h, &mhz), -1);
+	ASSERT_EQ_I(layout_parse_mode("99999x1", &w, &h, &mhz), -1);
+
+	struct layout_config cfg;
+	ASSERT_EQ_I(parse(&cfg, "GRID=1x1\nc|rtsp://h/s|1\n"), 0);
+	ASSERT_EQ_I(cfg.mode_w, 0);   /* default auto */
+	ASSERT_EQ_I(parse(&cfg, "MODE=1280x720@50\nGRID=1x1\nc|rtsp://h/s|1\n"), 0);
+	ASSERT_EQ_I(cfg.mode_w, 1280);
+	ASSERT_EQ_I(cfg.mode_h, 720);
+	ASSERT_EQ_I(cfg.mode_mhz, 50000);
+	ASSERT_EQ_I(parse(&cfg, "MODE=big\nGRID=1x1\nc|rtsp://h/s|1\n"), -1);
+	ASSERT(strstr(err, "line 1:") != NULL);
+	ASSERT(strstr(err, "MODE") != NULL);
+}
+
+#define M(w, h, hz, pref) { (w), (h), (int)((hz) * 1000), false, (pref) }
+#define MI(w, h, hz) { (w), (h), (int)((hz) * 1000), true, false }
+
+static void test_select_mode_4k30_tv(void)
+{
+	/* a typical 4K TV on a Pi 4 without hdmi_enable_4kp60 */
+	const struct layout_mode m[] = {
+		M(3840, 2160, 30, true), M(4096, 2160, 24, false), M(3840, 2160, 25, false),
+		MI(1920, 1080, 60), M(1920, 1080, 120, false), M(1920, 1080, 50, false),
+		M(1920, 1080, 60, false), M(1280, 720, 60, false), M(720, 576, 50, false),
+	};
+	enum layout_mode_reason why;
+	int i = layout_select_mode(m, 9, 0, 0, 0, &why);
+	ASSERT_EQ_I(i, 6);   /* 1920x1080@60: not interlaced, not 120 */
+	ASSERT_EQ_I(why, LAYOUT_MODE_AUTO_LOW_REFRESH);
+}
+
+static void test_select_mode_4k60(void)
+{
+	const struct layout_mode m[] = {
+		M(3840, 2160, 60, true), M(3840, 2160, 30, false), M(2560, 1440, 60, false),
+		M(1920, 1080, 60, false), M(1920, 1080, 59.94, false), M(1280, 720, 60, false),
+	};
+	enum layout_mode_reason why;
+	ASSERT_EQ_I(layout_select_mode(m, 6, 0, 0, 0, &why), 3);
+	ASSERT_EQ_I(why, LAYOUT_MODE_AUTO_4K);
+}
+
+static void test_select_mode_keeps_ultrawide_and_1440p(void)
+{
+	const struct layout_mode uw[] = {
+		M(2560, 1080, 60, true), M(1920, 1080, 60, false), M(1280, 720, 60, false),
+	};
+	const struct layout_mode qhd[] = {
+		M(2560, 1440, 60, true), M(1920, 1080, 60, false),
+	};
+	enum layout_mode_reason why;
+	ASSERT_EQ_I(layout_select_mode(uw, 3, 0, 0, 0, &why), 0);
+	ASSERT_EQ_I(why, LAYOUT_MODE_PREFERRED);
+	ASSERT_EQ_I(layout_select_mode(qhd, 2, 0, 0, 0, &why), 0);
+	ASSERT_EQ_I(why, LAYOUT_MODE_PREFERRED);
+}
+
+static void test_select_mode_keeps_1080p50_and_720p(void)
+{
+	const struct layout_mode p50[] = {
+		M(1920, 1080, 50, true), M(1920, 1080, 60, false),
+	};
+	const struct layout_mode p720[] = {
+		M(1280, 720, 60, true), M(1024, 768, 60, false),
+	};
+	enum layout_mode_reason why;
+	ASSERT_EQ_I(layout_select_mode(p50, 2, 0, 0, 0, &why), 0);
+	ASSERT_EQ_I(layout_select_mode(p720, 2, 0, 0, 0, &why), 0);
+	ASSERT_EQ_I(why, LAYOUT_MODE_PREFERRED);
+}
+
+static void test_select_mode_preferred_flag_and_interlaced(void)
+{
+	/* preferred is not first in the list */
+	const struct layout_mode a[] = {
+		M(1280, 720, 60, false), M(1920, 1080, 60, true),
+	};
+	/* preferred interlaced: skip to the first progressive mode */
+	const struct layout_mode b[] = {
+		MI(1920, 1080, 60), M(1920, 1080, 30, false), M(1280, 720, 60, false),
+	};
+	/* no preferred flag at all: first mode counts as preferred */
+	const struct layout_mode c[] = {
+		M(1680, 1050, 60, false), M(1280, 1024, 60, false),
+	};
+	const struct layout_mode only_i[] = { MI(1920, 1080, 60) };
+	enum layout_mode_reason why;
+	ASSERT_EQ_I(layout_select_mode(a, 2, 0, 0, 0, &why), 1);
+	/* b: base 1080p30 (< 50 Hz) -> highest refresh with the same aspect */
+	ASSERT_EQ_I(layout_select_mode(b, 3, 0, 0, 0, &why), 2);
+	ASSERT_EQ_I(why, LAYOUT_MODE_AUTO_LOW_REFRESH);
+	ASSERT_EQ_I(layout_select_mode(c, 2, 0, 0, 0, &why), 0);
+	ASSERT_EQ_I(layout_select_mode(only_i, 1, 0, 0, 0, &why), -1);
+	ASSERT_EQ_I(layout_select_mode(c, 0, 0, 0, 0, &why), -1);
+}
+
+static void test_select_mode_4k_without_same_aspect_keeps_preferred(void)
+{
+	const struct layout_mode m[] = {
+		M(4096, 2160, 60, true), M(1920, 1080, 60, false),
+	};
+	enum layout_mode_reason why;
+	ASSERT_EQ_I(layout_select_mode(m, 2, 0, 0, 0, &why), 0);
+	ASSERT_EQ_I(why, LAYOUT_MODE_PREFERRED);
+}
+
+static void test_select_mode_explicit(void)
+{
+	const struct layout_mode m[] = {
+		M(3840, 2160, 30, true), M(1920, 1080, 60, false), M(1920, 1080, 59.94, false),
+		M(1920, 1080, 50, false), M(1280, 720, 60, false), M(1280, 720, 50, false),
+		MI(1920, 1080, 50),
+	};
+	enum layout_mode_reason why;
+	ASSERT_EQ_I(layout_select_mode(m, 7, 1280, 720, 50000, &why), 5);
+	ASSERT_EQ_I(why, LAYOUT_MODE_EXPLICIT);
+	/* refresh tolerance: 59.94 asked, both 60 and 59.94 within 1 Hz,
+	 * the closer one wins */
+	ASSERT_EQ_I(layout_select_mode(m, 7, 1920, 1080, 59940, &why), 2);
+	ASSERT_EQ_I(layout_select_mode(m, 7, 1920, 1080, 60000, &why), 1);
+	/* no refresh given: highest refresh of that size, up to 60 Hz */
+	ASSERT_EQ_I(layout_select_mode(m, 7, 1920, 1080, 0, &why), 1);
+	/* the explicit choice is honoured even for 4K30 */
+	ASSERT_EQ_I(layout_select_mode(m, 7, 3840, 2160, 0, &why), 0);
+	/* not available */
+	ASSERT_EQ_I(layout_select_mode(m, 7, 1280, 720, 30000, &why), -1);
+	ASSERT_EQ_I(layout_select_mode(m, 7, 1366, 768, 0, &why), -1);
+	/* interlaced never matches */
+	const struct layout_mode i50[] = { M(1280, 720, 60, true), MI(1920, 1080, 50) };
+	ASSERT_EQ_I(layout_select_mode(i50, 2, 1920, 1080, 50000, &why), -1);
+}
+
+/* ------------------------------------------------------- MMP-5: UniFi */
+
+static void unifi(const char *in, int expect_r, const char *expect)
+{
+	char out[LAYOUT_URL_MAX];
+	int r = layout_unifi_rewrite(in, out, sizeof out);
+	ASSERT_EQ_I(r, expect_r);
+	if (expect_r == 1 && strcmp(out, expect)) {
+		fprintf(stderr, "FAIL unifi: \"%s\" -> \"%s\", expected \"%s\"\n", in, out, expect);
+		test_failures++;
+	}
+}
+
+static void test_unifi_rewrite(void)
+{
+	unifi("rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp", 1,
+	      "rtsp://192.168.1.1:7447/aB3dE5fG7hJ9kL1m");
+	unifi("rtsps://nvr.local:7441/aB3dE5fG7hJ9kL1m", 1,
+	      "rtsp://nvr.local:7447/aB3dE5fG7hJ9kL1m");
+	unifi("RTSPS://NVR:7441/Tok?enableSrtp", 1, "rtsp://NVR:7447/Tok");
+	unifi("rtsps://h:7441/T?enableSrtp&foo=1", 1, "rtsp://h:7447/T?foo=1");
+	unifi("rtsps://h:7441/T?foo=1&enableSrtp=true", 1, "rtsp://h:7447/T?foo=1");
+	unifi("rtsps://h:7441/T?a=1&enablesrtp&b=2", 1, "rtsp://h:7447/T?a=1&b=2");
+	unifi("rtsps://u:p@h:7441/T?enableSrtp", 1, "rtsp://u:p@h:7447/T");
+	unifi("rtsps://[fd00::1]:7441/T?enableSrtp", 1, "rtsp://[fd00::1]:7447/T");
+	unifi("  rtsps://h:7441/T?enableSrtp", 0, NULL);   /* fields arrive trimmed */
+
+	/* not UniFi Protect rtsps: untouched */
+	unifi("rtsp://192.168.1.1:7447/aB3dE5fG7hJ9kL1m", 0, NULL);
+	unifi("rtsps://cam:322/stream1", 0, NULL);
+	unifi("rtsps://cam/stream1", 0, NULL);
+	unifi("rtsps://cam:74410/stream1", 0, NULL);
+	unifi("rtsp://cam:7441/stream1?enableSrtp", 0, NULL);
+	unifi("/usr/share/rtspwall/demo/cam1.mp4", 0, NULL);
+
+	/* output buffer too small: -1, NUL-terminated */
+	char small[8];
+	ASSERT_EQ_I(layout_unifi_rewrite("rtsps://h:7441/T", small, sizeof small), -1);
+	ASSERT(strlen(small) < sizeof small);
+}
+
+static void test_unifi_rewrite_in_config(void)
+{
+	struct layout_config cfg;
+	ASSERT_EQ_I(parse(&cfg,
+		"GRID=1x2\n"
+		"door|rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp|1\n"
+		"yard|rtsp://cam/stream1|2\n"), 0);
+	ASSERT(cfg.unifi_rewrite);
+	ASSERT(strcmp(cfg.cam[0].url, "rtsp://192.168.1.1:7447/aB3dE5fG7hJ9kL1m") == 0);
+	ASSERT(cfg.cam[0].unifi_rewritten);
+	ASSERT(!cfg.cam[1].unifi_rewritten);
+
+	/* UNIFI_REWRITE=off keeps the URL unchanged, even when set after
+	 * the camera line */
+	ASSERT_EQ_I(parse(&cfg,
+		"GRID=1x1\n"
+		"door|rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp|1\n"
+		"UNIFI_REWRITE=off\n"), 0);
+	ASSERT(!cfg.unifi_rewrite);
+	ASSERT(strcmp(cfg.cam[0].url, "rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m?enableSrtp") == 0);
+	ASSERT(!cfg.cam[0].unifi_rewritten);
+
+	ASSERT_EQ_I(parse(&cfg, "UNIFI_REWRITE=maybe\nGRID=1x1\nc|rtsp://h/s|1\n"), -1);
+	ASSERT(strstr(err, "UNIFI_REWRITE") != NULL);
+}
+
+/* ------------------------------------------------ MMP-7: URL kinds */
+
+static void test_url_is_live(void)
+{
+	/* every network URL is live: the file pacing branch is never taken */
+	ASSERT(layout_url_is_live("rtsp://cam/stream1"));
+	ASSERT(layout_url_is_live("rtsp://u:p@192.168.1.10:554/Streaming/Channels/102"));
+	ASSERT(layout_url_is_live("RTSP://CAM/stream1"));
+	ASSERT(layout_url_is_live("rtsps://nvr:7441/tok"));
+	ASSERT(layout_url_is_live("http://cam/video.flv"));
+	ASSERT(layout_url_is_live("srt://cam:9000"));
+	ASSERT(layout_url_is_live("udp://239.0.0.1:1234"));
+	/* local files */
+	ASSERT(!layout_url_is_live("/usr/share/rtspwall/demo/cam1.mp4"));
+	ASSERT(!layout_url_is_live("demo/cam1.mp4"));
+	ASSERT(!layout_url_is_live("file:/usr/share/rtspwall/demo/cam1.mp4"));
+	ASSERT(!layout_url_is_live("file:///usr/share/rtspwall/demo/cam1.mp4"));
+	ASSERT(!layout_url_is_live("FILE:///x.mp4"));
+	ASSERT(!layout_url_is_live("clip:with:colons.mp4"));
+	ASSERT(!layout_url_is_live(""));
+
+	ASSERT(layout_url_is_rtsp("rtsp://cam/s"));
+	ASSERT(layout_url_is_rtsp("RTSPS://cam/s"));
+	ASSERT(!layout_url_is_rtsp("http://cam/s"));
+	ASSERT(!layout_url_is_rtsp("/x/rtsp://y"));
+	ASSERT(!layout_url_is_rtsp("file:///x.mp4"));
+}
+
+/* ------------------------------------------------- MMP-3: sd_notify */
+
+static void test_notify_sockaddr(void)
+{
+	char path[108];
+	size_t len = 0;
+	ASSERT_EQ_I(layout_notify_sockaddr("/run/systemd/notify", path, sizeof path, &len), 0);
+	ASSERT(strcmp(path, "/run/systemd/notify") == 0);
+	ASSERT_EQ_I(len, strlen("/run/systemd/notify"));
+
+	/* abstract namespace: leading '@' becomes a NUL, length counts it */
+	ASSERT_EQ_I(layout_notify_sockaddr("@/org/freedesktop/systemd1/notify/123", path,
+					   sizeof path, &len), 0);
+	ASSERT_EQ_I(path[0], '\0');
+	ASSERT(memcmp(path + 1, "/org/freedesktop/systemd1/notify/123", len - 1) == 0);
+	ASSERT_EQ_I(len, strlen("@/org/freedesktop/systemd1/notify/123"));
+
+	ASSERT_EQ_I(layout_notify_sockaddr(NULL, path, sizeof path, &len), -1);
+	ASSERT_EQ_I(layout_notify_sockaddr("", path, sizeof path, &len), -1);
+	ASSERT_EQ_I(layout_notify_sockaddr("relative/path", path, sizeof path, &len), -1);
+	ASSERT_EQ_I(layout_notify_sockaddr("@", path, sizeof path, &len), -1);
+	char longp[200];
+	memset(longp, 'a', sizeof longp - 1);
+	longp[0] = '/';
+	longp[sizeof longp - 1] = '\0';
+	ASSERT_EQ_I(layout_notify_sockaddr(longp, path, sizeof path, &len), -1);
+}
+
+/* ---------------------------------------------- MMP-3: DRM master holder */
+
+static void test_display_server_names(void)
+{
+	ASSERT(layout_is_display_server("labwc"));
+	ASSERT(layout_is_display_server("Xorg"));
+	ASSERT(layout_is_display_server("Xwayland"));
+	ASSERT(layout_is_display_server("wayfire"));
+	ASSERT(layout_is_display_server("lightdm"));
+	ASSERT(layout_is_display_server("gdm3"));
+	ASSERT(layout_is_display_server("sddm"));
+	ASSERT(layout_is_display_server("weston"));
+	ASSERT(layout_is_display_server("kodi.bin"));
+	ASSERT(layout_is_display_server("kodi"));
+	ASSERT(layout_is_display_server("labwc\n"));   /* /proc/PID/comm ends in '\n' */
+	ASSERT(!layout_is_display_server("rtspwall"));
+	ASSERT(!layout_is_display_server("bash"));
+	ASSERT(!layout_is_display_server("Xorgish"));
+	ASSERT(!layout_is_display_server(""));
+}
+
 int main(void)
 {
 	test_line_empty();
@@ -884,6 +1315,28 @@ int main(void)
 	test_delay_range();
 	test_ffmpeg_loglevel_key();
 	test_overlong_key_and_name_are_errors();
+
+	/* MMP-2 / MMP-3 / MMP-5 / MMP-7 */
+	test_no_cameras_configured_message();
+	test_placeholder_change_me_is_error();
+	test_placeholder_angle_brackets_is_error();
+	test_unknown_key_strict_is_error_with_suggestion();
+	test_suggest_key();
+	test_known_keys_are_accepted_strictly();
+	test_pipe_in_password_hint();
+	test_parse_mode_key();
+	test_select_mode_4k30_tv();
+	test_select_mode_4k60();
+	test_select_mode_keeps_ultrawide_and_1440p();
+	test_select_mode_keeps_1080p50_and_720p();
+	test_select_mode_preferred_flag_and_interlaced();
+	test_select_mode_4k_without_same_aspect_keeps_preferred();
+	test_select_mode_explicit();
+	test_unifi_rewrite();
+	test_unifi_rewrite_in_config();
+	test_url_is_live();
+	test_notify_sockaddr();
+	test_display_server_names();
 
 	return test_summary("test_layout");
 }
