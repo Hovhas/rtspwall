@@ -84,7 +84,10 @@ jobs:
           cd ..
           ./scripts/release-notes.sh "$TAG" > RELEASE_NOTES.md
           ls -l dist
+      # GitHub only stores attestations for public repositories on personal
+      # accounts; on a private repo the step would fail the whole release.
       - uses: actions/attest-build-provenance@v2
+        if: ${{ !github.event.repository.private }}
         with:
           subject-path: |
             dist/*.deb
