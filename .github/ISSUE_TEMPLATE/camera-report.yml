@@ -1,0 +1,78 @@
+name: Camera report
+description: Tell us whether a camera, NVR or setup works (or does not)
+labels: ["camera-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reports like this build the [compatibility table](https://github.com/Hovhas/rtspwall/blob/main/docs/compatibility.md). Working and failing setups are both useful. **Do not paste passwords, tokens or full URLs.**
+  - type: input
+    id: brand
+    attributes:
+      label: Brand and model
+      placeholder: "Example: Reolink RLC-810A"
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+    validations:
+      required: false
+  - type: input
+    id: nvr
+    attributes:
+      label: NVR or restream, if any
+      description: UniFi Protect, Frigate, go2rtc, a Hikvision or Dahua recorder, or none.
+    validations:
+      required: false
+  - type: input
+    id: stream
+    attributes:
+      label: Stream you used
+      description: Main or sub-stream, codec, resolution and frame rate. `sudo rtspwall probe` prints these.
+      placeholder: "Example: sub-stream, H.264, 640x360, 15 fps"
+    validations:
+      required: true
+  - type: input
+    id: number-of-cameras
+    attributes:
+      label: How many cameras were on the wall
+    validations:
+      required: true
+  - type: dropdown
+    id: pi-os
+    attributes:
+      label: Board and OS
+      options:
+        - Pi 4, Trixie
+        - Pi 4, Bookworm
+        - Pi 400 or CM4
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Works
+        - Works with changes (explain below)
+        - Does not work
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: What did you have to change, and what went wrong?
+      description: For example, you switched to the sub-stream, or you turned off "Enhanced encoding". Add the `verdict:` and `fix:` lines from `probe`.
+    validations:
+      required: false
+  - type: textarea
+    id: doctor-report
+    attributes:
+      label: Output of `sudo rtspwall doctor --report` (optional)
+      description: Only if something failed. Read it before you paste it.
+      render: text
+    validations:
+      required: false

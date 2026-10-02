@@ -1,5 +1,6 @@
 name: Release
 
+# Push a tag vX.Y.Z or vX.Y.Z-rc1 (see CONTRIBUTING.md, "Releasing").
 on:
   push:
     tags: ['v*']
@@ -8,7 +9,17 @@ permissions:
   contents: read
 
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: ./scripts/release-notes.sh "$TAG" >/dev/null
+
   build:
+    needs: check
     # Free arm64 runners exist for public repositories only.
     runs-on: ubuntu-24.04-arm
     strategy:
@@ -21,18 +32,20 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git \
-            build-essential pkg-config dpkg-dev lintian \
+            build-essential pkg-config dpkg-dev lintian ffmpeg \
             libdrm-dev libavformat-dev libavcodec-dev libavutil-dev
       - uses: actions/checkout@v4
       - name: Build, test, package
         env:
           TAG: ${{ github.ref_name }}
         run: |
+          # v0.1.0-rc1 -> 0.1.0-rc1: used in file names and `rtspwall --version`.
+          # build-deb.sh turns it into the Debian version 0.1.0~rc1 itself.
           VERSION=${TAG#v}
-          make VERSION="$VERSION"
-          make test
           ./scripts/build-deb.sh "$VERSION"
           ./scripts/build-tarball.sh "$VERSION"
+      - name: Install-test the .deb
+        run: ./scripts/install-test.sh dist/rtspwall_*.deb
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.dist }}
@@ -43,18 +56,48 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
           merge-multiple: true
           path: dist
-      - uses: softprops/action-gh-release@v2
+      - name: Fixed-name copies, get.sh, SHA256SUMS, release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          cd dist
+          for dist in bookworm trixie; do
+            cp rtspwall_*_"${dist}"_arm64.deb "rtspwall_${dist}_arm64.deb"
+          done
+          cp ../get.sh get.sh
+          # Versioned names AND the fixed names that get.sh downloads.
+          sha256sum rtspwall_*.deb rtspwall_*.tar.gz get.sh > SHA256SUMS
+          cat SHA256SUMS
+          cd ..
+          ./scripts/release-notes.sh "$TAG" > RELEASE_NOTES.md
+          ls -l dist
+      - uses: actions/attest-build-provenance@v2
         with:
-          files: |
+          subject-path: |
             dist/*.deb
             dist/*.tar.gz
-          generate_release_notes: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=""
+          case "$TAG" in
+            *-rc* | *-beta*) prerelease="--prerelease" ;;
+          esac
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes-file RELEASE_NOTES.md --verify-tag $prerelease

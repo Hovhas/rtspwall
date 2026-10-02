@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or help (Discussions Q&A)
+    url: https://github.com/Hovhas/rtspwall/discussions/categories/q-a
+    about: Ask how to set something up, or share your wall. Please read the troubleshooting page first.
+  - name: Feature idea (Discussions Ideas)
+    url: https://github.com/Hovhas/rtspwall/discussions/categories/ideas
+    about: Suggest a new feature. Ideas are discussed there first.
+  - name: Security problem
+    url: https://github.com/Hovhas/rtspwall/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.

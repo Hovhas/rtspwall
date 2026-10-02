@@ -5,7 +5,8 @@ set -e
 
 CONF_DIR=/etc/rtspwall
 CONF=$CONF_DIR/cameras.conf
-EXAMPLE=/usr/share/doc/rtspwall/examples/cameras.conf
+# Not under /usr/share/doc: dpkg path-exclude rules (minimal images) may drop that.
+EXAMPLE=/usr/share/rtspwall/cameras.conf.example
 
 case "$1" in
     configure)

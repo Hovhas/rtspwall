@@ -32,7 +32,7 @@ done
 [[ -f $X/usr/share/rtspwall/demo/demo.conf ]] || { echo "Missing demo files in $DEB." >&2; exit 1; }
 install -d -m 0755 "$D/demo"
 install -m 0644 "$X"/usr/share/rtspwall/demo/* "$D/demo/"
-install -m 0644 "$X/usr/share/doc/rtspwall/examples/cameras.conf" "$D/cameras.conf"
+install -m 0644 "$X/usr/share/rtspwall/cameras.conf.example" "$D/cameras.conf"
 if [[ -f LICENSE ]]; then install -m 0644 LICENSE "$D/LICENSE"; fi
 dpkg-deb -f "$DEB" Depends | tr ',' '\n' | sed 's/^ *//; s/ *$//' >"$D/DEPENDS"
 install -m 0755 packaging/tarball/install.sh "$D/install.sh"

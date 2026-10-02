@@ -29,10 +29,12 @@ Source files (in `src/`):
 | `v4l2.c` | V4L2 M2M decoder: open, buffers, dmabuf export |
 | `camera_thread.c` | Per camera: RTSP demux and watchdog, timestamps, decode, jitter buffer, teardown |
 | `compositor.c` | vblank and flip events, frame selection, rotation, the 60 s statistics |
-| `config.c`, `layout.c` | Config parsing, grid geometry, `--check-config` |
-| `pacing.c` | Pure logic: anchor, PLL, FIFO, rotation decisions, vblank counting |
+| `config.c`, `layout.c` | Config parsing, grid geometry, display-mode choice, UniFi URL rewrite, URL masking, `--check-config` |
+| `pacing.c` | Pure logic: anchor, PLL, FIFO, rotation decisions, vblank counting, failure classes and backoff, log de-duplication |
+| `cli.c`, `probe.c`, `add.c`, `demo.c`, `doctor.c` | The subcommands `probe`, `add`, `demo` and `doctor`, and the helpers they share |
+| `budget.c`, `clilogic.c` | Pure logic: the decoder-budget model, probe hints, board detection |
 
-`layout.c` and `pacing.c` have no Linux, DRM or FFmpeg dependencies, so `make test` exercises them on any machine.
+`layout.c`, `pacing.c`, `budget.c` and `clilogic.c` have no Linux, DRM or FFmpeg dependencies, so `make test` exercises them on any machine. A gentler introduction is in [How it works](how-it-works.md).
 
 ## Smooth playback
 
@@ -56,7 +58,7 @@ The PLL (`PACING_PLL_ALPHA_NUM/DEN`, alpha = 1/16, window of 32 frames) regulate
 
 ### Why a buffer of 160 ms
 
-`BUFFER_MS` is a trade-off between smoothness and latency. On the cameras we measured, 120 ms gave 0.7-0.9 % late frames at 30 fps (about 9 % at 24 fps), while 160 ms brought that down to 0-1 late frames per minute, for about 40 ms extra latency. Your sources may differ; see [troubleshooting](troubleshooting.md#choppy-video).
+`BUFFER_MS` is a trade-off between smoothness and latency. On the cameras we measured, 120 ms gave 0.7-0.9 % late frames at 30 fps (about 9 % at 24 fps), while 160 ms brought that down to 0-1 late frames per minute, for about 40 ms extra latency. Your sources may differ; see [troubleshooting](troubleshooting.md#the-picture-is-choppy).
 
 ### vblank-driven compositor
 
@@ -82,5 +84,10 @@ On shutdown the main thread wakes waiting camera threads immediately, so a stop 
 
 - RTSP watchdog: 5 s without data leads to a reconnect.
 - `stimeout` does not exist in FFmpeg 7.1 and is silently ignored if given, so it is not relied upon.
-- The systemd unit uses `Restart=always` with no start limit, so a network or camera outage never leaves the screen dead.
+- Failure classes: a camera failure is classed (login failed, not found, not H.264, resolution too large, decoder setup, refused, timeout, stream ended, stalled, unreachable). Failures a retry cannot fix back off from 5 s up to 60 s. Transient ones retry within a few seconds so recovery after an NVR reboot stays fast. Repeated identical log lines collapse into one line with a counter.
+- Display recovery: with no display the process waits and polls instead of exiting. When the connector disconnects (TV standby, input switch, cable out) the wall keeps running and sets the mode again on reconnect. Repeated failed commits trigger a re-probe and a new mode set.
+- Service state: the unit is `Type=notify`. The daemon sends `READY=1` and a `STATUS=` line such as `5/6 live; garage: login failed (401)` through `$NOTIFY_SOCKET`, with no libsystemd dependency.
+- Exit codes: `2` (config error, no cameras) and `3` (no H.264 decoder) are listed in `RestartPreventExitStatus=`, so those problems end the service with a readable status instead of a restart loop. Other failures restart with `Restart=on-failure`, a start limit of none, and a growing delay (`RestartSteps` and `RestartMaxDelaySec`, which systemd 254 and later honour).
+- Config watch: `rtspwall-config.path` fires on a change to `cameras.conf`. `rtspwall-config.service` runs `--check-config` and restarts the wall only if the file is valid and the wall is enabled.
+- Demo: `rtspwall-demo.service` plays local clips through the same code path. Only file inputs are paced by their timestamps and looped. `rtsp://` inputs never are.
 - Recovery test: `scripts/reconnect-test.sh` blocks the source for a set time; see [troubleshooting](troubleshooting.md#verify-reconnect-behaviour).

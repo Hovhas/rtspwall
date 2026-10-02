@@ -1,0 +1,89 @@
+name: Bug report
+description: Something does not work or looks wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please read [Troubleshooting](https://github.com/Hovhas/rtspwall/blob/main/docs/troubleshooting.md) first. For questions, use [Discussions](https://github.com/Hovhas/rtspwall/discussions) instead.
+
+        **Supported setup:** Raspberry Pi 4, Raspberry Pi OS Lite 64-bit (Bookworm or Trixie), H.264 cameras. Other setups may be closed with a pointer to the FAQ.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you see instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: pi-model
+    attributes:
+      label: Raspberry Pi model
+      options:
+        - Pi 4 Model B
+        - Pi 400
+        - Compute Module 4
+        - Pi 5 (not supported)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Raspberry Pi OS Lite 64-bit, Trixie
+        - Raspberry Pi OS Lite 64-bit, Bookworm
+        - Raspberry Pi OS Desktop
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How did you install it?
+      options:
+        - get.sh
+        - .deb package (apt install)
+        - Tarball
+        - From source
+    validations:
+      required: true
+  - type: dropdown
+    id: camera-vendor
+    attributes:
+      label: Camera or NVR
+      options:
+        - UniFi Protect
+        - Reolink
+        - Hikvision or ABUS
+        - Dahua or Amcrest
+        - Axis
+        - Frigate or go2rtc restream
+        - Other
+        - Not related to a camera
+    validations:
+      required: true
+  - type: textarea
+    id: doctor-report
+    attributes:
+      label: Output of `sudo rtspwall doctor --report`
+      description: |
+        Run `sudo rtspwall doctor --report` and paste everything. URLs and tokens are masked, but the masking is a heuristic. **Read it before you paste** and remove anything private.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
+      description: Steps to reproduce, the 60 second lines (`journalctl -u rtspwall | grep ': 60s'`), what you already tried.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed passwords and tokens from everything I pasted.
+          required: true

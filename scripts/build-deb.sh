@@ -4,6 +4,8 @@
 # Builds dist/rtspwall_VERSION_DIST_ARCH.deb from the current checkout.
 # DIST comes from /etc/os-release (VERSION_CODENAME, e.g. bookworm or trixie),
 # ARCH from dpkg. VERSION defaults to the latest git tag (without "v"), or 0.0.0.
+# A pre-release VERSION such as 0.1.0-rc1 is kept in file names; the package's
+# Debian version becomes 0.1.0~rc1 (see DEB_VERSION below).
 # Build dependencies: build-essential pkg-config libdrm-dev libavformat-dev
 # libavcodec-dev libavutil-dev ffmpeg (ffmpeg generates the demo clips with
 # `make demo-clips`; build-time only, not a runtime Depends) (+ dpkg-dev for
@@ -28,6 +30,11 @@ if [[ -z $VERSION ]]; then
     VERSION=${VERSION:-0.0.0}
 fi
 [[ $VERSION =~ ^[0-9][A-Za-z0-9.+~-]*$ ]] || { echo "Invalid version: $VERSION" >&2; exit 2; }
+# VERSION is the release version as tagged (0.1.0-rc1): it goes into the file
+# names and `rtspwall --version`. The Debian Version field gets the first "-"
+# turned into "~" (0.1.0~rc1) so a pre-release sorts BEFORE 0.1.0; a plain
+# "0.1.0-rc1" would be upstream 0.1.0 with revision rc1, i.e. newer than 0.1.0.
+DEB_VERSION=${VERSION/-/'~'}
 
 ARCH=$(dpkg --print-architecture)
 # shellcheck source=/dev/null
@@ -63,13 +70,16 @@ done
     echo "demo files missing from $STAGE/usr/share/rtspwall/demo (make install)." >&2
     exit 1
 }
+# Config template for postinst; deliberately outside /usr/share/doc, which
+# dpkg path-exclude rules (minimal images, some container setups) may drop.
+install -D -m 0644 examples/cameras.conf "$STAGE/usr/share/rtspwall/cameras.conf.example"
 DOC=$STAGE/usr/share/doc/$NAME
 install -d -m 0755 "$DOC/examples"
 install -m 0644 examples/* "$DOC/examples/"
 install -m 0644 packaging/debian/copyright "$DOC/copyright"
 if [[ -f README.md ]]; then install -m 0644 README.md "$DOC/README.md"; fi
 {
-    echo "$NAME ($VERSION) unstable; urgency=medium"
+    echo "$NAME ($DEB_VERSION) unstable; urgency=medium"
     echo
     echo "  * Release $VERSION."
     echo
@@ -104,7 +114,7 @@ DEPENDS=${DEPENDS:+$DEPENDS, }adduser
 SIZE=$(du -sk --exclude=DEBIAN "$STAGE" | cut -f1)
 cat >"$STAGE/DEBIAN/control" <<CTRL
 Package: $NAME
-Version: $VERSION
+Version: $DEB_VERSION
 Section: video
 Priority: optional
 Architecture: $ARCH

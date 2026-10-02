@@ -21,7 +21,7 @@ jobs:
         run: make test
       - name: ShellCheck
         run: |
-          shellcheck install.sh uninstall.sh scripts/*.sh packaging/tarball/install.sh \
+          shellcheck install.sh uninstall.sh get.sh scripts/*.sh packaging/tarball/install.sh \
             packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
 
   build:
@@ -40,7 +40,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git \
             build-essential pkg-config dpkg-dev lintian \
-            libdrm-dev libavformat-dev libavcodec-dev libavutil-dev
+            libdrm-dev libavformat-dev libavcodec-dev libavutil-dev ffmpeg
       - uses: actions/checkout@v4
       - name: Build and test
         run: |
@@ -53,3 +53,34 @@ jobs:
           name: deb-${{ matrix.dist }}
           path: dist/*.deb
           if-no-files-found: error
+
+  # Clean-container install of the built .deb, with and without the Raspberry Pi
+  # OS archive as an extra apt source (catches dependency conflicts against Pi
+  # OS's own ffmpeg/libdrm). systemd is not running in the container.
+  install-test:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        dist: [bookworm, trixie]
+        source: [debian, pios]
+    container: debian:${{ matrix.dist }}
+    steps:
+      - name: Install checkout prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-${{ matrix.dist }}
+          path: dist
+      - name: Install and check the .deb
+        env:
+          SOURCE: ${{ matrix.source }}
+        run: |
+          ls -l dist
+          flag=""
+          if [ "$SOURCE" = pios ]; then flag="--pios"; fi
+          ./scripts/install-test.sh dist/rtspwall_*.deb $flag
