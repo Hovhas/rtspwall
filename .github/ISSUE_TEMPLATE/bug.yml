@@ -77,7 +77,7 @@ body:
     id: more
     attributes:
       label: Anything else
-      description: Steps to reproduce, the 60 second lines (`journalctl -u rtspwall | grep ': 60s'`), what you already tried.
+      description: "Steps to reproduce, the 60 second lines (`journalctl -u rtspwall | grep ': 60s'`), what you already tried."
     validations:
       required: false
   - type: checkboxes

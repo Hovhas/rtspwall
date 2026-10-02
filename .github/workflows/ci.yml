@@ -11,7 +11,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -41,14 +41,14 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates git \
             build-essential pkg-config dpkg-dev lintian devscripts \
             libdrm-dev libavformat-dev libavcodec-dev libavutil-dev ffmpeg
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build and test
         run: |
           make
           make test
       - name: Build .deb
         run: ./scripts/build-deb.sh 0.0.0-ci
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deb-${{ matrix.dist }}
           path: dist/*.deb
@@ -71,8 +71,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: deb-${{ matrix.dist }}
           path: dist

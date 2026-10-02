@@ -12,7 +12,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Tag matches CHANGELOG.md
         env:
           TAG: ${{ github.ref_name }}
@@ -34,7 +34,7 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates git \
             build-essential pkg-config dpkg-dev lintian devscripts ffmpeg \
             libdrm-dev libavformat-dev libavcodec-dev libavutil-dev
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build, test, package
         env:
           TAG: ${{ github.ref_name }}
@@ -46,7 +46,7 @@ jobs:
           ./scripts/build-tarball.sh "$VERSION"
       - name: Install-test the .deb
         run: ./scripts/install-test.sh dist/rtspwall_*.deb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.dist }}
           path: |
@@ -62,8 +62,8 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           merge-multiple: true
@@ -86,7 +86,7 @@ jobs:
           ls -l dist
       # GitHub only stores attestations for public repositories on personal
       # accounts; on a private repo the step would fail the whole release.
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         if: ${{ !github.event.repository.private }}
         with:
           subject-path: |
