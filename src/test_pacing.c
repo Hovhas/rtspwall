@@ -972,7 +972,10 @@ static void test_pts_classify(void)
 	ASSERT_EQ_I(pacing_pts_classify(1000000, 1040000), PACING_PTS_OK);
 	ASSERT_EQ_I(pacing_pts_classify(1000000, 1000000), PACING_PTS_OK);
 	ASSERT_EQ_I(pacing_pts_classify(1000000, 2000001), PACING_PTS_JUMP);
-	ASSERT_EQ_I(pacing_pts_classify(1000000, 999999), PACING_PTS_BACKWARDS);
+	/* a small step back is B-frame reordering (see
+	 * test_pts_classify_reorder_window), a large one a new series */
+	ASSERT_EQ_I(pacing_pts_classify(1000000, 999999), PACING_PTS_OK);
+	ASSERT_EQ_I(pacing_pts_classify(10000000, 1000000), PACING_PTS_BACKWARDS);
 }
 
 static void test_pts_loop_reanchors_once(void)
@@ -1008,6 +1011,139 @@ static void test_filepace(void)
 	/* fell more than 1 s behind (e.g. stalled storage): re-base */
 	ASSERT_EQ_I(pacing_filepace_due(&p, 10040000, 2000000), 2000000);
 	ASSERT_EQ_I(pacing_filepace_due(&p, 10080000, 2000001), 2040000);
+}
+
+/* ------------------------------------------------ QA review of Phase A
+ * QA_KNOWN_BUGS: see test_layout.c. */
+
+/* Passes today: keys longer than PACING_DEDUP_KEY_MAX collapse on their
+ * prefix and never overflow the slot. */
+static void qa_test_dedup_overlong_key(void)
+{
+	struct pacing_dedup d;
+	char key[PACING_DEDUP_KEY_MAX * 3];
+	unsigned rep;
+
+	memset(key, 'k', sizeof key - 1);
+	key[sizeof key - 1] = '\0';
+	pacing_dedup_init(&d, 1000);
+	ASSERT(pacing_dedup_check(&d, key, 0, &rep));
+	ASSERT(!pacing_dedup_check(&d, key, 10, &rep));
+	ASSERT(pacing_dedup_check(&d, key, 2000, &rep));
+	ASSERT_EQ_I(rep, 1);
+}
+
+/* Passes today: a looped clip re-bases once per loop and never asks the
+ * caller to wait more than 2 s. */
+static void qa_test_filepace_never_waits_over_2s(void)
+{
+	struct pacing_filepace p;
+	pacing_filepace_reset(&p);
+	int64_t now = 1000000;
+	for (int loop = 0; loop < 3; loop++)
+		for (int f = 0; f < 250; f++) {
+			int64_t due = pacing_filepace_due(&p, (int64_t)f * 40000, now);
+			ASSERT(due - now <= 2000000);
+			if (due > now)
+				now = due;
+		}
+}
+
+/* Fixed (was a QA_KNOWN_BUGS test): camera_thread.c compute_pts classifies on pts in
+ * DECODE order. With B-frames (decode order I0 P3 B1 B2 P6 B4 B5 ...) every
+ * B-frame is "went backwards", so anchor and PLL are reset several times a
+ * second (silently for files since log_reanchor=false). Continuity should
+ * be judged on dts, or small reorders tolerated. */
+static void qa_test_pts_classify_bframes_are_not_discontinuities(void)
+{
+	static const int order[] = { 0, 3, 1, 2, 6, 4, 5, 9, 7, 8 };
+	int64_t last = -1;
+	int events = 0;
+	for (unsigned i = 0; i < sizeof order / sizeof order[0]; i++) {
+		int64_t pts = (int64_t)order[i] * 40000;
+		if (pacing_pts_classify(last, pts) != PACING_PTS_OK)
+			events++;
+		last = pts;
+	}
+	ASSERT_EQ_I(events, 0);
+}
+
+/* ------------------------------------------------ Phase A review fixes */
+
+/* Backoff item 4: the counter belongs to one fault class. A camera that
+ * failed with "refused" ten times and then gets a 404 starts the 404
+ * schedule from the beginning. */
+static void test_backoff_class_change_resets(void)
+{
+	struct pacing_backoff b;
+	pacing_backoff_init(&b);
+
+	for (int i = 0; i < 10; i++)
+		pacing_backoff_next(&b, PACING_FAULT_REFUSED);
+	ASSERT_EQ_I(pacing_backoff_total(&b), 10);
+	/* never live: 404 is deterministic, but its first attempt */
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 5000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 10000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 20000);
+	/* back to a transient fault: fast again */
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_REFUSED), 2000);
+	ASSERT_EQ_I(pacing_backoff_total(&b), 14);
+
+	/* the same deterministic fault keeps growing to 60 s */
+	pacing_backoff_init(&b);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 5000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 10000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 20000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 40000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 60000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 60000);
+
+	/* a healthy period forgets the run, not that the camera was live */
+	pacing_backoff_mark_live(&b);
+	pacing_backoff_reset(&b);
+	ASSERT_EQ_I(pacing_backoff_total(&b), 0);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_REFUSED), 2000);
+}
+
+/* Backoff item 4: once a camera has been live in this process, 401 and
+ * 404 are transient (an NVR restarting: refused x N, then 404 while the
+ * path is not ready yet). 403, codec and size stay deterministic. */
+static void test_backoff_auth_404_transient_after_live(void)
+{
+	struct pacing_backoff b;
+	pacing_backoff_init(&b);
+	pacing_backoff_mark_live(&b);
+
+	for (int i = 0; i < 10; i++)
+		pacing_backoff_next(&b, PACING_FAULT_REFUSED);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 2000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 3000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 4000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 5000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_NOT_FOUND), 5000);
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_UNAUTHORIZED), 2000);
+	ASSERT(!pacing_backoff_is_deterministic(&b, PACING_FAULT_UNAUTHORIZED));
+	ASSERT(!pacing_backoff_is_deterministic(&b, PACING_FAULT_NOT_FOUND));
+	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_FORBIDDEN));
+	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_CODEC));
+	ASSERT_EQ_I(pacing_backoff_next(&b, PACING_FAULT_FORBIDDEN), 5000);
+
+	/* never live: 401 stays deterministic */
+	pacing_backoff_init(&b);
+	ASSERT(pacing_backoff_is_deterministic(&b, PACING_FAULT_UNAUTHORIZED));
+}
+
+/* B-frames: steps back within the reorder window are not new series, a
+ * loop of a clip (back by seconds) still is. */
+static void test_pts_classify_reorder_window(void)
+{
+	ASSERT_EQ_I(pacing_pts_classify(400000, 400000 - PACING_PTS_REORDER_US), PACING_PTS_OK);
+	ASSERT_EQ_I(pacing_pts_classify(400000, 400000 - PACING_PTS_REORDER_US - 1),
+		    PACING_PTS_BACKWARDS);
+	/* 5 fps with two B-frames: back by 400 ms */
+	ASSERT_EQ_I(pacing_pts_classify(1600000, 1200000), PACING_PTS_OK);
+	/* the loop of a 10 s clip */
+	ASSERT_EQ_I(pacing_pts_classify(9960000, 0), PACING_PTS_BACKWARDS);
 }
 
 int main(void)
@@ -1068,6 +1204,16 @@ int main(void)
 	test_pts_classify();
 	test_pts_loop_reanchors_once();
 	test_filepace();
+
+	/* QA review of Phase A */
+	qa_test_dedup_overlong_key();
+	qa_test_filepace_never_waits_over_2s();
+	qa_test_pts_classify_bframes_are_not_discontinuities();
+
+	/* Phase A review fixes */
+	test_backoff_class_change_resets();
+	test_backoff_auth_404_transient_after_live();
+	test_pts_classify_reorder_window();
 
 	return test_summary("test_pacing");
 }

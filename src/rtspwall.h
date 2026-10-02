@@ -44,6 +44,20 @@
  * drain the list). */
 #define MAX_LEAKED   4
 
+/* Indices parked by the compositor after an abandoned page flip (see
+ * abandon_flip in compositor.c): at most the previous "shown" per
+ * abandoned flip, drained by the next confirmed flip. */
+#define MAX_LIMBO    4
+
+/* A page flip without an event for this long is abandoned (compositor.c). */
+#define FLIP_TIMEOUT_US   (2 * 1000000LL)
+
+/* teardown_stream waits this long for the plane to be confirmed detached.
+ * Longer than FLIP_TIMEOUT_US plus a second detach attempt, so a flip
+ * that times out does not make the camera thread give up (and leak) at
+ * the same moment the compositor retries the detach. */
+#define TEARDOWN_WAIT_S   5
+
 #define ANCHOR_WINDOW_US     (10 * 1000000)   /* sliding minimum over 10 s */
 #define ARRIVAL_QUEUE_SIZE   32                /* > OUTPUT_BUFFERS, margin */
 
@@ -148,7 +162,8 @@ struct camera {
 	 *                  false when the detach commit is confirmed.
 	 * detached       — condvar complete_flip signals when the detach
 	 *                  commit is confirmed. teardown_stream waits
-	 *                  (pthread_cond_timedwait, `lock` held, 2 s cap) until
+	 *                  (pthread_cond_timedwait, `lock` held, TEARDOWN_WAIT_S
+	 *                  cap) until
 	 *                  NEITHER in_flight != -1 NOR plane_attached holds —
 	 *                  i.e. no commit in flight and the plane off — before
 	 *                  it destroys the FBs/closes V4L2. The wait is capped
@@ -186,6 +201,8 @@ struct camera {
 
 	struct leaked_buffer leaked[MAX_LEAKED];
 	int                  n_leaked;
+	int                  limbo[MAX_LIMBO];   /* under `lock`, see abandon_flip */
+	int                  n_limbo;
 	unsigned long        m_leaks_closed, rep_leaks_closed;
 
 	bool             tearing_down;    /* teardown_stream wants the plane detached */
@@ -382,6 +399,10 @@ struct wall {
 	bool             display_connected;
 	bool             remodeset_pending;    /* reconnected, mode not yet set again */
 	int              commit_failures;      /* failed atomic commits in a row */
+	int              last_commit_errno;    /* errno of the latest failed commit */
+	bool             mode_fallback;        /* explicit MODE not offered: running on
+					        * MODE=auto (see pick_mode) */
+	int64_t          last_fallback_probe_us;
 	int64_t          last_display_poll_us;
 	int64_t          last_forced_probe_us;
 	int64_t          last_recovery_log_us;
@@ -411,21 +432,26 @@ int64_t monotonic_us(void);
 /* Return convention for the startup steps below: 0 = ok, -1 = error (exit
  * 1, systemd restarts), -2 = config error (exit RTSPWALL_EXIT_CONFIG),
  * 1 = quit was requested while waiting (exit 0). */
-int open_drm_device(struct wall *v);
 /* Opens the DRM device, sets the atomic caps and becomes DRM master. If
- * another program (a desktop) holds master: names it, prints the fix once
- * and keeps retrying every 2 s (re-opening the device each time). */
+ * DRM_DEVICE does not exist (yet) it waits for it; if another program (a
+ * desktop) holds master: names it, prints the fix once and keeps retrying
+ * every 2 s (re-opening the device each time). */
 int acquire_drm(struct wall *v);
 /* Waits (logging once, polling every 2 s) until a display is connected,
- * then picks the mode (MODE) and hands out the planes. */
+ * then picks the mode (MODE; falls back to auto with a warning if the
+ * display does not offer it), waits up to 60 s for a mode the manual
+ * tiles fit, and hands out the planes. */
 int wait_for_display(struct wall *v);
 int read_plane_props(struct wall *v);
 int create_primary_fb(struct wall *v);
 /* Compositor thread, only while no page flip is pending: notices a
  * connector going away/coming back (cheap cached status, at most once a
- * second) or ~10 failed commits in a row (forced re-probe, at most every
- * 5 s), and then re-reads the modes and sets the mode again. Returns true
- * if a modeset was made. */
+ * second) and then re-reads the modes and sets the mode again. ~10 failed
+ * commits in a row (forced re-probe, at most every 5 s) set the mode again
+ * only if the display's modes changed or a commit of the primary plane
+ * alone fails too. Running on the MODE=auto fallback, it checks every 30 s
+ * whether the explicit MODE is offered again. Returns true if a modeset
+ * was made. */
 bool display_poll(struct wall *v);
 
 /* ------------------------------------------------------------------ v4l2.c */
@@ -433,9 +459,12 @@ bool display_poll(struct wall *v);
 void close_buffers(struct camera *k, int keep_a, int keep_b);
 int open_decoder(const char *device, struct camera *k, unsigned width, unsigned height);
 /* VIDIOC_QUERYCAP + ENUM_FMT on the decoder before any camera starts.
- * Waits up to 15 s for the device node to appear (boot race). Returns 0,
- * RTSPWALL_EXIT_NO_DECODER if there is no usable H.264 M2M decoder there
- * (restarting will not help), or 1 for other errors. */
+ * Waits up to 15 s for the device node to appear and up to 30 s (in all)
+ * for permission to open it (boot races with the driver and udev).
+ * Returns 0, RTSPWALL_EXIT_NO_DECODER if there is no usable H.264 M2M
+ * decoder there (the node is still missing, still not accessible, or
+ * answers QUERYCAP without being an H.264 M2M decoder - restarting will
+ * not help), or 1 for other errors (QUERYCAP itself failing included). */
 int decoder_preflight(const char *device);
 int start_capture(struct wall *v, struct camera *k);
 

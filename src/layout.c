@@ -168,25 +168,36 @@ enum config_line_type config_parse_line(const char *line_in, struct config_globa
 
 /* ------------------------------------------------- placeholders and keys */
 
-/* Finds the first placeholder in s: "CHANGE_ME" (any case) or "<x...>".
- * Returns its start and stores its length, or NULL. */
+/* Separators of the "segments" a <...> placeholder must fill completely. */
+static bool placeholder_delim(char c)
+{
+	return c && strchr(":/@?&=#;[],|", c) != NULL;
+}
+
+/* Finds the first placeholder in s: "CHANGE_ME" (any case) anywhere, or a
+ * whole segment "<x...>" (see layout_has_placeholder). Returns its start
+ * and stores its length, or NULL. */
 static const char *find_placeholder(const char *s, size_t *len)
 {
 	static const char change_me[] = "CHANGE_ME";
 	const size_t n_cm = sizeof change_me - 1;
 
-	for (const char *p = s; *p; p++) {
+	for (const char *p = s; *p; p++)
 		if (strncasecmp(p, change_me, n_cm) == 0) {
 			*len = n_cm;
 			return p;
 		}
-		if (*p == '<') {
-			const char *close = strchr(p + 1, '>');
-			const char *next_open = strchr(p + 1, '<');
-			if (close && close > p + 1 && (!next_open || next_open > close)) {
-				*len = (size_t)(close - p) + 1;
-				return p;
-			}
+	for (const char *p = s; *p;) {
+		while (*p && placeholder_delim(*p))
+			p++;
+		const char *start = p;
+		while (*p && !placeholder_delim(*p))
+			p++;
+		size_t n = (size_t)(p - start);
+		if (n >= 3 && start[0] == '<' && start[n - 1] == '>'
+		    && !memchr(start + 1, '<', n - 2) && !memchr(start + 1, '>', n - 2)) {
+			*len = n;
+			return start;
 		}
 	}
 	return NULL;
@@ -366,12 +377,15 @@ static int handle_global(struct layout_config *cfg, const struct config_global *
 			return -1;
 		}
 	} else if (!strcmp(g->key, "UNIFI_REWRITE")) {
-		if (!strcmp(g->value, "auto")) {
-			cfg->unifi_rewrite = true;
+		if (!strcmp(g->value, "tls") || !strcmp(g->value, "auto")) {
+			cfg->unifi_mode = LAYOUT_UNIFI_MODE_TLS;
+		} else if (!strcmp(g->value, "plain")) {
+			cfg->unifi_mode = LAYOUT_UNIFI_MODE_PLAIN;
 		} else if (!strcmp(g->value, "off")) {
-			cfg->unifi_rewrite = false;
+			cfg->unifi_mode = LAYOUT_UNIFI_MODE_OFF;
 		} else {
-			set_err(err, errlen, line, "UNIFI_REWRITE must be auto or off, got \"%s\"",
+			set_err(err, errlen, line,
+				"UNIFI_REWRITE must be tls, plain or off (auto = tls), got \"%s\"",
 				g->value);
 			return -1;
 		}
@@ -405,8 +419,31 @@ static bool pipe_in_password(const struct config_fields *f)
 
 #define PIPE_HINT " - a '|' in the URL splits the line: encode | in passwords as %7C"
 
+/* Characters RFC 3986 does not allow unencoded anywhere in a URL. Many
+ * cameras accept some of them anyway, so this is only a warning. */
+#define URL_UNSAFE_CHARS "\"'<>{}\\^`"
+
+static void warn_unsafe_url_chars(const char *url, const char *name, int line,
+				  layout_warn_fn warn, void *ctx)
+{
+	char found[2 * sizeof URL_UNSAFE_CHARS];
+	size_t n = 0;
+
+	for (const char *c = URL_UNSAFE_CHARS; *c; c++)
+		if (strchr(url, *c)) {
+			if (n)
+				found[n++] = ' ';
+			found[n++] = *c;
+		}
+	found[n] = '\0';
+	if (n)
+		warnf(warn, ctx, line,
+		      "the URL of camera %s contains unencoded %s - percent-encode them "
+		      "(e.g. \" as %%22, ' as %%27) if the camera rejects the URL", name, found);
+}
+
 static int handle_camera(struct layout_config *cfg, const struct config_fields *f, int line,
-			 char *err, size_t errlen)
+			 layout_warn_fn warn, void *ctx, char *err, size_t errlen)
 {
 	const char *pipe_hint = pipe_in_password(f) ? PIPE_HINT : "";
 	char ph[48];
@@ -447,9 +484,12 @@ static int handle_camera(struct layout_config *cfg, const struct config_fields *
 		return -1;
 	}
 	if (placeholder_text(f->field[1], ph, sizeof ph)) {
+		/* Never echo the URL: what looks like a placeholder may be (part
+		 * of) a real password. Only the fixed word CHANGE_ME is named. */
 		set_err(err, errlen, line,
-			"placeholder \"%s\" in the URL of camera %s - replace it with the real "
-			"value (user, password, address or stream path)", ph, f->field[0]);
+			"placeholder in the URL of camera %s (%s) - replace it with the real "
+			"value (user, password, address or stream path)", f->field[0],
+			strncasecmp(ph, "CHANGE_ME", 9) == 0 ? "CHANGE_ME" : "a <...> field");
 		return -1;
 	}
 	for (int i = 2; i < f->count; i++)
@@ -474,6 +514,7 @@ static int handle_camera(struct layout_config *cfg, const struct config_fields *
 	}
 	c->line = line;
 	c->n_numbers = f->count - 2;
+	warn_unsafe_url_chars(c->url, c->name, line, warn, ctx);
 
 	int num[CONFIG_MAX_FIELDS - 2] = { 0 };
 	for (int i = 0; i < c->n_numbers; i++) {
@@ -530,7 +571,7 @@ int layout_parse_flags(struct layout_config *cfg, const char *text, unsigned fla
 		       layout_warn_fn warn, void *warn_ctx, char *err, size_t errlen)
 {
 	memset(cfg, 0, sizeof *cfg);
-	cfg->unifi_rewrite = true;
+	cfg->unifi_mode = LAYOUT_UNIFI_MODE_TLS;
 	cfg->buffer_ms = LAYOUT_DEFAULT_BUFFER_MS;
 	cfg->rotate_seconds = LAYOUT_DEFAULT_ROTATE_SECONDS;
 	copy_str(cfg->decoder, sizeof cfg->decoder, LAYOUT_DEFAULT_DECODER);
@@ -585,7 +626,7 @@ int layout_parse_flags(struct layout_config *cfg, const char *text, unsigned fla
 				grid_line = lineno;
 			break;
 		case CONFIG_LINE_CAMERA:
-			if (handle_camera(cfg, fields, lineno, err, errlen) < 0)
+			if (handle_camera(cfg, fields, lineno, warn, warn_ctx, err, errlen) < 0)
 				goto fail;
 			break;
 		}
@@ -603,14 +644,15 @@ int layout_parse_flags(struct layout_config *cfg, const char *text, unsigned fla
 
 	/* UniFi Protect rtsps URLs, once UNIFI_REWRITE is known (it may come
 	 * after the camera lines). Never longer than the input, so it fits. */
-	if (cfg->unifi_rewrite)
-		for (int i = 0; i < cfg->count; i++) {
-			char out[LAYOUT_URL_MAX];
-			if (layout_unifi_rewrite(cfg->cam[i].url, out, sizeof out) == 1) {
-				copy_str(cfg->cam[i].url, sizeof cfg->cam[i].url, out);
-				cfg->cam[i].unifi_rewritten = true;
-			}
+	for (int i = 0; i < cfg->count; i++) {
+		char out[LAYOUT_URL_MAX];
+		enum layout_unifi_result res;
+		if (layout_unifi_apply(cfg->cam[i].url, cfg->unifi_mode, out, sizeof out, &res) == 0) {
+			copy_str(cfg->cam[i].url, sizeof cfg->cam[i].url, out);
+			cfg->cam[i].unifi = res;
+			cfg->cam[i].unifi_rewritten = res == LAYOUT_UNIFI_PLAIN;
 		}
+	}
 
 	if (cfg->grid_cols > 0) {
 		int cells = cfg->grid_cols * cfg->grid_rows;
@@ -732,6 +774,28 @@ int layout_apply(struct layout_config *cfg, int screen_w, int screen_h,
 	return 0;
 }
 
+bool layout_tiles_fit(const struct layout_config *cfg, int screen_w, int screen_h,
+		      int *need_w, int *need_h)
+{
+	long long w = screen_w, h = screen_h;
+
+	if (cfg->grid_cols <= 0) {
+		w = h = 0;
+		for (int i = 0; i < cfg->count; i++) {
+			const struct layout_camera *c = &cfg->cam[i];
+			if ((long long)c->x + c->width > w)
+				w = (long long)c->x + c->width;
+			if ((long long)c->y + c->height > h)
+				h = (long long)c->y + c->height;
+		}
+	}
+	if (need_w)
+		*need_w = w > INT_MAX ? INT_MAX : (int)w;
+	if (need_h)
+		*need_h = h > INT_MAX ? INT_MAX : (int)h;
+	return w <= screen_w && h <= screen_h;
+}
+
 const char *layout_ffmpeg_log_name(enum layout_ffmpeg_log level)
 {
 	switch (level) {
@@ -786,6 +850,78 @@ static bool segment_is_token(const char *s, size_t n)
 	return (alnum_only && n >= 16) || n >= 32;
 }
 
+/* True if the key of a "key=value" path segment or ";key=value" parameter
+ * names a credential. */
+static bool credential_key(const char *k, size_t n)
+{
+	static const char *const words[] = {
+		"pass", "pwd", "psw", "pas", "token", "key", "auth", "sig", "secret", "cred",
+	};
+
+	for (size_t w = 0; w < sizeof words / sizeof words[0]; w++) {
+		size_t m = strlen(words[w]);
+		for (size_t i = 0; i + m <= n; i++)
+			if (strncasecmp(k + i, words[w], m) == 0)
+				return true;
+	}
+	return false;
+}
+
+/* Appends one path segment [s, e), masked (see layout_mask_url). */
+static void mask_segment(struct sbuf *b, const char *s, const char *e)
+{
+	size_t n = (size_t)(e - s);
+
+	if (segment_is_token(s, n) || (memchr(s, '&', n) && memchr(s, '=', n))) {
+		sb_puts(b, "***");
+		return;
+	}
+	for (const char *p = s;;) {
+		const char *pe = memchr(p, ';', (size_t)(e - p));
+		if (!pe)
+			pe = e;
+		const char *eq = memchr(p, '=', (size_t)(pe - p));
+		if (eq && credential_key(p, (size_t)(eq - p))) {
+			sb_putn(b, p, (size_t)(eq + 1 - p));
+			sb_puts(b, "***");
+		} else {
+			sb_putn(b, p, (size_t)(pe - p));
+		}
+		if (pe == e)
+			break;
+		sb_putn(b, pe, 1);   /* ';' */
+		p = pe + 1;
+	}
+}
+
+static const char *authority_end(const char *p, const char *end)
+{
+	while (p < end && *p != '/' && *p != '?' && *p != '#')
+		p++;
+	return p;
+}
+
+/* The ':' in [s, e) outside an IPv6 "[...]" literal: the first one
+ * (first = true) or the last one, or NULL. */
+static const char *colon_outside_brackets(const char *s, const char *e, bool first)
+{
+	const char *found = NULL;
+	int depth = 0;
+
+	for (const char *q = s; q < e; q++) {
+		if (*q == '[')
+			depth++;
+		else if (*q == ']' && depth > 0)
+			depth--;
+		else if (*q == ':' && !depth) {
+			found = q;
+			if (first)
+				break;
+		}
+	}
+	return found;
+}
+
 static void mask_url_into(struct sbuf *b, const char *url, size_t url_len)
 {
 	const char *end = url + url_len;
@@ -798,27 +934,58 @@ static void mask_url_into(struct sbuf *b, const char *url, size_t url_len)
 		}
 
 	const char *auth = scheme ? scheme + 3 : url;
-	const char *auth_end = auth;
-	while (auth_end < end && *auth_end != '/' && *auth_end != '?' && *auth_end != '#')
-		auth_end++;
+	const char *auth_end = authority_end(auth, end);
 
 	/* The LAST '@' inside the authority ends the userinfo — a password may
 	 * itself contain an (unescaped) '@'. */
-	const char *at = NULL, *colon = NULL;
+	const char *at = NULL;
 	for (const char *q = auth; q < auth_end; q++)
 		if (*q == '@')
 			at = q;
-	if (at)
-		for (const char *q = auth; q < at; q++)
-			if (*q == ':') {
-				colon = q;
-				break;
-			}
 
-	if (colon) {
-		sb_putn(b, url, (size_t)(colon + 1 - url));
-		sb_puts(b, "***");
+	/* No '@' in the authority but a ':' in it and an '@' later: the
+	 * password holds an unencoded '/', '?' or '#'. The userinfo then ends
+	 * at the last '@' before the first '/' after the first such '@'. */
+	if (!at && scheme && colon_outside_brackets(auth, auth_end, true)) {
+		const char *first_at = memchr(auth_end, '@', (size_t)(end - auth_end));
+		if (first_at) {
+			const char *slash = memchr(first_at, '/', (size_t)(end - first_at));
+			if (!slash)
+				slash = end;
+			at = first_at;
+			for (const char *q = first_at; q < slash; q++)
+				if (*q == '@')
+					at = q;
+			auth_end = authority_end(at + 1, end);
+		}
+	}
+
+	if (at && at > auth) {
+		const char *colon = memchr(auth, ':', (size_t)(at - auth));
+		if (colon) {
+			sb_putn(b, url, (size_t)(colon + 1 - url));
+			sb_puts(b, "***");
+		} else {
+			/* userinfo without ':' — may be a bare token: all of it */
+			sb_putn(b, url, (size_t)(auth - url));
+			sb_puts(b, "***");
+		}
 		sb_putn(b, at, (size_t)(auth_end - at));
+	} else if (!at && scheme) {
+		/* A non-numeric "port" without any '@' is a password whose URL
+		 * was cut short (e.g. a config key truncated before the '@'). */
+		const char *colon = colon_outside_brackets(auth, auth_end, false);
+		bool numeric = true;
+		if (colon)
+			for (const char *q = colon + 1; q < auth_end; q++)
+				if (!isdigit((unsigned char)*q))
+					numeric = false;
+		if (colon && !numeric) {
+			sb_putn(b, url, (size_t)(colon + 1 - url));
+			sb_puts(b, "***");
+		} else {
+			sb_putn(b, url, (size_t)(auth_end - url));
+		}
 	} else {
 		sb_putn(b, url, (size_t)(auth_end - url));
 	}
@@ -831,10 +998,7 @@ static void mask_url_into(struct sbuf *b, const char *url, size_t url_len)
 		const char *seg = p;
 		while (p < end && *p != '/' && *p != '?' && *p != '#')
 			p++;
-		if (segment_is_token(seg, (size_t)(p - seg)))
-			sb_puts(b, "***");
-		else
-			sb_putn(b, seg, (size_t)(p - seg));
+		mask_segment(b, seg, p);
 	}
 
 	/* Query string / fragment: masked wholesale. */
@@ -893,6 +1057,28 @@ void layout_mask_urls_in_text(const char *in, char *out, size_t outlen)
 		const char *stop = sep + 3;
 		while (url_char(*stop))
 			stop++;
+
+		/* ... unless that cut a password with ( ) ' " or a space in it:
+		 * a ':' but no '@' or '/' so far, and an '@' later on the line.
+		 * Then the URL runs on past that '@'. */
+		{
+			bool colon = false, at = false, slash = false;
+			for (const char *q = sep + 3; q < stop; q++) {
+				colon |= *q == ':';
+				at |= *q == '@';
+				slash |= *q == '/';
+			}
+			if (colon && !at && !slash && *stop) {
+				const char *a = stop;
+				while (*a && *a != '\n' && *a != '@')
+					a++;
+				if (*a == '@') {
+					stop = a + 1;
+					while (url_char(*stop))
+						stop++;
+				}
+			}
+		}
 
 		/* ... or where a second "scheme://" begins inside the same run
 		 * ("rtsp://u:pw@h/x;rtsp://a:b@c"), which then gets its own pass. */
@@ -1112,51 +1298,54 @@ bool layout_url_is_rtsp(const char *url)
 	       || (n == 5 && strncasecmp(url, "rtsps", 5) == 0);
 }
 
-int layout_unifi_rewrite(const char *url, char *out, size_t outlen)
+const char *layout_unifi_mode_name(enum layout_unifi_mode mode)
+{
+	switch (mode) {
+	case LAYOUT_UNIFI_MODE_TLS:   return "tls";
+	case LAYOUT_UNIFI_MODE_PLAIN: return "plain";
+	case LAYOUT_UNIFI_MODE_OFF:   return "off";
+	}
+	return "tls";
+}
+
+/* If url is a UniFi Protect rtsps URL (port 7441) stores where its
+ * authority starts/ends and where the port's ':' is, and returns true. */
+static bool unifi_split(const char *url, const char **auth, const char **colon,
+			const char **auth_end)
 {
 	static const char port_in[] = "7441";
 
-	if (!outlen)
-		return -1;
-	if (strncasecmp(url, "rtsps://", 8) != 0) {
-		copy_str(out, outlen, url);
-		return 0;
-	}
+	if (strncasecmp(url, "rtsps://", 8) != 0)
+		return false;
+	*auth = url + 8;
+	*auth_end = *auth + strcspn(*auth, "/?#");
 
-	const char *auth = url + 8;
-	const char *auth_end = auth + strcspn(auth, "/?#");
-
-	const char *host = auth;
-	for (const char *q = auth; q < auth_end; q++)
+	const char *host = *auth;
+	for (const char *q = *auth; q < *auth_end; q++)
 		if (*q == '@')
 			host = q + 1;
 
-	const char *colon = NULL;
+	const char *c = NULL;
 	if (*host == '[') {
-		const char *rb = memchr(host, ']', (size_t)(auth_end - host));
-		if (rb && rb + 1 < auth_end && rb[1] == ':')
-			colon = rb + 1;
+		const char *rb = memchr(host, ']', (size_t)(*auth_end - host));
+		if (rb && rb + 1 < *auth_end && rb[1] == ':')
+			c = rb + 1;
 	} else {
-		for (const char *q = host; q < auth_end; q++)
+		for (const char *q = host; q < *auth_end; q++)
 			if (*q == ':')
-				colon = q;
+				c = q;
 	}
-	if (!colon || (size_t)(auth_end - colon - 1) != sizeof port_in - 1
-	    || strncmp(colon + 1, port_in, sizeof port_in - 1) != 0) {
-		copy_str(out, outlen, url);
-		return 0;
-	}
+	if (!c || (size_t)(*auth_end - c - 1) != sizeof port_in - 1
+	    || strncmp(c + 1, port_in, sizeof port_in - 1) != 0)
+		return false;
+	*colon = c;
+	return true;
+}
 
-	struct sbuf b = { out, 0, outlen, false };
-	out[0] = '\0';
-	sb_puts(&b, "rtsp://");
-	sb_putn(&b, auth, (size_t)(colon - auth));
-	sb_puts(&b, ":7447");
-
-	const char *path_end = auth_end + strcspn(auth_end, "?#");
-	sb_putn(&b, auth_end, (size_t)(path_end - auth_end));
-
-	const char *p = path_end;
+/* Copies the query string starting at p ('?' or not) without the
+ * Protect-only parameters, then the fragment. */
+static void unifi_query(struct sbuf *b, const char *p)
+{
 	if (*p == '?') {
 		bool first = true;
 		p++;
@@ -1165,8 +1354,8 @@ int layout_unifi_rewrite(const char *url, char *out, size_t outlen)
 			size_t key_len = strcspn(p, "=&#");
 			bool drop = key_len == 10 && strncasecmp(p, "enableSrtp", 10) == 0;
 			if (!drop && len > 0) {
-				sb_puts(&b, first ? "?" : "&");
-				sb_putn(&b, p, len);
+				sb_puts(b, first ? "?" : "&");
+				sb_putn(b, p, len);
 				first = false;
 			}
 			p += len;
@@ -1175,8 +1364,50 @@ int layout_unifi_rewrite(const char *url, char *out, size_t outlen)
 		}
 	}
 	if (*p == '#')
-		sb_puts(&b, p);
-	return b.overflow ? -1 : 1;
+		sb_puts(b, p);
+}
+
+int layout_unifi_apply(const char *url, enum layout_unifi_mode mode, char *out, size_t outlen,
+		       enum layout_unifi_result *result)
+{
+	const char *auth, *colon, *auth_end;
+	enum layout_unifi_result res = LAYOUT_UNIFI_NOT_UNIFI;
+	struct sbuf b = { out, 0, outlen, false };
+
+	if (!outlen)
+		return -1;
+	out[0] = '\0';
+	if (!unifi_split(url, &auth, &colon, &auth_end)) {
+		sb_puts(&b, url);
+	} else if (mode == LAYOUT_UNIFI_MODE_OFF) {
+		res = LAYOUT_UNIFI_OFF;
+		sb_puts(&b, url);
+	} else {
+		const char *path_end = auth_end + strcspn(auth_end, "?#");
+		if (mode == LAYOUT_UNIFI_MODE_PLAIN) {
+			res = LAYOUT_UNIFI_PLAIN;
+			sb_puts(&b, "rtsp://");
+			sb_putn(&b, auth, (size_t)(colon - auth));
+			sb_puts(&b, ":7447");
+		} else {
+			res = LAYOUT_UNIFI_KEPT_TLS;
+			sb_putn(&b, url, (size_t)(auth_end - url));
+		}
+		sb_putn(&b, auth_end, (size_t)(path_end - auth_end));
+		unifi_query(&b, path_end);
+	}
+	if (result)
+		*result = res;
+	return b.overflow ? -1 : 0;
+}
+
+int layout_unifi_rewrite(const char *url, char *out, size_t outlen)
+{
+	enum layout_unifi_result res;
+
+	if (layout_unifi_apply(url, LAYOUT_UNIFI_MODE_PLAIN, out, outlen, &res) < 0)
+		return -1;
+	return res == LAYOUT_UNIFI_PLAIN ? 1 : 0;
 }
 
 /* ------------------------------------------------------------ sd_notify */
@@ -1187,7 +1418,7 @@ int layout_notify_sockaddr(const char *env, char *sun_path, size_t cap, size_t *
 		return -1;
 	if (env[0] == '@') {
 		size_t n = strlen(env + 1);
-		if (!n || n + 1 >= cap)
+		if (!n || n + 1 > cap)   /* abstract names are not NUL-terminated */
 			return -1;
 		sun_path[0] = '\0';
 		memcpy(sun_path + 1, env + 1, n);

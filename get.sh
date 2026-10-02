@@ -7,8 +7,10 @@
 # SHA256SUMS from the same release, and installs it with apt. Running it again
 # upgrades (the config in /etc/rtspwall is left alone). It never reboots.
 #
-# Options:  --yes          answer yes to the gpu_mem question
-#           --no-gpu-mem   never offer to change gpu_mem
+# Options:  --yes, --no-gpu-mem   accepted and ignored (kept so older docs and
+#           scripts keep working); this installer no longer touches gpu_mem.
+#           Run `sudo rtspwall doctor` after adding cameras: it says if gpu_mem
+#           must be raised.
 # Environment:  RTSPWALL_VERSION=v0.1.0-rc1   install that release instead of the latest
 #
 # Provenance of the files (GitHub build attestation):
@@ -94,12 +96,10 @@ fetch() { # fetch URL OUTFILE
 }
 
 main() {
-    yes=0 gpu=1
     for a in "$@"; do
         case $a in
-            --yes | -y) yes=1 ;;
-            --no-gpu-mem) gpu=0 ;;
-            -h | --help) echo "Usage: sudo bash get.sh [--yes] [--no-gpu-mem]   (RTSPWALL_VERSION=v0.1.0-rc1 picks a release)"; return 0 ;;
+            --yes | -y | --no-gpu-mem) ;; # accepted, no-op (compatibility)
+            -h | --help) echo "Usage: sudo bash get.sh   (--yes/--no-gpu-mem are accepted and ignored; RTSPWALL_VERSION=v0.1.0-rc1 picks a release)"; return 0 ;;
             *) die "unknown option: $a (try --help)" ;;
         esac
     done
@@ -141,19 +141,6 @@ main() {
     apt-get -o DPkg::Lock::Timeout=300 update
     apt-get -o DPkg::Lock::Timeout=300 install -y "$tmp/$file"
 
-    echo
-    out=$(rtspwall doctor --summary --no-probe 2>&1 || true)
-    printf '%s\n' "$out"
-
-    if [ "$gpu" -eq 1 ] && printf '%s\n' "$out" | grep -q '^WARN  *gpu_mem'; then
-        # doctor --fix asks via /dev/tty itself (this script may be piped from curl).
-        if [ "$yes" -eq 1 ]; then
-            rtspwall doctor --fix --yes >/dev/null || true
-        elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
-            rtspwall doctor --fix </dev/tty || true
-        fi
-    fi
-
     cat <<'NEXT'
 
 rtspwall is installed. It was not started and nothing was rebooted.
@@ -161,6 +148,7 @@ Next steps:
   sudo rtspwall demo          # 2x2 test wall, no cameras needed
   sudo rtspwall probe         # check a camera URL (codec, size, decoder budget)
   sudo rtspwall add NAME      # add a camera and start the wall
+After adding cameras: sudo rtspwall doctor
 Run this installer again at any time to upgrade; your config is kept.
 NEXT
 }

@@ -15,12 +15,55 @@ ExecCondition=/usr/bin/systemctl is-enabled --quiet rtspwall.service
 # into the current run, so editors' double writes (truncate + write, or
 # write + rename) cause one check and at most one restart of the final file.
 ExecStartPre=/usr/bin/sleep 2
-# An invalid file leaves the running wall untouched and logs one line; the
-# unit still ends successfully so the .path unit keeps watching.
+# Validation runs as the unprivileged service user (setpriv), so a config that
+# root can read but the service cannot (wrong owner/mode) is caught here, not
+# after the restart. A valid file restarts the wall when it is running OR
+# failed: exit 2/3 are in RestartPreventExitStatus, so a wall that died on a
+# bad config sits in "failed", and try-restart would never start it again
+# ("fix the config, save -> the wall starts" is the main flow). reset-failed
+# first, so the restart is not refused by a leftover failed state. While the
+# demo runs nothing is touched (restarting the wall would stop the demo via
+# Conflicts=). A wall that was stopped on purpose (inactive) stays stopped.
+# An invalid file leaves everything unchanged and logs one line; the unit
+# still ends successfully so the .path unit keeps watching.
 # NOTE: install.sh rewrites /usr/bin/rtspwall to $PREFIX/bin for source installs.
-ExecStart=/bin/sh -c 'if /usr/bin/rtspwall --check-config /etc/rtspwall/cameras.conf >/dev/null 2>&1; then echo "cameras.conf changed and is valid: restarting rtspwall.service"; /usr/bin/systemctl try-restart rtspwall.service; else echo "cameras.conf changed but is INVALID: rtspwall left running unchanged. Run: sudo rtspwall --check-config /etc/rtspwall/cameras.conf"; fi'
-# Runs as root (needs systemctl); keep the rest minimal.
+# (systemd treats $$ as a literal $; none are needed here.)
+ExecStart=/bin/sh -c 'if /usr/bin/setpriv --reuid=rtspwall --regid=rtspwall --init-groups /usr/bin/rtspwall --check-config /etc/rtspwall/cameras.conf >/dev/null 2>&1; then \
+  if systemctl is-active --quiet rtspwall-demo.service; then echo "cameras.conf changed and is valid, but the demo is running: not touching it (run: sudo systemctl restart rtspwall.service when done)"; \
+  elif systemctl is-active --quiet rtspwall.service; then echo "cameras.conf changed and is valid: restarting rtspwall.service"; systemctl restart rtspwall.service; \
+  elif systemctl is-failed --quiet rtspwall.service; then echo "cameras.conf changed and is valid: restarting failed rtspwall.service"; systemctl reset-failed rtspwall.service; systemctl restart rtspwall.service; \
+  else echo "cameras.conf changed and is valid; rtspwall.service is stopped, leaving it stopped"; fi; \
+else echo "cameras.conf changed but is INVALID (or unreadable by user rtspwall): rtspwall left unchanged. Run: sudo rtspwall --check-config /etc/rtspwall/cameras.conf"; fi'
+
+# ---------------------------------------------------------------------------
+# Hardening. Runs as root only because systemctl needs it; it talks to systemd
+# over the AF_UNIX socket /run/systemd/private, so no network, no devices.
+# CAP_SETUID/CAP_SETGID are what setpriv needs to drop to user rtspwall (root
+# switching user uses capabilities, so NoNewPrivileges does not get in the way).
+# OVERIFIERAT PA PI (and on a real systemd host; only `systemd-analyze verify`
+# was run): that setpriv + systemctl work under this sandbox. If the log shows
+# "Operation not permitted", "Bad system call" or "Failed to connect to bus",
+# relax in this order: SystemCallFilter, PrivateNetwork, ProtectSystem.
+# ---------------------------------------------------------------------------
 NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+PrivateDevices=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @setuid
+SystemCallFilter=~@resources

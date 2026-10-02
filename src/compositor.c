@@ -190,6 +190,12 @@ static void complete_flip(struct wall *v, int64_t flip_time_us)
 		}
 		if (old >= 0)
 			ring_push(k, old);
+		/* Indices parked by abandon_flip: any confirmed flip proves the
+		 * abandoned commit has completed, so the plane shows none of
+		 * them any more. */
+		for (int j = 0; j < k->n_limbo; j++)
+			ring_push(k, k->limbo[j]);
+		k->n_limbo = 0;
 
 		/* Leaked buffers (see .leaked in struct camera): this
 		 * confirmation proves the plane can no longer reference ANY older
@@ -228,6 +234,37 @@ static void complete_flip(struct wall *v, int64_t flip_time_us)
 			latency = 0;
 		k->m_latency_sum_us += (unsigned long)latency;
 		k->m_latency_count++;
+	}
+}
+
+/* A page flip that never got its event (see the flip timeout in
+ * compositor()). Unlike complete_flip nothing is confirmed:
+ *   - a detach in flight (-2) is NOT taken as done: in_flight goes back to
+ *     -1 and plane_attached stays true, so the detach is made again and a
+ *     waiting teardown_stream keeps waiting for a real confirmation (the
+ *     plane must be confirmed off before its framebuffers are removed);
+ *   - a frame in flight becomes "shown" (the plane may show it), but the
+ *     previous "shown" is NOT handed back to the decoder - the plane may
+ *     still show that one too. It is parked in `limbo` until a later flip
+ *     is confirmed (flips on one CRTC complete in order, so a confirmed
+ *     later flip proves the abandoned one is done);
+ *   - leaked[] is left alone (drained only on a confirmed flip). */
+static void abandon_flip(struct wall *v)
+{
+	for (int i = 0; i < v->count; i++) {
+		struct camera *k = &v->cam[i];
+
+		pthread_mutex_lock(&k->lock);
+		if (k->in_flight == -2) {
+			k->in_flight = -1;
+		} else if (k->in_flight >= 0) {
+			if (k->shown >= 0 && k->n_limbo < MAX_LIMBO)
+				k->limbo[k->n_limbo++] = k->shown;
+			k->shown = k->in_flight;
+			k->in_flight = -1;
+			k->plane_attached = true;
+		}
+		pthread_mutex_unlock(&k->lock);
 	}
 }
 
@@ -363,22 +400,26 @@ void compositor(struct wall *v)
 	int64_t vblank_request_us = 0;
 	int64_t last_report_us = monotonic_us();
 	int64_t last_flip_warn_us = 0;
+	int64_t vblank_fail_since_us = 0;   /* first of a run of refused vblank waits */
+	int     vblank_failures = 0;
+	int64_t last_vblank_warn_us = 0;
 
 	while (!quit) {
 		int64_t loop_us = monotonic_us();
 
 		/* A page flip that never completes (display gone, driver stuck)
-		 * would freeze the wall for good. After 2 s give up on it: its
-		 * frames count as shown (the buffers stay valid either way),
-		 * and the display recovery below gets a forced re-probe. */
-		if (!fl->done && loop_us - fl->commit_us > 2 * 1000000LL) {
+		 * would freeze the wall for good. After FLIP_TIMEOUT_US give up
+		 * on it WITHOUT confirming anything (abandon_flip: no buffer
+		 * goes back to the decoder, a detach is redone) and let the
+		 * display recovery below re-probe. */
+		if (!fl->done && loop_us - fl->commit_us > FLIP_TIMEOUT_US) {
 			if (!last_flip_warn_us || loop_us - last_flip_warn_us >= 60 * 1000000LL) {
 				log_msg("display: no page-flip event for 2 s on %s - recovering",
 					v->conn_name);
 				last_flip_warn_us = loop_us;
 			}
 			fl->done = true;
-			complete_flip(v, loop_us);
+			abandon_flip(v);
 			if (v->commit_failures < 10)
 				v->commit_failures = 10;
 		}
@@ -411,10 +452,33 @@ void compositor(struct wall *v)
 				/* Rare (the driver refuses right now, e.g. the
 				 * CRTC is off) — fall back to a short sleep
 				 * instead of spinning hot or freezing the
-				 * compositor. */
+				 * compositor. Refused for a second on end: the
+				 * CRTC is most likely off, so re-probe the display
+				 * and set the mode again (display_poll). */
+				int e = errno;
+				if (!vblank_fail_since_us) {
+					vblank_fail_since_us = loop_us;
+					vblank_failures = 0;
+				}
+				vblank_failures++;
+				if (loop_us - vblank_fail_since_us >= 1000000 && v->display_connected
+				    && !v->remodeset_pending) {
+					if (!last_vblank_warn_us
+					    || loop_us - last_vblank_warn_us >= 60 * 1000000LL) {
+						log_msg("display: vblank wait refused %d times in %lld ms "
+							"(%s) - re-probing %s and setting the mode again",
+							vblank_failures,
+							(long long)(loop_us - vblank_fail_since_us) / 1000,
+							strerror(e), v->conn_name);
+						last_vblank_warn_us = loop_us;
+					}
+					v->remodeset_pending = true;
+					vblank_fail_since_us = 0;
+				}
 				usleep(4000);
 				continue;
 			}
+			vblank_fail_since_us = 0;
 			vblank_pending = true;
 			vblank_request_us = loop_us;
 		}
@@ -632,6 +696,7 @@ void compositor(struct wall *v)
 			if (r) {
 				fl->done = true;
 				v->commit_failures++;
+				v->last_commit_errno = commit_errno;
 				/* The frames were never shown — in_flight is never
 				 * confirmed by a flip, so they must go straight back
 				 * to the decoder instead of leaking. Also counted as

@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -43,6 +44,14 @@ int cli_main(int argc, char **argv)
 	/* Line-buffered even into a pipe, so stdout and stderr lines keep
 	 * their order in logs and bug reports. */
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	/* The process holds camera URLs (passwords) in memory: no core dumps,
+	 * no ptrace attach by other processes of the same user. */
+	prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+	/* As root (sudo), helpers (systemctl, runuser, journalctl, dmesg, ...)
+	 * are only looked up in the system directories, whatever PATH the
+	 * caller had. */
+	if (geteuid() == 0)
+		setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin", 1);
 	for (size_t i = 0; i < sizeof commands / sizeof commands[0]; i++)
 		if (strcmp(argv[1], commands[i].name) == 0)
 			return commands[i].fn(argc - 1, argv + 1);   /* argv[0] = subcommand */
@@ -75,16 +84,11 @@ void cli_usage(FILE *out)
 
 /* ------------------------------------------------------------------ files */
 
-char *cli_read_file(const char *path, size_t max)
+char *cli_read_fd(int fd, size_t max)
 {
-	int fd = open(path, O_RDONLY | O_CLOEXEC);
-	if (fd < 0)
-		return NULL;
-
 	size_t cap = 4096, len = 0;
 	char *buf = malloc(cap);
 	if (!buf) {
-		close(fd);
 		errno = ENOMEM;
 		return NULL;
 	}
@@ -92,14 +96,12 @@ char *cli_read_file(const char *path, size_t max)
 		if (len + 1 >= cap) {
 			if (cap > max) {
 				free(buf);
-				close(fd);
 				errno = EFBIG;
 				return NULL;
 			}
 			char *nb = realloc(buf, cap * 2);
 			if (!nb) {
 				free(buf);
-				close(fd);
 				errno = ENOMEM;
 				return NULL;
 			}
@@ -112,7 +114,6 @@ char *cli_read_file(const char *path, size_t max)
 				continue;
 			int e = errno;
 			free(buf);
-			close(fd);
 			errno = e;
 			return NULL;
 		}
@@ -120,13 +121,24 @@ char *cli_read_file(const char *path, size_t max)
 			break;
 		len += (size_t)n;
 	}
-	close(fd);
 	if (len > max) {
 		free(buf);
 		errno = EFBIG;
 		return NULL;
 	}
 	buf[len] = '\0';
+	return buf;
+}
+
+char *cli_read_file(const char *path, size_t max)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return NULL;
+	char *buf = cli_read_fd(fd, max);
+	int e = errno;
+	close(fd);
+	errno = e;
 	return buf;
 }
 
@@ -151,26 +163,52 @@ int cli_load_config(const char *path, struct layout_config *cfg, char *err, size
 /* ------------------------------------------------------------- the prompt */
 
 static int tty_fd = -1;
-static struct termios tty_saved;
+static struct termios tty_saved, tty_noecho;
 static volatile sig_atomic_t tty_echo_off = 0;
 
+/* TCSANOW, not TCSAFLUSH: flushing would throw away a URL that was
+ * pasted before the prompt appeared. */
 static void tty_restore(void)
 {
 	if (tty_echo_off && tty_fd >= 0) {
-		tcsetattr(tty_fd, TCSAFLUSH, &tty_saved);
+		tcsetattr(tty_fd, TCSANOW, &tty_saved);
 		tty_echo_off = 0;
 	}
 }
 
-/* Ctrl-C at the hidden prompt must not leave the terminal without echo. */
+/* Ctrl-C, Ctrl-\ or a kill at the hidden prompt must not leave the
+ * terminal without echo. */
 static void prompt_signal(int sig)
 {
 	if (tty_echo_off && tty_fd >= 0) {
-		tcsetattr(tty_fd, TCSAFLUSH, &tty_saved);
+		tcsetattr(tty_fd, TCSANOW, &tty_saved);
 		(void)!write(tty_fd, "\n", 1);
 	}
 	signal(sig, SIG_DFL);
 	raise(sig);
+}
+
+/* Ctrl-Z: echo back on while stopped (the shell needs it), off again
+ * after `fg`. */
+static void prompt_tstp(int sig)
+{
+	int saved_errno = errno;
+	bool was_off = tty_echo_off && tty_fd >= 0;
+	if (was_off)
+		tcsetattr(tty_fd, TCSANOW, &tty_saved);
+	signal(SIGTSTP, SIG_DFL);
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGTSTP);
+	sigprocmask(SIG_UNBLOCK, &set, NULL);
+	raise(SIGTSTP);                       /* stops here until SIGCONT */
+	struct sigaction sa = { .sa_handler = prompt_tstp };
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGTSTP, &sa, NULL);
+	if (was_off)
+		tcsetattr(tty_fd, TCSANOW, &tty_noecho);
+	errno = saved_errno;
+	(void)sig;
 }
 
 static void chomp(char *s)
@@ -223,21 +261,24 @@ int cli_read_url(bool from_stdin, char *out, size_t outlen)
 		static const char prompt[] = "Camera URL (input hidden): ";
 		(void)!write(tty_fd, prompt, sizeof prompt - 1);
 
-		struct sigaction sa = { .sa_handler = prompt_signal }, old_int, old_term;
+		static const int sigs[] = { SIGINT, SIGTERM, SIGQUIT, SIGHUP, SIGTSTP };
+		struct sigaction sa = { .sa_handler = prompt_signal }, tstp = { .sa_handler = prompt_tstp };
+		struct sigaction old[sizeof sigs / sizeof sigs[0]];
 		sigemptyset(&sa.sa_mask);
-		sigaction(SIGINT, &sa, &old_int);
-		sigaction(SIGTERM, &sa, &old_term);
+		sigemptyset(&tstp.sa_mask);
+		for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++)
+			sigaction(sigs[i], sigs[i] == SIGTSTP ? &tstp : &sa, &old[i]);
 		if (tcgetattr(tty_fd, &tty_saved) == 0) {
-			struct termios t = tty_saved;
-			t.c_lflag &= ~(tcflag_t)ECHO;
-			t.c_lflag |= ECHONL;
-			if (tcsetattr(tty_fd, TCSAFLUSH, &t) == 0)
+			tty_noecho = tty_saved;
+			tty_noecho.c_lflag &= ~(tcflag_t)ECHO;
+			tty_noecho.c_lflag |= ECHONL;
+			if (tcsetattr(tty_fd, TCSANOW, &tty_noecho) == 0)
 				tty_echo_off = 1;
 		}
 		int r = read_line_fd(tty_fd, out, outlen);
 		tty_restore();
-		sigaction(SIGINT, &old_int, NULL);
-		sigaction(SIGTERM, &old_term, NULL);
+		for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++)
+			sigaction(sigs[i], &old[i], NULL);
 		close(tty_fd);
 		tty_fd = -1;
 		if (r < 0) {
@@ -310,7 +351,10 @@ int cli_run(char *const argv[], char *out, size_t outlen, int timeout_ms)
 		return -1;
 	}
 	if (pid == 0) {
-		int devnull = open("/dev/null", O_RDONLY);
+		/* Own process group, so a timeout kills the helper and anything
+		 * it started (runuser -> rtspwall, systemctl -> pager, ...). */
+		setpgid(0, 0);
+		int devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
 		if (devnull >= 0)
 			dup2(devnull, STDIN_FILENO);
 		dup2(pfd[1], STDOUT_FILENO);
@@ -321,6 +365,7 @@ int cli_run(char *const argv[], char *out, size_t outlen, int timeout_ms)
 		(void)!write(efd[1], &e, sizeof e);
 		_exit(127);
 	}
+	setpgid(pid, pid);     /* also here: no race with kill(-pid) below */
 	close(pfd[1]);
 	close(efd[1]);
 
@@ -357,7 +402,7 @@ int cli_run(char *const argv[], char *out, size_t outlen, int timeout_ms)
 		}
 	}
 	close(pfd[0]);
-	if (timed_out)
+	if (timed_out && kill(-pid, SIGKILL) < 0)
 		kill(pid, SIGKILL);
 
 	int status = 0;
@@ -412,6 +457,25 @@ bool cli_unit_active(const char *unit)
 {
 	char *argv[] = { "systemctl", "is-active", "--quiet", (char *)unit, NULL };
 	return cli_run(argv, NULL, 0, 10000) == 0;
+}
+
+void cli_unit_state(const char *unit, char *out, size_t outlen)
+{
+	char *argv[] = { "systemctl", "is-active", (char *)unit, NULL };
+	char buf[128];
+	if (cli_run(argv, buf, sizeof buf, 10000) < 0)
+		buf[0] = '\0';
+	buf[strcspn(buf, "\r\n")] = '\0';
+	snprintf(out, outlen, "%s", buf[0] ? buf : "unknown");
+}
+
+bool cli_unit_running(const char *unit)
+{
+	char st[64];
+	cli_unit_state(unit, st, sizeof st);
+	/* "activating" includes auto-restart between two attempts */
+	return strcmp(st, "active") == 0 || strcmp(st, "activating") == 0 ||
+	       strcmp(st, "reloading") == 0;
 }
 
 bool cli_unit_enabled(const char *unit)

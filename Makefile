@@ -40,7 +40,9 @@ PKG_CONFIG ?= pkg-config
 # with gcc and clang at -O0/-O1/-O2/-Os/-Og. Packagers whose compiler or
 # hardening flags add new warnings can use WERROR=0. The warning flags are
 # kept separate from CFLAGS, so an externally supplied CFLAGS (e.g. from
-# dpkg-buildflags) does not drop them.
+# dpkg-buildflags) does not drop them. CPPFLAGS and LDFLAGS from the
+# environment are passed through unchanged to the compile/link command
+# (scripts/build-deb.sh exports the dpkg-buildflags hardening set this way).
 OPTFLAGS ?= -O2 -g
 WERROR   ?= 1
 WERROR_FLAG = $(if $(filter 1,$(WERROR)),-Werror)
@@ -56,9 +58,9 @@ BIN  = src/rtspwall
 SRCS = src/main.c src/drm.c src/v4l2.c src/camera_thread.c src/compositor.c \
        src/config.c src/layout.c src/pacing.c \
        src/cli.c src/probe.c src/add.c src/doctor.c src/demo.c \
-       src/budget.c src/clilogic.c
+       src/budget.c src/clilogic.c src/sandbox.c
 HDRS = src/rtspwall.h src/layout.h src/pacing.h \
-       src/cli.h src/budget.h src/clilogic.h
+       src/cli.h src/budget.h src/clilogic.h src/sandbox.h
 
 all: $(BIN)
 

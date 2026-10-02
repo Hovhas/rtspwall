@@ -145,8 +145,12 @@ static int open_drm_device_q(struct wall *v, bool quiet)
 		v->drmfd = open(v->drm_path, O_RDWR | O_CLOEXEC);
 		if (v->drmfd < 0) {
 			int e = errno;
+			/* Not there (yet): the DRM driver may still be loading at
+			 * boot. The caller waits; a typo shows in the log. */
+			if (e == ENOENT)
+				return 2;
 			log_msg("DRM_DEVICE=%s: %s", v->drm_path, strerror(e));
-			return e == ENOENT ? -2 : -1;
+			return -1;
 		}
 		if (!quiet)
 			log_device_choice(v);
@@ -207,10 +211,6 @@ static int open_drm_device_q(struct wall *v, bool quiet)
 	return 0;
 }
 
-int open_drm_device(struct wall *v)
-{
-	return open_drm_device_q(v, false);
-}
 
 /* Sleeps `ms` in 100 ms steps; false if quit was set meanwhile. */
 static bool sleep_unless_quit(int ms)
@@ -260,11 +260,29 @@ static void find_drm_holders(char *out, size_t n)
 int acquire_drm(struct wall *v)
 {
 	bool waiting = false;
+	bool waiting_node = false;
 
 	for (;;) {
-		int r = open_drm_device_q(v, waiting);
+		int r = open_drm_device_q(v, waiting || waiting_node);
 		if (r < 0)
 			return r;
+		if (r == 2) {
+			if (!waiting_node) {
+				log_msg("DRM_DEVICE=%s does not exist (yet) - waiting for it (checking "
+					"every 2 s); if it never appears, check the path or use "
+					"DRM_DEVICE=auto", v->drm_path);
+				notify_status("waiting for DRM_DEVICE=%s to appear", v->drm_path);
+				waiting_node = true;
+			}
+			if (!sleep_unless_quit(2000))
+				return 1;
+			continue;
+		}
+		if (waiting_node) {
+			log_msg("display: %s appeared", v->drm_path);
+			log_device_choice(v);
+			waiting_node = false;
+		}
 
 		if (drmSetClientCap(v->drmfd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1)
 		    || drmSetClientCap(v->drmfd, DRM_CLIENT_CAP_ATOMIC, 1)) {
@@ -380,9 +398,11 @@ static void list_modes(const char *name, const drmModeConnector *c)
 /* Picks the mode for connector c according to MODE (see
  * layout_select_mode). If an explicit MODE is not offered: -2 (config
  * error, modes listed) unless fallback is set, then MODE=auto is used with
- * a warning (a running wall must not die because a different TV was
- * plugged in). quiet suppresses the log lines (retries). Returns 0 with
- * *out set, or -1/-2. */
+ * a warning and v->mode_fallback is set (a wall must not die because a
+ * different TV was plugged in, or because a TV in standby or without a
+ * readable EDID only offers the driver's reserve modes; display_poll
+ * checks every 30 s whether MODE is offered again). quiet suppresses the
+ * log lines (retries). Returns 0 with *out set, or -1/-2. */
 static int pick_mode(struct wall *v, const drmModeConnector *c, bool fallback, bool quiet,
 		     drmModeModeInfo *out)
 {
@@ -408,6 +428,7 @@ static int pick_mode(struct wall *v, const drmModeConnector *c, bool fallback, b
 	}
 
 	int idx = layout_select_mode(lm, n, cfg->mode_w, cfg->mode_h, cfg->mode_mhz, &why);
+	v->mode_fallback = idx < 0 && cfg->mode_w && fallback;
 	if (idx < 0 && cfg->mode_w) {
 		if (!quiet) {
 			log_msg("MODE=%s: %s does not offer that mode", want, v->conn_name);
@@ -458,12 +479,13 @@ static int pick_mode(struct wall *v, const drmModeConnector *c, bool fallback, b
 }
 
 /* Looks for the connector (by name if CONNECTOR is set, otherwise the
- * first connected one) and its CRTC, and picks the mode. Returns 0 when a
- * display is connected (v->connector_id/crtc_id/crtc_pipe/mode set), 1
- * when none is connected yet, -2 when CONNECTOR names no connector of this
- * device or MODE is not offered, -1 on errors. Lists the connectors unless
- * quiet. */
-static int find_connector(struct wall *v, bool quiet)
+ * first connected one) and its CRTC, and picks the mode (an explicit MODE
+ * the display does not offer falls back to auto, see pick_mode). Returns 0
+ * when a display is connected (v->connector_id/crtc_id/crtc_pipe/mode
+ * set), 1 when none is connected yet, -2 when CONNECTOR names no connector
+ * of this device, -1 on errors. Lists the connectors and logs the mode
+ * choice unless quiet. */
+static int find_connector(struct wall *v, bool quiet, bool quiet_mode)
 {
 	drmModeRes *res = drmModeGetResources(v->drmfd);
 	if (!res) {
@@ -493,7 +515,7 @@ static int find_connector(struct wall *v, bool quiet)
 			uint32_t crtc = crtc_for_connector(v->drmfd, res, c);
 			if (crtc) {
 				snprintf(v->conn_name, sizeof v->conn_name, "%s", name);
-				result = pick_mode(v, c, false, false, &v->mode);
+				result = pick_mode(v, c, true, quiet_mode, &v->mode);
 				if (result == 0) {
 					v->connector_id = c->connector_id;
 					v->crtc_id = crtc;
@@ -589,13 +611,49 @@ static void set_vblank_period(struct wall *v)
 	v->vblank_period_us = pacing_vblank_period_us(v->mode.clock, v->mode.htotal, v->mode.vtotal);
 }
 
+/* How long the startup waits for a display mode the manual tiles fit,
+ * before it starts anyway with the tiles cut off. */
+#define FIT_WAIT_US (60 * 1000000LL)
+
 int wait_for_display(struct wall *v)
 {
 	bool waiting = false;
+	int64_t fit_wait_since = 0;
 	int r;
 
-	while ((r = find_connector(v, waiting)) == 1) {
-		if (!waiting) {
+	for (;;) {
+		r = find_connector(v, waiting || fit_wait_since, fit_wait_since != 0);
+		if (r < 0)
+			return r;
+		if (r == 0) {
+			/* Manual tiles made for a larger screen than the one
+			 * offered now: a TV in standby or without EDID gives
+			 * only small reserve modes at boot. Wait for a mode they
+			 * fit (bounded - it may also just be the wrong layout). */
+			int need_w, need_h;
+			if (layout_tiles_fit(&v->cfg, v->mode.hdisplay, v->mode.vdisplay,
+					     &need_w, &need_h))
+				break;
+			int64_t now = monotonic_us();
+			if (!fit_wait_since) {
+				log_msg("layout: the manual tiles need a %dx%d screen but %s offers "
+					"%ux%u right now (TV in standby?) - waiting up to %lld s for a "
+					"larger mode (checking every 2 s)", need_w, need_h,
+					v->conn_name, v->mode.hdisplay, v->mode.vdisplay,
+					FIT_WAIT_US / 1000000);
+				notify_status("waiting for a display mode of at least %dx%d (%s offers %ux%u)",
+					      need_w, need_h, v->conn_name,
+					      v->mode.hdisplay, v->mode.vdisplay);
+				fit_wait_since = now;
+			} else if (now - fit_wait_since >= FIT_WAIT_US) {
+				log_msg("layout: WARNING: still %ux%u after %lld s - starting anyway; "
+					"tiles reaching outside the screen are cut off (check the "
+					"tiles with: rtspwall --check-config --mode %ux%u)",
+					v->mode.hdisplay, v->mode.vdisplay, FIT_WAIT_US / 1000000,
+					v->mode.hdisplay, v->mode.vdisplay);
+				break;
+			}
+		} else if (!waiting) {
 			log_msg("waiting for a display: switch the TV/monitor on or plug in HDMI "
 				"(checking every 2 s)");
 			notify_status("waiting for display");
@@ -604,8 +662,6 @@ int wait_for_display(struct wall *v)
 		if (!sleep_unless_quit(2000))
 			return 1;
 	}
-	if (r < 0)
-		return r;
 
 	v->display_connected = true;
 	log_msg("display: %s (connector %u), CRTC %u (index %u), %ux%u@%u",
@@ -663,7 +719,16 @@ int read_plane_props(struct wall *v)
 	return 0;
 }
 
-/* Black background via a dumb buffer. */
+static void destroy_dumb(int fd, uint32_t handle)
+{
+	struct drm_mode_destroy_dumb d = { .handle = handle };
+	if (handle)
+		drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);
+}
+
+/* Black background via a dumb buffer. On failure nothing is left behind
+ * (no dumb buffer, no mapping) and v->primary_fb/primary_handle are
+ * unchanged. */
 int create_primary_fb(struct wall *v)
 {
 	struct drm_mode_create_dumb create = {
@@ -677,6 +742,7 @@ int create_primary_fb(struct wall *v)
 	struct drm_mode_map_dumb map = { .handle = create.handle };
 	if (drmIoctl(v->drmfd, DRM_IOCTL_MODE_MAP_DUMB, &map)) {
 		log_msg("MAP_DUMB: %s", strerror(errno));
+		destroy_dumb(v->drmfd, create.handle);
 		return -1;
 	}
 
@@ -684,26 +750,23 @@ int create_primary_fb(struct wall *v)
 		       v->drmfd, map.offset);
 	if (p == MAP_FAILED) {
 		log_msg("mmap dumb: %s", strerror(errno));
+		destroy_dumb(v->drmfd, create.handle);
 		return -1;
 	}
 	memset(p, 0, create.size);
 	munmap(p, create.size);
 
+	uint32_t fb = 0;
 	uint32_t handles[4] = { create.handle }, pitches[4] = { create.pitch }, offsets[4] = { 0 };
 	if (drmModeAddFB2(v->drmfd, create.width, create.height, DRM_FORMAT_XRGB8888,
-			  handles, pitches, offsets, &v->primary_fb, 0)) {
+			  handles, pitches, offsets, &fb, 0)) {
 		log_msg("AddFB2 primary: %s", strerror(errno));
+		destroy_dumb(v->drmfd, create.handle);
 		return -1;
 	}
+	v->primary_fb = fb;
 	v->primary_handle = create.handle;
 	return 0;
-}
-
-static void destroy_dumb(int fd, uint32_t handle)
-{
-	struct drm_mode_destroy_dumb d = { .handle = handle };
-	if (handle)
-		drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);
 }
 
 /* ------------------------------------------------------- hotplug recovery */
@@ -744,8 +807,10 @@ static int display_remodeset(struct wall *v, const drmModeModeInfo *m)
 		char err[256];
 		tiles = v->cfg;
 		if (layout_apply(&tiles, m->hdisplay, m->vdisplay, NULL, NULL, err, sizeof err) < 0) {
-			log_msg("display: cannot lay out the wall on %ux%u: %s - keeping %ux%u",
-				m->hdisplay, m->vdisplay, err, old_mode.hdisplay, old_mode.vdisplay);
+			if (recovery_log_ok(v, now))
+				log_msg("display: cannot lay out the wall on %ux%u: %s - keeping %ux%u",
+					m->hdisplay, m->vdisplay, err,
+					old_mode.hdisplay, old_mode.vdisplay);
 			drmModeDestroyPropertyBlob(v->drmfd, blob);
 			return -1;
 		}
@@ -822,9 +887,16 @@ static int display_remodeset(struct wall *v, const drmModeModeInfo *m)
 		destroy_dumb(v->drmfd, old_handle);
 		v->primary_fb = fb;
 		v->primary_handle = handle;
-		v->cfg = tiles;
+		/* Only the tile coordinates change. NOT v->cfg = tiles: the
+		 * camera threads read v->cfg (decoder path) concurrently, and a
+		 * struct copy would be a data race. The coordinates themselves
+		 * are only read by this (compositor) thread. */
 		for (int i = 0; i < v->count; i++) {
 			struct camera *k = &v->cam[i];
+			v->cfg.cam[i].x = tiles.cam[i].x;
+			v->cfg.cam[i].y = tiles.cam[i].y;
+			v->cfg.cam[i].width = tiles.cam[i].width;
+			v->cfg.cam[i].height = tiles.cam[i].height;
 			k->x = tiles.cam[i].x;
 			k->y = tiles.cam[i].y;
 			k->width = tiles.cam[i].width;
@@ -839,30 +911,76 @@ static int display_remodeset(struct wall *v, const drmModeModeInfo *m)
 	return 0;
 }
 
+static bool same_timing(const drmModeModeInfo *a, const drmModeModeInfo *b)
+{
+	return a->hdisplay == b->hdisplay && a->vdisplay == b->vdisplay
+	       && a->clock == b->clock && a->htotal == b->htotal && a->vtotal == b->vtotal
+	       && a->flags == b->flags;
+}
+
+/* A commit that only re-sets the black primary plane (no camera plane in
+ * it). Returns 0 if the kernel accepts it, else the errno. Only called
+ * while no page flip is pending; nonblocking and without an event, so a
+ * stuck CRTC cannot block the compositor here (it fails with EBUSY). */
+static int primary_only_commit(struct wall *v)
+{
+	drmModeAtomicReq *req = drmModeAtomicAlloc();
+	if (!req)
+		return ENOMEM;
+	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_fb, v->primary_fb);
+	drmModeAtomicAddProperty(req, v->primary_plane, v->pp_crtc, v->crtc_id);
+	int r = drmModeAtomicCommit(v->drmfd, req, DRM_MODE_ATOMIC_NONBLOCK, NULL);
+	int e = r ? errno : 0;
+	drmModeAtomicFree(req);
+	return e;
+}
+
+/* True if the explicit MODE is among the connector's modes now. */
+static bool explicit_mode_offered(const struct wall *v, const drmModeConnector *c)
+{
+	struct layout_mode lm[MAX_MODES];
+	int n = c->count_modes < MAX_MODES ? c->count_modes : MAX_MODES;
+	enum layout_mode_reason why;
+
+	for (int i = 0; i < n; i++)
+		lm[i] = (struct layout_mode){
+			.width = c->modes[i].hdisplay, .height = c->modes[i].vdisplay,
+			.refresh_mhz = mode_refresh_mhz(&c->modes[i]),
+			.interlaced = (c->modes[i].flags & DRM_MODE_FLAG_INTERLACE) != 0,
+		};
+	return layout_select_mode(lm, n, v->cfg.mode_w, v->cfg.mode_h, v->cfg.mode_mhz, &why) >= 0;
+}
+
+#define FALLBACK_PROBE_US (30 * 1000000LL)
+
 bool display_poll(struct wall *v)
 {
 	int64_t now = monotonic_us();
 	bool force = v->commit_failures >= 10
 		     && now - v->last_forced_probe_us >= 5 * 1000000LL;
+	/* Running on MODE=auto because the explicit MODE was not offered (TV
+	 * in standby, no EDID): a full probe (EDID read) now and then shows
+	 * when it is. */
+	bool fallback_probe = v->mode_fallback && v->display_connected && !v->remodeset_pending
+			      && now - v->last_fallback_probe_us >= FALLBACK_PROBE_US;
+	int failures = v->commit_failures;
 
-	if (!force && now - v->last_display_poll_us < 1000000)
+	if (!force && !fallback_probe && now - v->last_display_poll_us < 1000000)
 		return false;
 	v->last_display_poll_us = now;
-
+	if (fallback_probe)
+		v->last_fallback_probe_us = now;
 	if (force) {
 		v->last_forced_probe_us = now;
 		v->recoveries++;
-		if (recovery_log_ok(v, now))
-			log_msg("display: %d atomic commits failed in a row - re-probing %s and "
-				"setting the mode again (recovery #%u)",
-				v->commit_failures, v->conn_name, v->recoveries);
 		v->commit_failures = 0;
 	}
 
 	/* The cached status is cheap (no EDID read) and follows the hotplug
 	 * interrupt; a forced probe re-reads everything. */
-	drmModeConnector *c = force ? drmModeGetConnector(v->drmfd, v->connector_id)
-				    : drmModeGetConnectorCurrent(v->drmfd, v->connector_id);
+	bool full = force || fallback_probe;
+	drmModeConnector *c = full ? drmModeGetConnector(v->drmfd, v->connector_id)
+				   : drmModeGetConnectorCurrent(v->drmfd, v->connector_id);
 	if (!c)
 		return false;
 	bool connected = c->connection == DRM_MODE_CONNECTED;
@@ -877,21 +995,69 @@ bool display_poll(struct wall *v)
 		drmModeFreeConnector(c);
 		return false;
 	}
-	bool first = force;
+	bool first = false;
 	if (!v->display_connected) {
 		log_msg("display: %s connected again - re-reading its modes and setting the mode",
 			v->conn_name);
 		v->display_connected = true;
+		v->remodeset_pending = true;
 		first = true;
 	}
-	if (first)
+
+	if (force && !v->remodeset_pending) {
+		/* Failed commits with the display still connected. A modeset
+		 * (an HDMI resync, the screen goes dark for a moment) only helps
+		 * if the display's modes changed or the CRTC itself is stuck -
+		 * not when the camera planes are rejected (ENOSPC/EINVAL when
+		 * the scaler is overloaded, e.g. during a rotation). Tell the
+		 * two apart with a commit of the background plane alone. */
+		drmModeModeInfo m;
+		bool same = c->count_modes > 0 && pick_mode(v, c, true, true, &m) == 0
+			    && same_timing(&m, &v->mode);
+		int e = same ? primary_only_commit(v) : 0;
+		bool log_ok = recovery_log_ok(v, now);
+		if (same && !e) {
+			if (log_ok)
+				log_msg("display: %d atomic commits failed in a row (%s) but %s still "
+					"accepts the background plane - the camera planes are rejected "
+					"(scaler or memory bandwidth limit?); not setting the mode again "
+					"(recovery check #%u)", failures,
+					strerror(v->last_commit_errno), v->conn_name, v->recoveries);
+			drmModeFreeConnector(c);
+			return false;
+		}
+		if (log_ok) {
+			if (same)
+				log_msg("display: %d atomic commits failed in a row and even the "
+					"background plane alone is rejected (%s) - re-probing %s and "
+					"setting the mode again (recovery #%u)", failures, strerror(e),
+					v->conn_name, v->recoveries);
+			else
+				log_msg("display: %d atomic commits failed in a row and the modes of "
+					"%s changed - setting the mode again (recovery #%u)", failures,
+					v->conn_name, v->recoveries);
+		}
 		v->remodeset_pending = true;
+		first = log_ok;
+	}
+
+	if (fallback_probe && !v->remodeset_pending) {
+		if (c->count_modes < 1 || !explicit_mode_offered(v, c)) {
+			drmModeFreeConnector(c);
+			return false;
+		}
+		log_msg("display: MODE=%dx%d is offered by %s now - switching to it",
+			v->cfg.mode_w, v->cfg.mode_h, v->conn_name);
+		v->remodeset_pending = true;
+		first = true;
+	}
+
 	if (!v->remodeset_pending) {
 		drmModeFreeConnector(c);
 		return false;
 	}
 
-	if (!force) {
+	if (!full) {
 		/* fresh probe: it may be a different display with other modes */
 		drmModeFreeConnector(c);
 		c = drmModeGetConnector(v->drmfd, v->connector_id);

@@ -48,14 +48,20 @@ static char *read_file(const char *path, char *err, size_t errlen)
 	return buf;
 }
 
+/* Config messages can quote what was on the line (an unknown "key" that
+ * was really a URL, a bad value): every URL in them is masked. */
 static void warn_to_log(void *ctx, const char *msg)
 {
-	log_msg("config %s: warning: %s", (const char *)ctx, msg);
+	char masked[1024];
+	layout_mask_urls_in_text(msg, masked, sizeof masked);
+	log_msg("config %s: warning: %s", (const char *)ctx, masked);
 }
 
 static void warn_to_stderr(void *ctx, const char *msg)
 {
-	fprintf(stderr, "rtspwall: %s: warning: %s\n", (const char *)ctx, msg);
+	char masked[1024];
+	layout_mask_urls_in_text(msg, masked, sizeof masked);
+	fprintf(stderr, "rtspwall: %s: warning: %s\n", (const char *)ctx, masked);
 }
 
 /* "1920x1080@60" / "1920x1080" / "auto" for MODE. */
@@ -72,7 +78,11 @@ static void mode_text(const struct layout_config *cfg, char *buf, size_t n)
 		snprintf(buf, n, "%dx%d", cfg->mode_w, cfg->mode_h);
 }
 
-#define UNIFI_NOTE "UniFi Protect rtsps URL rewritten to plain RTSP on port 7447"
+#define UNIFI_PLAIN_NOTE "UniFi Protect rtsps URL rewritten to plain RTSP on port 7447 " \
+	"(UNIFI_REWRITE=plain)"
+#define UNIFI_PLAIN_WARN "plaintext: the UniFi token and video travel unencrypted on your LAN"
+#define UNIFI_TLS_NOTE   "UniFi Protect URL: kept rtsps on port 7441 (TLS), Protect-only " \
+	"?enableSrtp removed"
 
 static int parse_file(struct layout_config *cfg, const char *path, unsigned flags,
 		      layout_warn_fn warn, char *err, size_t errlen)
@@ -98,10 +108,10 @@ int load_config(struct wall *v, const char *path)
 
 	if (parse_file(&v->cfg, path, 0, warn_to_log, err, sizeof err) < 0) {
 		char masked[sizeof err];
-		log_msg("config: %s", err);
+		layout_mask_urls_in_text(err, masked, sizeof masked);
+		log_msg("config: %s", masked);
 		log_msg("config: fix the file and check it with: sudo rtspwall --check-config %s",
 			path);
-		layout_mask_urls_in_text(err, masked, sizeof masked);
 		notify_status("config error: %s", masked);
 		return -1;
 	}
@@ -136,15 +146,19 @@ int load_config(struct wall *v, const char *path)
 		char masked[LAYOUT_URL_MAX];
 		layout_mask_url(k->url, masked, sizeof masked);
 		log_msg("camera %d: %-10s %s delay=%dms", v->count, k->name, masked, k->delay_ms);
-		if (c->unifi_rewritten)
-			log_msg("%s: " UNIFI_NOTE " (%s); set UNIFI_REWRITE=off to keep rtsps",
-				k->name, masked);
+		if (c->unifi == LAYOUT_UNIFI_PLAIN) {
+			log_msg("%s: " UNIFI_PLAIN_NOTE " (%s)", k->name, masked);
+			log_msg("%s: WARNING: " UNIFI_PLAIN_WARN " - UNIFI_REWRITE=tls keeps rtsps",
+				k->name);
+		} else if (c->unifi == LAYOUT_UNIFI_KEPT_TLS) {
+			log_msg("%s: " UNIFI_TLS_NOTE, k->name);
+		}
 		v->count++;
 	}
 
 	char mode[48];
 	mode_text(&v->cfg, mode, sizeof mode);
-	log_msg("config: MODE=%s UNIFI_REWRITE=%s", mode, v->cfg.unifi_rewrite ? "auto" : "off");
+	log_msg("config: MODE=%s UNIFI_REWRITE=%s", mode, layout_unifi_mode_name(v->cfg.unifi_mode));
 
 	if (v->cfg.grid_cols > 0)
 		log_msg("config: grid %dx%d, buffer=%dms rotate=%ds decoder=%s connector=%s drm=%s ffmpeg_log=%s",
@@ -224,13 +238,17 @@ int check_config(const char *path, int screen_w, int screen_h)
 	static struct layout_config cfg;
 	char err[768];
 
+	char masked_err[sizeof err];
+
 	if (parse_file(&cfg, path, LAYOUT_PARSE_STRICT, warn_to_stderr, err, sizeof err) < 0) {
-		fprintf(stderr, "rtspwall: %s\n", err);
+		layout_mask_urls_in_text(err, masked_err, sizeof masked_err);
+		fprintf(stderr, "rtspwall: %s\n", masked_err);
 		return RTSPWALL_EXIT_CONFIG;
 	}
 	if (layout_apply(&cfg, screen_w, screen_h, warn_to_stderr, (void *)path,
 			 err, sizeof err) < 0) {
-		fprintf(stderr, "rtspwall: %s: %s\n", path, err);
+		layout_mask_urls_in_text(err, masked_err, sizeof masked_err);
+		fprintf(stderr, "rtspwall: %s: %s\n", path, masked_err);
 		return RTSPWALL_EXIT_CONFIG;
 	}
 	char mode[48];
@@ -251,7 +269,7 @@ int check_config(const char *path, int screen_w, int screen_h)
 	printf("FFMPEG_LOGLEVEL: %s\n", layout_ffmpeg_log_name(cfg.ffmpeg_loglevel));
 	printf("MODE:            %s%s\n", mode,
 	       cfg.mode_w ? "" : " (preferred mode; 1080p60 instead of 4K or < 50 Hz)");
-	printf("UNIFI_REWRITE:   %s\n", cfg.unifi_rewrite ? "auto" : "off");
+	printf("UNIFI_REWRITE:   %s\n", layout_unifi_mode_name(cfg.unifi_mode));
 
 	printf("\ncameras:\n");
 	for (int i = 0; i < cfg.count; i++) {
@@ -266,8 +284,11 @@ int check_config(const char *path, int screen_w, int screen_h)
 		snprintf(geometry, sizeof geometry, "%dx%d+%d+%d", c->width, c->height, c->x, c->y);
 		printf("  %-12s %s%-16s delay %3d ms  %s\n", c->name, where, geometry,
 		       c->delay_ms, masked);
-		if (c->unifi_rewritten)
-			printf("  %-12s note: " UNIFI_NOTE " (UNIFI_REWRITE=off keeps rtsps)\n", "");
+		if (c->unifi == LAYOUT_UNIFI_PLAIN)
+			printf("  %-12s WARNING: " UNIFI_PLAIN_NOTE "; " UNIFI_PLAIN_WARN
+			       " (UNIFI_REWRITE=tls keeps rtsps)\n", "");
+		else if (c->unifi == LAYOUT_UNIFI_KEPT_TLS)
+			printf("  %-12s note: " UNIFI_TLS_NOTE "\n", "");
 	}
 
 	struct pacing_tile tiles[LAYOUT_MAX_CAMERAS];

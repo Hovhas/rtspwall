@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <grp.h>
+#include <limits.h>
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -66,7 +67,7 @@ struct check {
 	char fix[512];
 };
 
-#define MAX_CHECKS 32
+#define MAX_CHECKS 64      /* ~20 checks + one unifi line per camera */
 
 struct doctor {
 	struct check checks[MAX_CHECKS];
@@ -81,6 +82,7 @@ struct doctor {
 	int  gpu_needed;              /* MB, 0 = default is enough / unknown */
 	int  gpu_effective;           /* MB */
 	int  gpu_configtxt;           /* MB in config.txt, -1 = unset */
+	struct configtxt_gpu gpu_info;  /* which key, filters doctor cannot evaluate */
 	char configtxt_path[64];
 	char display_text[4096];
 	char model[128];
@@ -241,10 +243,15 @@ static void check_gpu_mem(struct doctor *d)
 {
 	find_configtxt(d);
 	int conf_mb = -1;
+	struct configtxt_gpu *gi = &d->gpu_info;
+	memset(gi, 0, sizeof *gi);
+	gi->value = -1;
+	gi->key = "";
 	if (d->configtxt_path[0]) {
 		char *t = cli_read_file(d->configtxt_path, 256 * 1024);
 		if (t) {
-			conf_mb = configtxt_gpu_mem(t);
+			configtxt_gpu_mem_info(t, gi);
+			conf_mb = gi->value;
 			free(t);
 		}
 	}
@@ -252,18 +259,31 @@ static void check_gpu_mem(struct doctor *d)
 	int live_mb = vcgencmd_gpu_mem();
 	d->gpu_effective = live_mb > 0 ? live_mb : conf_mb > 0 ? conf_mb : GPU_MEM_DEFAULT_MB;
 
-	char have[160];
-	snprintf(have, sizeof have, "gpu_mem %d MB (%s%s%s)", d->gpu_effective,
-		 live_mb > 0 ? "vcgencmd" : conf_mb > 0 ? "config.txt" : "firmware default",
+	char have[200];
+	snprintf(have, sizeof have, "gpu_mem %d MB (%s%s%s%s)", d->gpu_effective,
+		 live_mb > 0 ? "vcgencmd" : conf_mb > 0 ? "config.txt " : "firmware default",
+		 live_mb <= 0 && conf_mb > 0 ? gi->key : "",
 		 conf_mb > 0 && live_mb > 0 && conf_mb != live_mb ? ", config.txt says " : "",
 		 conf_mb > 0 && live_mb > 0 && conf_mb != live_mb ? "a different value" : "");
 
-	if (!d->cfg_ok) {
-		add_check(d, L_INFO, "gpu_mem", NULL, "%s; need unknown (config not valid)", have);
-		return;
-	}
-	if (!d->probe) {
-		add_check(d, L_INFO, "gpu_mem", NULL, "%s; need not checked (--no-probe)", have);
+	/* A gpu_mem line under a filter doctor cannot evaluate ([HDMI:0],
+	 * [board-type=...], [EDID=...], ...) may or may not be what the
+	 * firmware uses: say so rather than PASS on a guess. */
+	char uncertain_fix[300] = "";
+	if (gi->uncertain)
+		snprintf(uncertain_fix, sizeof uncertain_fix,
+			 "check the gpu_mem lines under %s in %s by hand (doctor cannot tell "
+			 "whether that filter matches this Pi), or move gpu_mem to [all]",
+			 gi->filter, d->configtxt_path);
+
+	if (!d->cfg_ok || !d->probe) {
+		const char *why = !d->cfg_ok ? "need unknown (config not valid)"
+					     : "need not checked (--no-probe)";
+		if (gi->uncertain)
+			add_check(d, L_WARN, "gpu_mem", uncertain_fix, "%s; %s; config.txt sets gpu_mem "
+				  "under %s, which may or may not apply here", have, why, gi->filter);
+		else
+			add_check(d, L_INFO, "gpu_mem", NULL, "%s; %s", have, why);
 		return;
 	}
 
@@ -292,17 +312,27 @@ static void check_gpu_mem(struct doctor *d)
 	d->gpu_needed = doctor_gpu_mem_needed(total, d->cfg.count);
 	if (d->gpu_needed && d->gpu_effective < d->gpu_needed && conf_mb >= d->gpu_needed) {
 		add_check(d, L_WARN, "gpu_mem", "sudo reboot",
-			  "%s; gpu_mem=%d is set in config.txt but not active until a reboot",
-			  have, conf_mb);
+			  "%s; %s=%d is set in config.txt but not active until a reboot",
+			  have, gi->key, conf_mb);
 	} else if (d->gpu_needed && d->gpu_effective < d->gpu_needed) {
-		char fix[256];
-		snprintf(fix, sizeof fix, "sudo rtspwall doctor --fix   (sets gpu_mem=%d in %s, "
-			 "then: sudo reboot)", d->gpu_needed,
-			 d->configtxt_path[0] ? d->configtxt_path : "config.txt");
+		char fix[300];
+		if (gi->uncertain)
+			snprintf(fix, sizeof fix, "%s", uncertain_fix);
+		else
+			snprintf(fix, sizeof fix, "sudo rtspwall doctor --fix   (sets %s=%d in %s, "
+				 "then: sudo reboot)", gi->key[0] ? gi->key : "gpu_mem", d->gpu_needed,
+				 d->configtxt_path[0] ? d->configtxt_path : "config.txt");
 		add_check(d, L_WARN, "gpu_mem", fix,
-			  "%s; the cameras use %.0f %% of the decoder%s and need %d MB", have,
+			  "%s; the cameras use %.0f %% of the decoder%s and need %d MB%s%s%s", have,
 			  budget_percent(total), measured < d->cfg.count ? " (lower bound)" : "",
-			  d->gpu_needed);
+			  d->gpu_needed, gi->uncertain ? " (config.txt also sets gpu_mem under " : "",
+			  gi->uncertain ? gi->filter : "",
+			  gi->uncertain ? ", which may or may not apply here)" : "");
+	} else if (gi->uncertain) {
+		add_check(d, L_WARN, "gpu_mem", uncertain_fix, "%s; enough for %.0f %% decoder load, "
+			  "but config.txt sets gpu_mem under %s, which may or may not apply here "
+			  "(after a reboot the value may differ)", have, budget_percent(total),
+			  gi->filter);
 	} else {
 		add_check(d, L_PASS, "gpu_mem", NULL, "%s; enough for %.0f %% decoder load", have,
 			  budget_percent(total));
@@ -577,7 +607,7 @@ static bool service_user_can_read(const char *path, char *why, size_t whylen)
 	gid_t groups[64];
 	int ng = service_groups(pw, groups, 64);
 
-	char buf[LAYOUT_PATH_MAX];
+	char buf[PATH_MAX];      /* realpath() needs PATH_MAX (FORTIFY aborts otherwise) */
 	if (!realpath(path, buf))
 		snprintf(buf, sizeof buf, "%s", path);
 	for (char *slash = strchr(buf + 1, '/');; slash = strchr(slash + 1, '/')) {
@@ -609,6 +639,24 @@ static void check_config_file(struct doctor *d, char *cc_out, size_t cc_outlen)
 		add_check(d, L_FAIL, "config", "sudo rtspwall add front-door   (asks for the URL)",
 			  "%s: %s", d->config, strerror(errno));
 		return;
+	}
+	/* Whoever can write the config decides which URLs root's probes and the
+	 * service open, and can redirect them: root (and the service group
+	 * reading) only. */
+	struct stat cst;
+	if (stat(d->config, &cst) == 0) {
+		bool w_owner = (cst.st_mode & S_IWUSR) && cst.st_uid != 0;
+		bool w_group = (cst.st_mode & S_IWGRP) && cst.st_gid != 0;
+		bool w_other = (cst.st_mode & S_IWOTH) != 0;
+		if (w_owner || w_group || w_other) {
+			char m[96], fix[300];
+			describe_mode(&cst, m, sizeof m);
+			snprintf(fix, sizeof fix, "sudo chown root:rtspwall %s && sudo chmod 0640 %s",
+				 d->config, d->config);
+			add_check(d, L_FAIL, "config", fix, "%s (%s) is writable by %s: only root may "
+				  "change it", d->config, m, w_other ? "every user" :
+				  w_group ? "its group" : "its non-root owner");
+		}
 	}
 	char why[256];
 	if (!service_user_can_read(d->config, why, sizeof why)) {
@@ -653,6 +701,58 @@ static void check_config_file(struct doctor *d, char *cc_out, size_t cc_outlen)
 		snprintf(fix, sizeof fix, "sudoedit %s   then: sudo rtspwall --check-config %s",
 			 d->config, d->config);
 		add_check(d, L_FAIL, "config", fix, "%s", first[0] ? first : "--check-config failed");
+	}
+}
+
+/* The interface of the IPv4 default route (/proc/net/route), or "". */
+static void default_route_iface(char *out, size_t outlen)
+{
+	out[0] = '\0';
+	char *t = cli_read_file("/proc/net/route", 64 * 1024);
+	if (!t)
+		return;
+	char *save = NULL;
+	for (char *line = strtok_r(t, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		char iface[32];
+		unsigned long dest, gw, mask;
+		unsigned flags;
+		int refcnt, use, metric;
+		if (sscanf(line, "%31s %lx %lx %x %d %d %d %lx", iface, &dest, &gw, &flags, &refcnt,
+			   &use, &metric, &mask) == 8 && dest == 0 && mask == 0 && (flags & 1)) {
+			snprintf(out, outlen, "%s", iface);
+			break;
+		}
+	}
+	free(t);
+}
+
+/* UNIFI_REWRITE=plain sends the UniFi access token and the video in clear
+ * text: one WARN per camera it applies to. */
+static void check_unifi(struct doctor *d)
+{
+	if (!d->cfg_ok)
+		return;
+	char iface[32];
+	default_route_iface(iface, sizeof iface);
+	bool wifi = strncmp(iface, "wlan", 4) == 0;
+	for (int i = 0; i < d->cfg.count; i++) {
+		const struct layout_camera *c = &d->cfg.cam[i];
+		if (c->unifi != LAYOUT_UNIFI_PLAIN)
+			continue;
+		if (wifi)
+			add_check(d, L_WARN, "unifi",
+				  "remove UNIFI_REWRITE=plain from the config (the default, tls, keeps "
+				  "rtsps on port 7441), or connect the Pi by Ethernet",
+				  "%s: UNIFI_REWRITE=plain plays it as plain RTSP (port 7447) - the "
+				  "access token and the video are unencrypted, and the default route goes "
+				  "over Wi-Fi (%s): anyone in radio range of an open or shared network "
+				  "can capture them", c->name, iface);
+		else
+			add_check(d, L_WARN, "unifi",
+				  "remove UNIFI_REWRITE=plain from the config (the default, tls, keeps "
+				  "rtsps on port 7441)",
+				  "%s: UNIFI_REWRITE=plain plays it as plain RTSP (port 7447) - the "
+				  "access token and the video cross the network unencrypted", c->name);
 	}
 }
 
@@ -782,29 +882,56 @@ static void check_wifi(struct doctor *d)
 
 /* ------------------------------------------------------------------ --fix */
 
+/* Writes `text` to `path` via a temp file in the same directory (mkostemp:
+ * O_EXCL, and O_NOFOLLOW), fsyncs file and directory, renames, and
+ * sync()s: /boot/firmware is FAT, where a power cut right after the
+ * change must not leave a truncated config.txt. Returns 0, or -1 with
+ * errno set (nothing changed). */
 static int write_file_atomic(const char *path, const char *text, mode_t mode)
 {
-	char tmp[128];
-	snprintf(tmp, sizeof tmp, "%s.rtspwall-new", path);
-	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+	char tmp[160];
+	if (snprintf(tmp, sizeof tmp, "%s.rtspwall-XXXXXX", path) >= (int)sizeof tmp) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	int fd = mkostemp(tmp, O_CLOEXEC | O_NOFOLLOW);
 	if (fd < 0)
 		return -1;
+	(void)fchmod(fd, mode);     /* best effort: FAT has no modes */
 	size_t len = strlen(text), off = 0;
+	int e = 0;
 	while (off < len) {
 		ssize_t n = write(fd, text + off, len - off);
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n <= 0) {
-			close(fd);
-			unlink(tmp);
-			return -1;
+			e = n < 0 ? errno : EIO;
+			break;
 		}
 		off += (size_t)n;
 	}
-	if (fsync(fd) < 0 || close(fd) < 0 || rename(tmp, path) < 0) {
+	if (!e && fsync(fd) < 0)
+		e = errno;
+	if (close(fd) < 0 && !e)
+		e = errno;
+	if (!e && rename(tmp, path) < 0)
+		e = errno;
+	if (e) {
 		unlink(tmp);
+		errno = e;
 		return -1;
 	}
+	char dir[160];
+	snprintf(dir, sizeof dir, "%s", path);
+	char *slash = strrchr(dir, '/');
+	if (slash && slash != dir)
+		*slash = '\0';
+	int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dfd >= 0) {
+		fsync(dfd);
+		close(dfd);
+	}
+	sync();
 	return 0;
 }
 
@@ -818,18 +945,25 @@ static int do_fix(struct doctor *d, bool yes)
 		printf("\n--fix: no config.txt found under /boot/firmware or /boot\n");
 		return 1;
 	}
+	if (d->gpu_info.uncertain) {
+		printf("\n--fix: not changing %s: it sets gpu_mem under %s, and doctor cannot "
+		       "tell whether that applies to this Pi. Set gpu_mem=%d by hand (under [all])\n",
+		       d->configtxt_path, d->gpu_info.filter, d->gpu_needed);
+		return 1;
+	}
 	if (d->gpu_configtxt >= d->gpu_needed) {
-		printf("\n--fix: gpu_mem=%d is already in %s; it takes effect after: sudo reboot\n",
-		       d->gpu_configtxt, d->configtxt_path);
+		printf("\n--fix: %s=%d is already in %s; it takes effect after: sudo reboot\n",
+		       d->gpu_info.key, d->gpu_configtxt, d->configtxt_path);
 		return 0;
 	}
+	const char *key = d->gpu_info.key[0] ? d->gpu_info.key : "gpu_mem";
 	char q[256];
-	snprintf(q, sizeof q, "\nSet gpu_mem=%d in %s (a backup is made first)?", d->gpu_needed,
+	snprintf(q, sizeof q, "\nSet %s=%d in %s (a backup is made first)?", key, d->gpu_needed,
 		 d->configtxt_path);
 	if (!yes) {
 		if (!cli_interactive()) {
 			printf("\n--fix: not changing %s without a terminal; add --yes to apply "
-			       "gpu_mem=%d\n", d->configtxt_path, d->gpu_needed);
+			       "%s=%d\n", d->configtxt_path, key, d->gpu_needed);
 			return 1;
 		}
 		if (!cli_ask_yes_no(q)) {
@@ -849,7 +983,7 @@ static int do_fix(struct doctor *d, bool yes)
 	struct stat st;
 	mode_t mode = stat(d->configtxt_path, &st) == 0 ? st.st_mode & 07777 : 0644;
 
-	char backup[128], stamp[32];
+	char backup[140], stamp[32];
 	time_t now = time(NULL);
 	struct tm tm;
 	localtime_r(&now, &tm);
@@ -868,9 +1002,10 @@ static int do_fix(struct doctor *d, bool yes)
 		fprintf(stderr, "rtspwall: cannot write %s: %s (backup: %s)\n", d->configtxt_path,
 			strerror(errno), backup);
 	} else {
-		printf("set gpu_mem=%d in %s (backup: %s)\n"
-		       "takes effect after a reboot - not rebooting for you: sudo reboot\n",
-		       d->gpu_needed, d->configtxt_path, backup);
+		printf("set %s=%d in %s (backup: %s)\n"
+		       "takes effect after a reboot - not rebooting for you: sudo reboot\n"
+		       "undo:     sudo cp %s %s && sudo reboot\n",
+		       key, d->gpu_needed, d->configtxt_path, backup, backup, d->configtxt_path);
 		r = 0;
 	}
 	free(next);
@@ -1062,6 +1197,7 @@ int cmd_doctor(int argc, char **argv)
 		check_device_access(&d);
 	}
 	check_config_file(&d, cc_out, sizeof cc_out);
+	check_unifi(&d);
 	check_service(&d);
 	check_journal(&d);
 	check_kernel(&d);

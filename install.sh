@@ -19,6 +19,9 @@
 set -euo pipefail
 
 PREFIX=${PREFIX:-/usr/local}
+# PREFIX is sed-ed into the unit files and ends up in ExecStart=: allow only a
+# plain absolute path (no spaces, quotes, "|", "&", "\\", "%" or "$").
+[[ $PREFIX =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "Invalid PREFIX '$PREFIX': use an absolute path of letters, digits, . _ / - only." >&2; exit 2; }
 SVC_USER=rtspwall
 CONF_DIR=/etc/rtspwall
 CONF=$CONF_DIR/cameras.conf

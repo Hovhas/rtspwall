@@ -32,6 +32,8 @@ TimeoutStopSec=10
 #   systemctl start rtspwall; journalctl -u rtspwall -b
 #   systemd-analyze security rtspwall
 # ---------------------------------------------------------------------------
+# No core dumps: a crash must not write camera credentials (RTSP URLs) to disk.
+LimitCORE=0
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

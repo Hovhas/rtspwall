@@ -102,18 +102,41 @@ enum board_kind {
 /* Classifies the text of /proc/device-tree/model. */
 enum board_kind board_classify(const char *model);
 
-/* gpu_mem in MB from the text of config.txt, as the firmware on a Pi 4
- * would see it: plain `gpu_mem=` lines in the global part, [all] and [pi4]
- * sections count; other conditional sections ([pi5], [pi3], [cm4], [none],
- * ...) and comments are ignored. The last applicable line wins. Returns
- * -1 if unset (firmware default, 76 MB on a Pi 4). */
+/* gpu_mem as the firmware on a Pi 4 would read config.txt.
+ *
+ * Keys: `gpu_mem_1024=` applies to boards with >= 1 GB RAM — every Pi 4 —
+ * and overrides `gpu_mem=` wherever it appears; `gpu_mem_256=` and
+ * `gpu_mem_512=` only apply to 256/512 MB boards and are ignored. Within a
+ * key the last applicable line wins.
+ *
+ * Conditional filters stack until [all]: a model filter ([pi4], [pi5],
+ * [cm4], ...) replaces the previous model filter, other filters ([HDMI:0],
+ * [EDID=...], [gpio4=1], [0xSERIAL], [board-type=...], [tryboot], ...) are
+ * added to it. A line applies when every active filter holds. [pi4] holds,
+ * other model names and [none] (until [all]) do not, and every filter
+ * doctor cannot evaluate counts as "maybe": lines under it are not used
+ * for `value` but set `uncertain` when they could change the result, so
+ * the caller can WARN instead of reporting a wrong PASS. */
+struct configtxt_gpu {
+	int  value;              /* effective MB from definite lines, -1 = unset
+				    (firmware default, 76 MB on a Pi 4) */
+	const char *key;         /* "gpu_mem", "gpu_mem_1024" or "" */
+	bool uncertain;          /* a "maybe" line could override value */
+	char filter[64];         /* the first such filter, e.g. "[HDMI:0]" */
+};
+
+void configtxt_gpu_mem_info(const char *text, struct configtxt_gpu *out);
+
+/* Just the value of configtxt_gpu_mem_info. */
 int configtxt_gpu_mem(const char *text);
 
-/* Writes `text` to `out` with gpu_mem set to `mb`: an applicable existing
- * gpu_mem= line (see configtxt_gpu_mem) is rewritten in place, otherwise
- * "[all]\ngpu_mem=MB\n" is appended (an [all] header is needed because
- * the file may end inside a conditional section). Nothing else changes.
- * Returns 0, or -1 if `out` is too small. */
+/* Writes `text` to `out` with the effective gpu_mem set to `mb`: the
+ * definite line in effect (gpu_mem_1024 if set, else gpu_mem; see
+ * configtxt_gpu_mem_info) is rewritten in place, keeping its line ending
+ * (\r\n stays \r\n); otherwise "[all]\ngpu_mem=MB\n" is appended (an [all]
+ * header is needed because the file may end inside a conditional section;
+ * \r\n if the file uses \r\n). Nothing else changes. Returns 0, or -1 if
+ * `out` is too small. */
 int configtxt_set_gpu_mem(const char *text, int mb, char *out, size_t outlen);
 
 /* gpu_mem in MB the current camera load needs, or 0 if the firmware
@@ -169,6 +192,12 @@ const char *cfg_check_url(const char *url);
  * Returns 0, or -1 if `out` is too small. */
 int cfg_append_camera(const char *text, const char *name, const char *url, int cell,
 		      char *out, size_t outlen);
+
+/* Why a URL must not be given on the command line (argv ends up in shell
+ * history, `ps` and sudo's log): "a user name/password" for userinfo,
+ * "a query string" for ?/#, "a token-like path segment" for what
+ * layout_mask_url would mask. NULL if the URL carries none of these. */
+const char *url_secret_reason(const char *url);
 
 /* --------------------------------------------------------- report masking */
 

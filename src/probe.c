@@ -16,17 +16,23 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
 #include <libavutil/log.h>
 
 #include "cli.h"
+
+/* How long the PLAY fallback may read packets. */
+#define PROBE_FALLBACK_MS 3000
 
 static int64_t mono_ms(void)
 {
@@ -145,7 +151,7 @@ static void fill_from_stream(const AVStream *st, bool live, struct probe_result 
 		r->s.height = sps.height;
 		if (sps.fps > 0) {
 			r->s.fps = sps.fps;
-			r->fps_source = "VUI";
+			snprintf(r->fps_source, sizeof r->fps_source, "VUI");
 		}
 	}
 	if (r->s.width <= 0 || r->s.height <= 0) {
@@ -156,35 +162,109 @@ static void fill_from_stream(const AVStream *st, bool live, struct probe_result 
 		double f = q2d_ok(st->avg_frame_rate);
 		if (f > 0) {
 			r->s.fps = f;
-			r->fps_source = live ? "SDP" : "container";
+			snprintf(r->fps_source, sizeof r->fps_source, "%s", live ? "SDP" : "container");
 		} else if (!live && (f = q2d_ok(st->r_frame_rate)) > 0) {
 			r->s.fps = f;
-			r->fps_source = "container";
+			snprintf(r->fps_source, sizeof r->fps_source, "container");
 		}
 	}
 }
 
 int probe_url(const char *url, int timeout_ms, struct probe_result *r)
 {
+	probe_urls(&url, 1, timeout_ms, r);
+	return r->err == PROBE_OK ? 0 : -1;
+}
+
+/* What libav may touch. The local-file case reads through our own
+ * AVIOContext on an fd the parent opened, so it needs no protocol at all
+ * ("none" matches no protocol, so a demuxer cannot open nested files). */
+#define NET_PROTOCOLS  "rtsp,rtsps,tcp,udp,tls,rtp,srtp,crypto"
+#define NET_FORMATS    "rtsp,sdp,rtp"
+#define FILE_PROTOCOLS "none"
+#define FILE_FORMATS   "mov,mp4,matroska"
+#define CODECS         "h264"
+
+/* A probe target: a network URL, or a local file already opened (and
+ * checked to be a regular file) by the caller. */
+struct probe_target {
+	const char *url;
+	int fd;               /* local file, or -1 */
+	bool skip;            /* result already filled in (could not open) */
+};
+
+struct fd_io {
+	int fd;
+};
+
+static int fd_read(void *opaque, uint8_t *buf, int size)
+{
+	const struct fd_io *io = opaque;
+	ssize_t n;
+	do
+		n = read(io->fd, buf, (size_t)size);
+	while (n < 0 && errno == EINTR);
+	if (n == 0)
+		return AVERROR_EOF;
+	return n < 0 ? AVERROR(errno) : (int)n;
+}
+
+static int64_t fd_seek(void *opaque, int64_t off, int whence)
+{
+	const struct fd_io *io = opaque;
+	if (whence & AVSEEK_SIZE) {
+		struct stat st;
+		return fstat(io->fd, &st) == 0 ? (int64_t)st.st_size : AVERROR(errno);
+	}
+	off_t r = lseek(io->fd, (off_t)off, whence & ~AVSEEK_FORCE);
+	return r < 0 ? AVERROR(errno) : (int64_t)r;
+}
+
+/* The probe itself. Runs in the sandboxed child when root. */
+static void probe_do(const struct probe_target *t, int fd, int timeout_ms, struct probe_result *r)
+{
 	probe_init_libav();
 	memset(r, 0, sizeof *r);
+	r->uid = (int)getuid();
 	last_av_msg[0] = '\0';
 
 	int64_t t0 = mono_ms();
 	struct deadline dl = { t0 + timeout_ms };
-	bool rtsp = layout_url_is_rtsp(url);
-	bool live = layout_url_is_live(url);
+	bool file = fd >= 0;
+	bool rtsp = !file && layout_url_is_rtsp(t->url);
+	bool live = !file;
+
+	if (!file && !rtsp) {
+		r->err = PROBE_ERR_OTHER;
+		snprintf(r->detail, sizeof r->detail, "only rtsp://, rtsps:// and local files can "
+			 "be probed");
+		return;
+	}
 
 	AVFormatContext *ic = avformat_alloc_context();
-	if (!ic) {
+	AVIOContext *pb = NULL;
+	struct fd_io io = { fd };
+	if (ic && file) {
+		unsigned char *buf = av_malloc(32768);
+		pb = buf ? avio_alloc_context(buf, 32768, 0, &io, fd_read, NULL, fd_seek) : NULL;
+		if (!pb)
+			av_free(buf);
+		else
+			ic->pb = pb;
+	}
+	if (!ic || (file && !pb)) {
+		avformat_free_context(ic);
 		r->err = PROBE_ERR_OTHER;
 		snprintf(r->detail, sizeof r->detail, "out of memory");
-		return -1;
+		return;
 	}
 	ic->interrupt_callback.callback = interrupt_cb;
 	ic->interrupt_callback.opaque = &dl;
 
 	AVDictionary *opts = NULL;
+	av_dict_set(&opts, "protocol_whitelist", file ? FILE_PROTOCOLS : NET_PROTOCOLS, 0);
+	av_dict_set(&opts, "format_whitelist", file ? FILE_FORMATS : NET_FORMATS, 0);
+	av_dict_set(&opts, "codec_whitelist", CODECS, 0);
 	if (rtsp) {
 		char us[32];
 		snprintf(us, sizeof us, "%lld", (long long)timeout_ms * 1000);
@@ -193,7 +273,7 @@ int probe_url(const char *url, int timeout_ms, struct probe_result *r)
 		av_dict_set(&opts, "timeout", us, 0);          /* socket I/O, microseconds */
 	}
 
-	int e = avformat_open_input(&ic, url, NULL, &opts);   /* frees ic on failure */
+	int e = avformat_open_input(&ic, t->url, NULL, &opts);   /* frees ic on failure */
 	av_dict_free(&opts);
 	if (e < 0) {
 		bool interrupted = mono_ms() > dl.at_ms;
@@ -205,7 +285,11 @@ int probe_url(const char *url, int timeout_ms, struct probe_result *r)
 		else
 			snprintf(r->detail, sizeof r->detail, "%s", interrupted ? "no answer" : buf);
 		r->elapsed_ms = (int)(mono_ms() - t0);
-		return -1;
+		if (pb) {
+			av_freep(&pb->buffer);
+			avio_context_free(&pb);
+		}
+		return;
 	}
 
 	int vi = -1;
@@ -215,17 +299,21 @@ int probe_url(const char *url, int timeout_ms, struct probe_result *r)
 			break;
 		}
 
-	/* Without a video stream description in the SDP (unusual) a short read
-	 * may still find it; the fallback below handles both cases. */
+	/* The codec comes from the stream description (SDP / container): an
+	 * H.265 stream is recognised here, before any decoder exists. */
 	if (vi >= 0)
 		fill_from_stream(ic->streams[vi], live, r);
 
+	/* Without a video stream description in the SDP (unusual) a short read
+	 * may still find it. Only H.264 (or not yet known) streams get here,
+	 * and codec_whitelist=h264 keeps libavcodec from opening any other
+	 * decoder. */
 	bool need_more = vi < 0 ||
 			 ((r->s.codec == PROBE_CODEC_H264 || r->s.codec == PROBE_CODEC_UNKNOWN) &&
 			  (r->s.width <= 0 || r->s.height <= 0 || r->s.fps <= 0));
 	if (need_more) {
 		/* Fallback: PLAY and look at <= 2 s of packets. */
-		dl.at_ms = mono_ms() + 3000;
+		dl.at_ms = mono_ms() + PROBE_FALLBACK_MS;
 		if (rtsp)
 			av_read_play(ic);
 		ic->max_analyze_duration = 2 * AV_TIME_BASE;
@@ -240,55 +328,225 @@ int probe_url(const char *url, int timeout_ms, struct probe_result *r)
 				double fps_before = r->s.fps;
 				fill_from_stream(ic->streams[vi], live, r);
 				if (fps_before <= 0 && r->s.fps > 0)
-					r->fps_source = "packets";
+					snprintf(r->fps_source, sizeof r->fps_source, "packets");
 			}
 		}
 	}
 
 	avformat_close_input(&ic);   /* sends TEARDOWN */
+	if (pb) {
+		av_freep(&pb->buffer);
+		avio_context_free(&pb);
+	}
 	r->elapsed_ms = (int)(mono_ms() - t0);
 	if (vi < 0) {
 		r->err = PROBE_ERR_NO_VIDEO;
 		snprintf(r->detail, sizeof r->detail, "no video stream");
-		return -1;
+		return;
 	}
 	r->err = PROBE_OK;
-	return 0;
 }
 
-/* ------------------------------------------------------ parallel probing */
+/* ------------------------------------------------------- probe targets */
+
+/* "file:PATH" / "file://PATH" -> PATH. */
+static const char *file_path(const char *url)
+{
+	if (strncasecmp(url, "file:", 5) != 0)
+		return url;
+	url += 5;
+	if (url[0] == '/' && url[1] == '/')
+		url += 2;
+	return url;
+}
+
+/* Opens a local file for probing: as the user running rtspwall (root
+ * reads root-only files), and only if it is a regular file — never a
+ * FIFO, device or directory. The child gets the fd, not the path. */
+static void target_open(const char *url, struct probe_target *t, struct probe_result *r)
+{
+	t->url = url;
+	t->fd = -1;
+	t->skip = false;
+	if (layout_url_is_live(url))
+		return;
+
+	const char *path = file_path(url);
+	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
+	struct stat st;
+	if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+		memset(r, 0, sizeof *r);
+		r->err = PROBE_ERR_OTHER;
+		r->uid = (int)getuid();
+		snprintf(r->detail, sizeof r->detail, "%s", fd < 0 ? strerror(errno) :
+			 "not a regular file (only regular files are probed)");
+		if (fd >= 0)
+			close(fd);
+		t->skip = true;
+		return;
+	}
+	t->fd = fd;
+}
+
+/* -------------------------------------------------------- the sandbox */
 
 struct probe_job {
-	const char *url;
+	const struct probe_target *t;
 	int timeout_ms;
 	struct probe_result *res;
 };
 
+static void probe_child(void *ctx, int fd, void *out)
+{
+	const struct probe_job *j = ctx;
+	probe_do(j->t, fd, j->timeout_ms, out);
+}
+
+static bool known_fps_source(const char *s)
+{
+	static const char *const ok[] = { "", "VUI", "SDP", "container", "packets" };
+	for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++)
+		if (strcmp(s, ok[i]) == 0)
+			return true;
+	return false;
+}
+
+/* The child's result is untrusted input too: check every field before
+ * anything prints or adds it up. */
+static bool result_valid(struct probe_result *r, uid_t expected_uid)
+{
+	r->detail[sizeof r->detail - 1] = '\0';
+	r->codec_name[sizeof r->codec_name - 1] = '\0';
+	r->fps_source[sizeof r->fps_source - 1] = '\0';
+	layout_sanitize_log_text(r->detail);
+	layout_sanitize_log_text(r->codec_name);
+	const struct probe_stream *s = &r->s;
+	return (unsigned)r->err <= PROBE_ERR_OTHER &&
+	       (unsigned)s->codec <= PROBE_CODEC_OTHER &&
+	       s->width >= 0 && s->width <= 65536 && s->height >= 0 && s->height <= 65536 &&
+	       s->fps >= 0.0 && s->fps <= 240.0 &&
+	       s->profile_idc >= 0 && s->profile_idc <= 255 &&
+	       s->constraint_flags >= 0 && s->constraint_flags <= 255 &&
+	       s->level_idc >= 0 && s->level_idc <= 255 &&
+	       r->elapsed_ms >= 0 && known_fps_source(r->fps_source) &&
+	       r->uid == (int)expected_uid;
+}
+
+static void sandbox_failed(struct probe_result *r, const struct sandbox_job *j,
+			   const struct sandbox_user *u, int limit_ms)
+{
+	memset(r, 0, sizeof *r);
+	r->uid = -1;
+	r->elapsed_ms = j->status == SANDBOX_TIMEOUT ? limit_ms : 0;
+	switch (j->status) {
+	case SANDBOX_TIMEOUT:
+		r->err = PROBE_ERR_TIMEOUT;
+		snprintf(r->detail, sizeof r->detail, "no answer (probe process stopped after %d s)",
+			 limit_ms / 1000);
+		break;
+	case SANDBOX_CRASHED:
+		r->err = PROBE_ERR_OTHER;
+		snprintf(r->detail, sizeof r->detail, "the probe process died (signal %d, %s) while "
+			 "reading the stream: a malformed stream, or a bug - please report it",
+			 j->signo, strsignal(j->signo));
+		break;
+	case SANDBOX_NOPRIV:
+		r->err = PROBE_ERR_OTHER;
+		snprintf(r->detail, sizeof r->detail, "could not drop root privileges to user %s "
+			 "for the probe; not probing as root", u->name);
+		break;
+	default:
+		r->err = PROBE_ERR_OTHER;
+		snprintf(r->detail, sizeof r->detail, "the probe process %s",
+			 sandbox_status_text(j->status));
+		break;
+	}
+}
+
+static void probe_sandboxed(const struct probe_target *t, int n, int timeout_ms,
+			    struct probe_result *res)
+{
+	struct probe_job pj[LAYOUT_MAX_CAMERAS];
+	struct sandbox_job sj[LAYOUT_MAX_CAMERAS];
+	int idx[LAYOUT_MAX_CAMERAS], nj = 0;
+	const struct sandbox_user *u = sandbox_user();
+	/* The child stops itself after timeout + fallback; this is the hard
+	 * limit for a child that hangs anyway. */
+	int limit_ms = timeout_ms + PROBE_FALLBACK_MS + 2000;
+
+	for (int i = 0; i < n; i++) {
+		if (t[i].skip)
+			continue;
+		pj[nj] = (struct probe_job){ &t[i], timeout_ms, &res[i] };
+		sj[nj] = (struct sandbox_job){ .fn = probe_child, .ctx = &pj[nj], .fd = t[i].fd,
+					       .out = &res[i], .outlen = sizeof res[i] };
+		idx[nj++] = i;
+	}
+	sandbox_run(sj, nj, limit_ms);
+
+	bool debug = getenv("RTSPWALL_DEBUG") != NULL;
+	for (int k = 0; k < nj; k++) {
+		struct probe_result *r = &res[idx[k]];
+		if (sj[k].status != SANDBOX_OK) {
+			sandbox_failed(r, &sj[k], u, limit_ms);
+		} else if (!result_valid(r, u->uid)) {
+			memset(r, 0, sizeof *r);
+			r->err = PROBE_ERR_OTHER;
+			r->uid = -1;
+			snprintf(r->detail, sizeof r->detail, "the probe process returned an invalid "
+				 "result");
+		}
+		if (debug) {
+			char masked[LAYOUT_URL_MAX];
+			layout_mask_url(t[idx[k]].url, masked, sizeof masked);
+			fprintf(stderr, "debug: probe of %s: pid %d, ran as uid %d (%s), %s\n", masked,
+				(int)sj[k].pid, r->uid, u->name, sandbox_status_text(sj[k].status));
+		}
+	}
+}
+
+/* ------------------------------------------------------ parallel probing */
+
 static void *probe_thread(void *arg)
 {
 	struct probe_job *j = arg;
-	probe_url(j->url, j->timeout_ms, j->res);
+	probe_do(j->t, j->t->fd, j->timeout_ms, j->res);
 	return NULL;
 }
 
 void probe_urls(const char *const *urls, int n, int timeout_ms, struct probe_result *res)
 {
-	pthread_t th[LAYOUT_MAX_CAMERAS];
-	struct probe_job jobs[LAYOUT_MAX_CAMERAS];
-	bool started[LAYOUT_MAX_CAMERAS] = { false };
+	struct probe_target t[LAYOUT_MAX_CAMERAS];
 
-	probe_init_libav();
 	if (n > LAYOUT_MAX_CAMERAS)
 		n = LAYOUT_MAX_CAMERAS;
-	for (int i = 0; i < n; i++) {
-		jobs[i] = (struct probe_job){ urls[i], timeout_ms, &res[i] };
-		started[i] = pthread_create(&th[i], NULL, probe_thread, &jobs[i]) == 0;
-		if (!started[i])
-			probe_url(urls[i], timeout_ms, &res[i]);
+	for (int i = 0; i < n; i++)
+		target_open(urls[i], &t[i], &res[i]);
+
+	if (geteuid() == 0) {
+		/* Untrusted stream data is never parsed as root. */
+		probe_sandboxed(t, n, timeout_ms, res);
+	} else {
+		pthread_t th[LAYOUT_MAX_CAMERAS];
+		struct probe_job jobs[LAYOUT_MAX_CAMERAS];
+		bool started[LAYOUT_MAX_CAMERAS] = { false };
+
+		probe_init_libav();
+		for (int i = 0; i < n; i++) {
+			if (t[i].skip)
+				continue;
+			jobs[i] = (struct probe_job){ &t[i], timeout_ms, &res[i] };
+			started[i] = pthread_create(&th[i], NULL, probe_thread, &jobs[i]) == 0;
+			if (!started[i])
+				probe_do(&t[i], t[i].fd, timeout_ms, &res[i]);
+		}
+		for (int i = 0; i < n; i++)
+			if (started[i])
+				pthread_join(th[i], NULL);
 	}
 	for (int i = 0; i < n; i++)
-		if (started[i])
-			pthread_join(th[i], NULL);
+		if (t[i].fd >= 0)
+			close(t[i].fd);
 }
 
 /* ---------------------------------------------------------------- output */
@@ -338,7 +596,7 @@ enum budget_verdict probe_print_one(const char *url, const struct probe_result *
 			printf("size:     unknown\n");
 		if (r->s.fps > 0)
 			printf("fps:      %.2f (%s), budgeted as %d\n", r->s.fps,
-			       r->fps_source ? r->fps_source : "?", budget_nominal_fps(r->s.fps));
+			       r->fps_source[0] ? r->fps_source : "?", budget_nominal_fps(r->s.fps));
 		else
 			printf("fps:      unknown\n");
 		long mbps = budget_stream_mbps(r->s.width, r->s.height, r->s.fps);
@@ -399,6 +657,11 @@ enum budget_verdict probe_print_config(const struct layout_config *cfg, long *to
 		printf("%-14s %-5s %-24s %-10s %6s %7s  %s\n", c->name, cell, codec, size, fps,
 		       load, budget_verdict_name(v));
 		printf("    %s\n", masked);
+		if (c->unifi == LAYOUT_UNIFI_PLAIN)
+			printf("    WARNING: UNIFI_REWRITE=plain: plain RTSP on port 7447, the token "
+			       "and the video are unencrypted\n");
+		else if (c->unifi == LAYOUT_UNIFI_KEPT_TLS)
+			printf("    note: UniFi Protect over rtsps (TLS kept)\n");
 		if (hint[0])
 			printf("    fix: %s\n", hint);
 	}
@@ -430,10 +693,17 @@ static void probe_usage(FILE *out)
 		"Usage: rtspwall probe            (hidden prompt for the URL)\n"
 		"       rtspwall probe -          (read the URL from stdin)\n"
 		"       rtspwall probe CONFIG     (probe every camera, print the budget table)\n"
-		"       rtspwall probe URL        (works, but the URL ends up in shell history)\n"
+		"       rtspwall probe FILE       (a local video file: .mp4/.mov/.mkv)\n"
+		"       rtspwall probe URL        (only a URL without password, token or query:\n"
+		"                                  the command line ends up in shell history,\n"
+		"                                  `ps` and sudo's log)\n"
+		"\n"
+		"  --insecure-argv   accept a URL with a password/token on the command line\n"
+		"                    anyway\n"
 		"\n"
 		"Checks codec, profile, size and frame rate against the Pi 4 H.264 decoder\n"
 		"without playing the stream (RTSP DESCRIBE + SETUP, no PLAY), timeout %d s.\n"
+		"Run as root, each probe runs as the unprivileged user " SANDBOX_USER ".\n"
 		"Exit status: 0 PASS, 1 WARN, 2 FAIL or error.\n",
 		CLI_PROBE_TIMEOUT_MS / 1000);
 }
@@ -449,19 +719,57 @@ static bool ends_with(const char *s, const char *suffix)
 	return n >= m && strcmp(s + n - m, suffix) == 0;
 }
 
-/* Probes one URL as typed/pasted: UniFi Protect rtsps URLs are probed the
- * way the daemon will play them (layout_unifi_rewrite). */
-int probe_single(const char *url, struct probe_result *r, enum budget_verdict *v)
+/* Prints what UNIFI_REWRITE does with a UniFi Protect URL (nothing for
+ * other URLs). `use` is the URL the wall will play. */
+void probe_unifi_note(enum layout_unifi_result res, const char *use)
 {
-	char rewritten[LAYOUT_URL_MAX];
+	char masked[LAYOUT_URL_MAX];
+	layout_mask_url(use, masked, sizeof masked);
+	switch (res) {
+	case LAYOUT_UNIFI_KEPT_TLS:
+		printf("note:     UniFi Protect URL: the wall plays it as %s - rtsps, TLS is kept "
+		       "(UNIFI_REWRITE=tls, the default; only ?enableSrtp is dropped)\n", masked);
+		break;
+	case LAYOUT_UNIFI_PLAIN:
+		printf("WARNING:  UNIFI_REWRITE=plain: the wall plays this camera as %s - plain "
+		       "RTSP on port 7447, so the access token and the video cross the network "
+		       "UNENCRYPTED. Remove UNIFI_REWRITE=plain (default: tls) to keep TLS.\n",
+		       masked);
+		break;
+	case LAYOUT_UNIFI_OFF:
+		printf("note:     UniFi Protect URL, UNIFI_REWRITE=off: used exactly as written "
+		       "(rtsps, TLS)\n");
+		break;
+	case LAYOUT_UNIFI_NOT_UNIFI:
+		break;
+	}
+}
+
+/* UNIFI_REWRITE of the installed config, for a URL probed on its own;
+ * the default (tls) when there is none. */
+enum layout_unifi_mode probe_default_unifi_mode(void)
+{
+	static struct layout_config cfg;
+	char err[256];
+	if (access(CLI_DEFAULT_CONFIG, R_OK) == 0 &&
+	    cli_load_config(CLI_DEFAULT_CONFIG, &cfg, err, sizeof err) == 0)
+		return cfg.unifi_mode;
+	return LAYOUT_UNIFI_MODE_TLS;
+}
+
+/* Probes one URL as typed/pasted, the way the daemon will play it with
+ * UNIFI_REWRITE=`mode` (UniFi Protect rtsps URLs). */
+int probe_single(const char *url, enum layout_unifi_mode mode, struct probe_result *r,
+		 enum budget_verdict *v)
+{
+	char played[LAYOUT_URL_MAX];
+	enum layout_unifi_result res = LAYOUT_UNIFI_NOT_UNIFI;
 	const char *use = url;
 
-	if (layout_unifi_rewrite(url, rewritten, sizeof rewritten) == 1) {
-		char masked[LAYOUT_URL_MAX];
-		layout_mask_url(rewritten, masked, sizeof masked);
-		printf("note:     UniFi Protect URL; probed as %s (plain RTSP, as the wall "
-		       "plays it unless UNIFI_REWRITE=off)\n", masked);
-		use = rewritten;
+	if (layout_unifi_apply(url, mode, played, sizeof played, &res) == 0 &&
+	    res != LAYOUT_UNIFI_NOT_UNIFI) {
+		probe_unifi_note(res, played);
+		use = played;
 	}
 	probe_url(use, CLI_PROBE_TIMEOUT_MS, r);
 	*v = probe_print_one(use, r);
@@ -473,15 +781,22 @@ int cmd_probe(int argc, char **argv)
 	char url[LAYOUT_URL_MAX + 2];
 	struct probe_result r;
 	enum budget_verdict v;
+	bool insecure_argv = false;
+	const char *arg = NULL;
 
-	if (argc > 2) {
-		probe_usage(stderr);
-		return 2;
-	}
-	const char *arg = argc == 2 ? argv[1] : NULL;
-	if (arg && (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0)) {
-		probe_usage(stdout);
-		return 0;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+			probe_usage(stdout);
+			return 0;
+		}
+		if (strcmp(argv[i], "--insecure-argv") == 0) {
+			insecure_argv = true;
+		} else if (arg || (argv[i][0] == '-' && argv[i][1])) {
+			probe_usage(stderr);
+			return 2;
+		} else {
+			arg = argv[i];
+		}
 	}
 
 	if (!arg || strcmp(arg, "-") == 0) {
@@ -490,20 +805,39 @@ int cmd_probe(int argc, char **argv)
 		const char *why = cfg_check_url(url);
 		if (why)
 			fprintf(stderr, "rtspwall: note: %s\n", why);
-		return probe_single(url, &r, &v);
+		return probe_single(url, probe_default_unifi_mode(), &r, &v);
 	}
 
 	if (strstr(arg, "://")) {
+		const char *secret = url_secret_reason(arg);
+		if (secret && !insecure_argv) {
+			fprintf(stderr,
+				"rtspwall: not probing: this URL contains %s, and a command line is "
+				"saved in your shell history, visible in `ps` and logged by sudo.\n"
+				"Give the URL without the command line instead:\n"
+				"  sudo rtspwall probe              (hidden prompt; paste the URL)\n"
+				"  sudo rtspwall probe - < url.txt  (read it from stdin)\n"
+				"or add --insecure-argv to use it from the command line anyway.\n",
+				secret);
+			return 2;
+		}
 		fprintf(stderr, "rtspwall: note: a URL on the command line is saved in your shell "
 				"history and sudo's log; next time use the hidden prompt "
 				"(`rtspwall probe`)\n");
-		return probe_single(arg, &r, &v);
+		return probe_single(arg, probe_default_unifi_mode(), &r, &v);
 	}
 
-	/* A file: a config to probe camera by camera, or a local media file. */
+	/* A file: a config to probe camera by camera, or a local media file.
+	 * Only regular files: a FIFO or device would block or be read as
+	 * root. */
 	struct stat st;
 	if (stat(arg, &st) < 0) {
 		fprintf(stderr, "rtspwall: %s: %s\n", arg, strerror(errno));
+		return 2;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "rtspwall: %s: not a regular file (probe takes a URL, a config "
+				"file or a video file)\n", arg);
 		return 2;
 	}
 	static struct layout_config cfg;
@@ -517,5 +851,5 @@ int cmd_probe(int argc, char **argv)
 		fprintf(stderr, "rtspwall: %s\n", err);
 		return 2;
 	}
-	return probe_single(arg, &r, &v);
+	return probe_single(arg, probe_default_unifi_mode(), &r, &v);
 }

@@ -4,6 +4,7 @@
  * ffmpeg/libx264 6.1 for the sizes named.
  */
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -201,7 +202,8 @@ static void test_configtxt(void)
 	ASSERT_EQ_I(configtxt_gpu_mem("[pi5]\ngpu_mem=256\n[all]\n"), -1);
 	ASSERT_EQ_I(configtxt_gpu_mem("[cm4]\ngpu_mem=32\n[all]\ngpu_mem=96\n"), 96);
 	ASSERT_EQ_I(configtxt_gpu_mem("  gpu_mem = 200 \r\n"), 200);
-	ASSERT_EQ_I(configtxt_gpu_mem("gpu_mem_1024=300\n"), -1);   /* different key */
+	/* gpu_mem_1024 overrides gpu_mem on every Pi 4 (all have >= 1 GB). */
+	ASSERT_EQ_I(configtxt_gpu_mem("gpu_mem_1024=300\n"), 300);
 
 	char out[512];
 	ASSERT_EQ_I(configtxt_set_gpu_mem("dtparam=audio=on\n[pi5]\nfoo=1\n", 256, out, sizeof out), 0);
@@ -444,6 +446,286 @@ static void test_report_masking(void)
 	report_free(&r);
 }
 
+/* ------------------------------------------------ QA review of Phase A
+ * QA_KNOWN_BUGS: see test_layout.c. */
+
+/* Passes today (run under SANITIZE=1): the SPS/extradata parsers stay in
+ * bounds on random and truncated input. */
+static void qa_test_sps_parser_random_input(void)
+{
+	unsigned char buf[300];
+	struct h264_sps_info info;
+	unsigned seed = 12345;
+
+	for (int iter = 0; iter < 200000; iter++) {
+		size_t len = (size_t)(seed % sizeof buf);
+		for (size_t i = 0; i < len; i++) {
+			seed = seed * 1103515245u + 12345u;
+			buf[i] = (unsigned char)(seed >> 16);
+		}
+		seed = seed * 1103515245u + 12345u;
+		if (len > 0)
+			buf[0] = (iter & 1) ? 0x67 : 0x01;   /* SPS NAL / avcC */
+		if (h264_parse_sps(buf, len, &info) == 0) {
+			ASSERT(info.width > 0 && info.width <= 1024 * 16);
+			ASSERT(info.height > 0 && info.height <= 2 * 1024 * 16);
+		}
+		(void)h264_parse_extradata(buf, len, &info);
+	}
+	/* every prefix of a real SPS */
+	for (size_t n = 0; n <= sizeof sps_1080p_high_15; n++)
+		(void)h264_parse_sps(sps_1080p_high_15, n, &info);
+}
+
+static void qa_test_cfg_check_url_rejects_control_chars(void)
+{
+	ASSERT(cfg_check_url("rtsp://h/a\tb") != NULL);
+	ASSERT(cfg_check_url("rtsp://h/a\nb") != NULL);
+	ASSERT(cfg_check_url("rtsp://h/a\x1b[31m") != NULL);
+	ASSERT(cfg_check_url("rtsp://u:p%7Cq@h/a") == NULL);
+}
+
+/* Was a known bug (fixed): on a Pi 4 gpu_mem_1024= overrides gpu_mem=
+ * (likewise gpu_mem_256/512 on 256/512 MB boards). doctor read only gpu_mem
+ * and --fix wrote gpu_mem=256, which the firmware then ignored. */
+static void qa_test_configtxt_gpu_mem_1024_override(void)
+{
+	char out[256];
+	ASSERT_EQ_I(configtxt_set_gpu_mem("gpu_mem_1024=64\n", 256, out, sizeof out), 0);
+	ASSERT(strstr(out, "gpu_mem_1024=64") == NULL);
+}
+
+/* ------------------------------------------- review fixes (qa + security) */
+
+/* Bit writer for constructed SPS NAL units (the fixtures from the qa and
+ * security reviews: out-of-range Exp-Golomb values). */
+struct bw {
+	unsigned char b[256];
+	size_t bits;
+};
+
+static void bw_put(struct bw *w, uint64_t v, int n)
+{
+	while (n-- > 0) {
+		if (w->bits / 8 >= sizeof w->b)
+			return;
+		if ((v >> n) & 1)
+			w->b[w->bits / 8] |= (unsigned char)(0x80u >> (w->bits % 8));
+		w->bits++;
+	}
+}
+
+static void bw_ue(struct bw *w, uint32_t v)
+{
+	uint64_t x = (uint64_t)v + 1;
+	int len = 0;
+	while ((x >> len) > 1)
+		len++;
+	bw_put(w, 0, len);
+	bw_put(w, x, len + 1);
+}
+
+static void bw_se(struct bw *w, int64_t v)
+{
+	bw_ue(w, v > 0 ? (uint32_t)(2 * v - 1) : (uint32_t)(-2 * v));
+}
+
+/* RBSP trailing bits, then NAL header + emulation prevention. */
+static size_t bw_nal(struct bw *w, unsigned char *out, size_t cap)
+{
+	bw_put(w, 1, 1);
+	while (w->bits % 8)
+		bw_put(w, 0, 1);
+	size_t n = 0, zeros = 0;
+	out[n++] = 0x67;
+	for (size_t i = 0; i < w->bits / 8 && n + 2 < cap; i++) {
+		if (zeros >= 2 && w->b[i] <= 3) {
+			out[n++] = 3;
+			zeros = 0;
+		}
+		out[n++] = w->b[i];
+		zeros = w->b[i] == 0 ? zeros + 1 : 0;
+	}
+	return n;
+}
+
+/* 640x368 coded (40x23 MBs), displayed size set by the
+ * crop offsets; profile 100 with one scaling-list delta if scaling != 0. */
+static size_t make_sps(unsigned char *out, size_t cap, int profile, const uint32_t crop[4],
+		       int64_t scaling)
+{
+	struct bw w;
+	memset(&w, 0, sizeof w);
+	bw_put(&w, (uint64_t)profile, 8);
+	bw_put(&w, 0, 8);                /* constraint flags */
+	bw_put(&w, 30, 8);               /* level 3.0 */
+	bw_ue(&w, 0);                    /* sps_id */
+	if (profile == 100) {
+		bw_ue(&w, 1);            /* chroma 4:2:0 */
+		bw_ue(&w, 0);            /* bit depth luma */
+		bw_ue(&w, 0);            /* bit depth chroma */
+		bw_put(&w, 0, 1);        /* transform bypass */
+		bw_put(&w, scaling ? 1 : 0, 1);
+		if (scaling) {
+			bw_put(&w, 1, 1);        /* list 0 present */
+			bw_se(&w, scaling);
+			for (int j = 1; j < 16; j++)
+				bw_se(&w, 0);
+			for (int i = 1; i < 8; i++)
+				bw_put(&w, 0, 1);
+		}
+	}
+	bw_ue(&w, 0);                    /* log2_max_frame_num_minus4 */
+	bw_ue(&w, 0);                    /* poc type 0 */
+	bw_ue(&w, 0);                    /* log2_max_poc_lsb_minus4 */
+	bw_ue(&w, 1);                    /* max_num_ref_frames */
+	bw_put(&w, 0, 1);                /* gaps */
+	bw_ue(&w, 39);                   /* 40 MBs = 640 */
+	bw_ue(&w, 22);                   /* 23 MBs = 368 */
+	bw_put(&w, 1, 1);                /* frame_mbs_only */
+	bw_put(&w, 1, 1);                /* direct_8x8 */
+	bw_put(&w, 1, 1);                /* cropping */
+	for (int i = 0; i < 4; i++)
+		bw_ue(&w, crop[i]);
+	bw_put(&w, 0, 1);                /* no VUI */
+	return bw_nal(&w, out, cap);
+}
+
+static void test_sps_constructed_overflow(void)
+{
+	unsigned char nal[300];
+	struct h264_sps_info s;
+	const uint32_t ok_crop[4] = { 0, 0, 0, 4 };
+	size_t n;
+
+	n = make_sps(nal, sizeof nal, 66, ok_crop, 0);
+	ASSERT_EQ_I(h264_parse_sps(nal, n, &s), 0);
+	ASSERT_EQ_I(s.width, 640);
+	ASSERT_EQ_I(s.height, 360);
+
+	/* crop_left + crop_right wraps to 0 in uint32 arithmetic: must be
+	 * rejected, not read as an uncropped 640 pixels. */
+	const uint32_t wrap_lr[4] = { 0xFFFFFFFEu, 2, 0, 0 };
+	n = make_sps(nal, sizeof nal, 66, wrap_lr, 0);
+	ASSERT_EQ_I(h264_parse_sps(nal, n, &s), -1);
+	const uint32_t wrap_tb[4] = { 0, 0, 0xFFFFFFFEu, 2 };
+	n = make_sps(nal, sizeof nal, 66, wrap_tb, 0);
+	ASSERT_EQ_I(h264_parse_sps(nal, n, &s), -1);
+	const uint32_t huge[4] = { 0x7FFFFFFFu, 0, 0, 0 };
+	n = make_sps(nal, sizeof nal, 66, huge, 0);
+	ASSERT_EQ_I(h264_parse_sps(nal, n, &s), -1);
+
+	/* delta_scale far outside -128..127 (8 + 2147483647 was signed
+	 * overflow in skip_scaling_list; run with SANITIZE=1). */
+	n = make_sps(nal, sizeof nal, 100, ok_crop, 2147483647);
+	ASSERT_EQ_I(h264_parse_sps(nal, n, &s), 0);
+	ASSERT_EQ_I(s.width, 640);
+	n = make_sps(nal, sizeof nal, 100, ok_crop, -2147483647);
+	ASSERT_EQ_I(h264_parse_sps(nal, n, &s), 0);
+	ASSERT_EQ_I(s.height, 360);
+	n = make_sps(nal, sizeof nal, 100, ok_crop, 5);
+	ASSERT_EQ_I(h264_parse_sps(nal, n, &s), 0);
+	ASSERT_EQ_I(s.width, 640);
+}
+
+static void test_configtxt_variants(void)
+{
+	struct configtxt_gpu g;
+
+	/* gpu_mem_1024 applies to boards with >= 1 GB (every Pi 4) and
+	 * overrides gpu_mem wherever it is in the file. */
+	configtxt_gpu_mem_info("gpu_mem=128\ngpu_mem_1024=300\n", &g);
+	ASSERT_EQ_I(g.value, 300);
+	ASSERT(strcmp(g.key, "gpu_mem_1024") == 0);
+	ASSERT(!g.uncertain);
+	configtxt_gpu_mem_info("gpu_mem_1024=300\ngpu_mem=128\n", &g);
+	ASSERT_EQ_I(g.value, 300);
+	/* gpu_mem_256/512 only apply to 256/512 MB boards: never a Pi 4. */
+	configtxt_gpu_mem_info("gpu_mem_256=32\ngpu_mem_512=64\ngpu_mem=128\n", &g);
+	ASSERT_EQ_I(g.value, 128);
+	ASSERT(strcmp(g.key, "gpu_mem") == 0);
+	configtxt_gpu_mem_info("[pi5]\ngpu_mem_1024=16\n[all]\ngpu_mem=128\n", &g);
+	ASSERT_EQ_I(g.value, 128);
+	ASSERT(!g.uncertain);
+	configtxt_gpu_mem_info("", &g);
+	ASSERT_EQ_I(g.value, -1);
+	ASSERT(!g.uncertain);
+
+	/* Stacked filters: [pi4] then [HDMI:0] — both must hold, and doctor
+	 * cannot tell whether the HDMI filter matches: "maybe", not PASS. */
+	configtxt_gpu_mem_info("[pi4]\n[HDMI:0]\ngpu_mem=256\n", &g);
+	ASSERT_EQ_I(g.value, -1);
+	ASSERT(g.uncertain);
+	ASSERT(strstr(g.filter, "HDMI:0") != NULL);
+	configtxt_gpu_mem_info("gpu_mem=256\n[board-type=0x11]\ngpu_mem=64\n", &g);
+	ASSERT_EQ_I(g.value, 256);
+	ASSERT(g.uncertain);
+	ASSERT(strstr(g.filter, "board-type") != NULL);
+	configtxt_gpu_mem_info("[gpio4=1]\ngpu_mem=64\n", &g);
+	ASSERT(g.uncertain);
+	configtxt_gpu_mem_info("[0x12345678]\ngpu_mem_1024=64\n[all]\ngpu_mem=256\n", &g);
+	ASSERT_EQ_I(g.value, 256);
+	ASSERT(g.uncertain);          /* a maybe-gpu_mem_1024 would override */
+	/* A later definite line of the same key settles it. */
+	configtxt_gpu_mem_info("[HDMI:0]\ngpu_mem=64\n[all]\ngpu_mem=256\n", &g);
+	ASSERT_EQ_I(g.value, 256);
+	ASSERT(!g.uncertain);
+	/* A model filter that excludes the Pi 4 excludes it whatever else is
+	 * stacked on it. */
+	configtxt_gpu_mem_info("[pi4]\ngpu_mem=128\n[pi5]\n[HDMI:0]\ngpu_mem=64\n", &g);
+	ASSERT_EQ_I(g.value, 128);
+	ASSERT(!g.uncertain);
+	/* A maybe-gpu_mem under a definite gpu_mem_1024 does not matter. */
+	configtxt_gpu_mem_info("[pi4]\ngpu_mem_1024=64\n[HDMI:1]\ngpu_mem=256\n", &g);
+	ASSERT_EQ_I(g.value, 64);
+	ASSERT(!g.uncertain);
+	configtxt_gpu_mem_info("[none]\ngpu_mem=16\n[all]\ngpu_mem=96\n", &g);
+	ASSERT_EQ_I(g.value, 96);
+	ASSERT(!g.uncertain);
+
+	/* --fix rewrites the line that is in effect, keeping CRLF. */
+	char out[512];
+	ASSERT_EQ_I(configtxt_set_gpu_mem("gpu_mem=64\ngpu_mem_1024=64\n", 256, out, sizeof out), 0);
+	ASSERT(strcmp(out, "gpu_mem=64\ngpu_mem_1024=256\n") == 0);
+	ASSERT_EQ_I(configtxt_gpu_mem(out), 256);
+	ASSERT_EQ_I(configtxt_set_gpu_mem("gpu_mem=64\r\nb=2\r\n", 256, out, sizeof out), 0);
+	ASSERT(strcmp(out, "gpu_mem=256\r\nb=2\r\n") == 0);
+	ASSERT_EQ_I(configtxt_set_gpu_mem("a=1\r\n", 256, out, sizeof out), 0);
+	ASSERT(strcmp(out, "a=1\r\n[all]\r\ngpu_mem=256\r\n") == 0);
+}
+
+static void test_url_secret(void)
+{
+	ASSERT(url_secret_reason("rtsp://10.0.0.5:554/Streaming/Channels/101") == NULL);
+	ASSERT(url_secret_reason("rtsp://cam.local/h264Preview_01_main") == NULL);
+	ASSERT(url_secret_reason("/home/pi/clip.mp4") == NULL);
+	ASSERT(url_secret_reason("rtsp://admin:pw@10.0.0.5/x") != NULL);
+	ASSERT(url_secret_reason("rtsp://admin@10.0.0.5/x") != NULL);
+	ASSERT(url_secret_reason("rtsp://10.0.0.5/cam/realmonitor?channel=1") != NULL);
+	ASSERT(url_secret_reason("rtsp://10.0.0.5/x#frag") != NULL);
+	ASSERT(url_secret_reason("rtsps://192.168.1.1:7441/aB3dE5fG7hJ9kL1m") != NULL);
+	ASSERT(url_secret_reason("rtsp://10.0.0.5/0123456789abcdef0123456789abcdef") != NULL);
+}
+
+static void test_report_mask_more_keys(void)
+{
+	static const char *const masked[] = {
+		"pwd=Hx1", "PSW=Hx1", "loginPassword=Hx1", "Auth=Hx1", "api-key=Hx1",
+		"sig=Hx1", "SECRET=Hx1", "cred=Hx1", "x_signature=Hx1", "authKey=Hx1",
+		"loginpas=Hx1", "accesskey=Hx1",
+	};
+	char out[256];
+	for (size_t i = 0; i < sizeof masked / sizeof masked[0]; i++) {
+		report_mask_line(masked[i], out, sizeof out);
+		if (strstr(out, "Hx1")) {
+			fprintf(stderr, "not masked: %s -> %s\n", masked[i], out);
+			ASSERT(0);
+		}
+	}
+	report_mask_line("user=bob signal=11 path=/x", out, sizeof out);
+	ASSERT(strcmp(out, "user=bob signal=11 path=/x") == 0);
+}
+
 int main(void)
 {
 	test_sps_parse();
@@ -460,5 +742,16 @@ int main(void)
 	test_cfg_checks();
 	test_cfg_append();
 	test_report_masking();
+
+	/* QA review of Phase A */
+	qa_test_sps_parser_random_input();
+	qa_test_cfg_check_url_rejects_control_chars();
+	qa_test_configtxt_gpu_mem_1024_override();
+
+	/* review fixes */
+	test_sps_constructed_overflow();
+	test_configtxt_variants();
+	test_url_secret();
+	test_report_mask_more_keys();
 	return test_summary("test_clilogic");
 }

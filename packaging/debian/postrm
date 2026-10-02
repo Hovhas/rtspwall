@@ -8,7 +8,7 @@ case "$1" in
 esac
 
 if [ "$1" = purge ]; then
-    rm -rf /etc/rtspwall
+    rm -rf /etc/rtspwall /var/lib/rtspwall
     if getent passwd rtspwall >/dev/null; then deluser --system --quiet rtspwall || true; fi
     if getent group rtspwall >/dev/null; then delgroup --system --quiet rtspwall || true; fi
 fi

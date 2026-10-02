@@ -55,11 +55,36 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE" "$OUT"
 
 echo "== Building $NAME $VERSION ($DIST/$ARCH) =="
+# Hardened build: PIE, stack protector (-strong + clash protection), _FORTIFY_SOURCE,
+# full RELRO + BIND_NOW, CET/BTI branch protection where the arch has it.
+# dpkg-buildflags exports CFLAGS/CPPFLAGS/LDFLAGS; the Makefile keeps
+# its own warning flags (-Wall -Wextra -Werror) on top of them.
+command -v dpkg-buildflags >/dev/null || { echo "dpkg-buildflags missing (apt install dpkg-dev)." >&2; exit 1; }
+export DEB_BUILD_MAINT_OPTIONS="hardening=+all"
+eval "$(dpkg-buildflags --export=sh)"
+# Flags changed since any earlier plain build: always rebuild from scratch.
+make clean
 make VERSION="$VERSION"
 make test
 make demo-clips
 make VERSION="$VERSION" DESTDIR="$STAGE" PREFIX=/usr install
 strip --strip-unneeded "$STAGE/usr/bin/$NAME"
+if command -v hardening-check >/dev/null; then
+    # PIE, stack protector, fortify, relro, bindnow must all be "yes".
+    hc=$(hardening-check "$STAGE/usr/bin/$NAME" || true)
+    echo "$hc"
+    if grep -E 'Position Independent|Stack protected|Fortify|Read-only relocations|Immediate binding' <<<"$hc" \
+        | grep -qE 'no, |no$|unknown'; then
+        echo "hardening-check: a protection is missing in $NAME (see above)." >&2
+        exit 1
+    fi
+elif [ -n "${CI:-}" ]; then
+    # CI must prove the hardening, not silently skip it.
+    echo "hardening-check not installed in CI (apt install devscripts)." >&2
+    exit 1
+else
+    echo "hardening-check not installed (apt install devscripts); skipping" >&2
+fi
 
 # --- Files ---
 for u in "${UNITS[@]}"; do

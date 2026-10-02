@@ -456,14 +456,17 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	 * (plane never attached, or already detached) the wait never runs —
 	 * the while condition is false at once under the same lock
 	 * tearing_down was set under, so no race with the compositor is
-	 * possible. 2 s cap: the compositor may stand still (e.g. on quit,
-	 * when its own while (!quit) loop soon stops committing for the same
-	 * reason) — then give up and destroy the FB anyway instead of hanging
-	 * forever. */
+	 * possible. TEARDOWN_WAIT_S cap: the compositor may stand still (e.g.
+	 * on quit, when its own while (!quit) loop soon stops committing for
+	 * the same reason) — then give up and destroy the FB anyway instead of
+	 * hanging forever. The cap is longer than the compositor's flip
+	 * timeout (FLIP_TIMEOUT_US): an abandoned detach is NOT taken as
+	 * confirmed (see abandon_flip) but made again, and this wait must
+	 * outlast that second attempt. */
 	k->tearing_down = true;
 	struct timespec deadline;
 	clock_gettime(CLOCK_REALTIME, &deadline);
-	deadline.tv_sec += 2;
+	deadline.tv_sec += TEARDOWN_WAIT_S;
 	bool gave_up = false;
 	while ((k->plane_attached || k->in_flight != -1) && !quit) {
 		if (pthread_cond_timedwait(&k->detached, &k->lock, &deadline) == ETIMEDOUT) {
@@ -520,6 +523,11 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	}
 	k->shown = -1;
 	k->in_flight = -1;
+	k->n_limbo = 0;   /* the indices die with the buffers below */
+	/* complete_flip may have handed indices back while we waited (an old
+	 * "shown", parked limbo indices): they belong to the buffers torn
+	 * down below and must not be queued into the next connection. */
+	k->ring_head = k->ring_tail = 0;
 	pthread_mutex_unlock(&k->lock);
 	k->arrival_in = k->arrival_out = 0;
 
@@ -627,6 +635,13 @@ static void pace_file_packet(struct wall *v, struct camera *k, struct pacing_fil
 	k->last_packet_us = monotonic_us();   /* the wait is not a stall */
 }
 
+/* libavformat whitelists (see camera_thread). "sdp"/"rtp" for RTSP's
+ * internal RTP handling; the file demuxer names match the demuxers' name
+ * lists ("mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm"). */
+#define PROTOCOLS_NET "rtsp,rtsps,tcp,udp,tls,rtp,srtp,crypto"
+#define FORMATS_NET   "rtsp,sdp,rtp"
+#define FORMATS_FILE  "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm"
+
 /* Rewinds a file input to its start for the next loop. */
 static bool rewind_file(AVFormatContext *fc, int vstream)
 {
@@ -650,7 +665,8 @@ void *camera_thread(void *arg)
 	char masked[LAYOUT_URL_MAX];
 	layout_mask_url(k->url, masked, sizeof masked);
 
-	unsigned failures = 0;          /* failed attempts in a row */
+	struct pacing_backoff backoff;  /* failed attempts in a row, per fault */
+	pacing_backoff_init(&backoff);
 	pacing_dedup_init(&k->logdd, LOG_COLLAPSE_US);
 	atomic_store(&k->st_state, PACING_CAM_CONNECTING);
 	if (!live_src)
@@ -693,11 +709,30 @@ void *camera_thread(void *arg)
 			 * protects us, but we still set the real option as a
 			 * first line of defence. */
 			av_dict_set(&opt, "timeout", "5000000", 0);        /* 5 s */
+			/* Video only: no SETUP for the audio track. Besides
+			 * saving bandwidth this keeps the codec whitelist below
+			 * from failing (and logging) on every camera with audio
+			 * while avformat_find_stream_info probes it, which also
+			 * cost ~4 s per connect. */
+			av_dict_set(&opt, "allowed_media_types", "video", 0);
 		}
 		if (live_src) {
 			av_dict_set(&opt, "max_delay", "500000", 0);
 			av_dict_set(&opt, "fflags", "nobuffer", 0);
 		}
+		/* Defence in depth: libavformat would otherwise follow whatever
+		 * a URL or a server hands it (other protocols, any demuxer, any
+		 * decoder during probing). Only what a camera wall needs: RTSP(S)
+		 * over TCP/UDP/TLS for network streams, local files for the demo
+		 * clips, the MP4/Matroska demuxers for those, H.264 only. */
+		if (live_src) {
+			av_dict_set(&opt, "protocol_whitelist", PROTOCOLS_NET, 0);
+			av_dict_set(&opt, "format_whitelist", FORMATS_NET, 0);
+		} else {
+			av_dict_set(&opt, "protocol_whitelist", "file", 0);
+			av_dict_set(&opt, "format_whitelist", FORMATS_FILE, 0);
+		}
+		av_dict_set(&opt, "codec_whitelist", "h264", 0);
 
 		k->connections++;
 
@@ -778,6 +813,7 @@ void *camera_thread(void *arg)
 			snprintf(what, sizeof what, "the stream is %dx%d", cp->width, cp->height);
 			goto retry;
 		}
+		unsigned failures = pacing_backoff_total(&backoff);
 		if (failures)
 			log_msg("%s: connected, %dx%d (after %u failed attempt%s)", k->name,
 				cp->width, cp->height, failures, failures == 1 ? "" : "s");
@@ -901,6 +937,8 @@ retry:
 		 * else counts as a failed attempt and backs off by fault class. */
 		int64_t now = monotonic_us();
 		bool was_healthy = k->live_since_us && now - k->live_since_us >= 10 * 1000000LL;
+		if (k->live_since_us)
+			pacing_backoff_mark_live(&backoff);   /* 401/404 transient from now on */
 		if (k->live_since_us && now - k->live_since_us >= 60 * 1000000LL)
 			pacing_dedup_reset(&k->logdd);
 		k->live_since_us = 0;
@@ -911,12 +949,11 @@ retry:
 		atomic_store(&k->st_state, PACING_CAM_FAILING);
 
 		if (was_healthy) {
-			failures = 0;
+			pacing_backoff_reset(&backoff);
 			log_fault(k, fault, what, 0);
 			continue;
 		}
-		failures++;
-		int64_t delay_ms = pacing_backoff_ms(fault, failures);
+		int64_t delay_ms = pacing_backoff_next(&backoff, fault);
 		log_fault(k, fault, what, delay_ms);
 		for (int64_t waited = 0; waited < delay_ms && !quit; waited += 100)
 			usleep(100000);

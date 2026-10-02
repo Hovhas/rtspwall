@@ -54,18 +54,29 @@ static uint32_t ue(struct bits *b)
 	return ((1u << zeros) - 1) + bitsn(b, zeros);
 }
 
+/* Signed Exp-Golomb, clamped to +-65536: no syntax element the parser
+ * reads is legitimately larger (delta_scale is -128..127, the POC offsets
+ * are only skipped), and the clamp keeps every later sum far from int
+ * overflow on hostile input. */
+#define SE_LIMIT 65536
+
 static int32_t se(struct bits *b)
 {
 	uint32_t k = ue(b);
-	return (k & 1) ? (int32_t)((k + 1) / 2) : -(int32_t)(k / 2);
+	int64_t v = (k & 1) ? (int64_t)(((uint64_t)k + 1) / 2) : -(int64_t)(k / 2);
+	if (v > SE_LIMIT)
+		v = SE_LIMIT;
+	if (v < -SE_LIMIT)
+		v = -SE_LIMIT;
+	return (int32_t)v;
 }
 
 static void skip_scaling_list(struct bits *b, int size)
 {
 	int last = 8, next = 8;
 	for (int j = 0; j < size && !b->overrun; j++) {
-		if (next != 0)
-			next = (last + se(b) + 256) % 256;
+		if (next != 0)   /* (last + delta + 256) % 256, for any clamped delta */
+			next = ((last + se(b)) % 256 + 256) % 256;
 		last = next == 0 ? last : next;
 	}
 }
@@ -165,10 +176,16 @@ int h264_parse_sps(const unsigned char *nal, size_t len, struct h264_sps_info *o
 	}
 	int crop_x = (chroma == 0 || separate_planes) ? 1 : sub_w;
 	int crop_y = ((chroma == 0 || separate_planes) ? 1 : sub_h) * (2 - frame_mbs_only);
-	long width = (long)w_mbs * 16 - (long)crop_x * (crop_l + crop_r);
-	long height = (long)(2 - frame_mbs_only) * h_units * 16 - (long)crop_y * (crop_t + crop_b);
-	if (width <= 0 || height <= 0)
+	/* In 64 bits: crop_l + crop_r can wrap in 32 (0xfffffffe + 2 = 0),
+	 * which would read as "not cropped". The crop must leave a picture. */
+	uint64_t coded_w = (uint64_t)w_mbs * 16;
+	uint64_t coded_h = (uint64_t)(2 - frame_mbs_only) * h_units * 16;
+	uint64_t cut_w = (uint64_t)crop_x * ((uint64_t)crop_l + crop_r);
+	uint64_t cut_h = (uint64_t)crop_y * ((uint64_t)crop_t + crop_b);
+	if (cut_w >= coded_w || cut_h >= coded_h)
 		return -1;
+	long width = (long)(coded_w - cut_w);
+	long height = (long)(coded_h - cut_h);
 
 	double fps = 0.0;
 	if (bit1(&b)) {                    /* vui_parameters_present */
@@ -426,15 +443,66 @@ enum board_kind board_classify(const char *model)
 	return BOARD_OLDER_PI;
 }
 
-/* Iterates config.txt lines; calls fn for each applicable gpu_mem line. */
-struct ctxt_line {
-	const char *start, *end;    /* line without '\n' */
-	bool applicable;            /* firmware on a Pi 4 reads this line */
-	bool is_gpu_mem;
-	int  value;
+/* config.txt, line by line, with the conditional filters evaluated for a
+ * Raspberry Pi 4 Model B (see clilogic.h). */
+enum tri { TRI_NO, TRI_MAYBE, TRI_YES };
+
+enum gpu_key { KEY_NONE, KEY_GPU_MEM, KEY_GPU_MEM_1024, KEY_COUNT };
+
+static const char *const gpu_key_name[KEY_COUNT] = { "", "gpu_mem", "gpu_mem_1024" };
+
+struct ctxt_state {
+	enum tri model;          /* the last model filter ([pi4] yes, [pi5] no) */
+	bool none;               /* [none] since the last [all] */
+	bool other;              /* a filter doctor cannot evaluate is active */
+	char filter[64];         /* the first of those, for the message */
 };
 
-static const char *next_line(const char *p, struct ctxt_line *l, bool *section_ok)
+struct ctxt_line {
+	const char *start, *end; /* line without '\n' (may end in '\r') */
+	enum tri applies;
+	enum gpu_key key;
+	int value;
+};
+
+static void ctxt_reset(struct ctxt_state *st)
+{
+	st->model = TRI_YES;
+	st->none = false;
+	st->other = false;
+	st->filter[0] = '\0';
+}
+
+/* [pi4], [pi400], [cm4], [pi02], [pi3+], ... */
+static bool is_model_filter(const char *s, size_t n)
+{
+	if (n < 3 || !((s[0] == 'p' && s[1] == 'i') || (s[0] == 'c' && s[1] == 'm')))
+		return false;
+	for (size_t i = 2; i < n; i++)
+		if (!isalnum((unsigned char)s[i]) && s[i] != '+')
+			return false;
+	return true;
+}
+
+/* s/n: the text between '[' and ']'. */
+static void ctxt_section(struct ctxt_state *st, const char *s, size_t n)
+{
+	if (n == 3 && strncasecmp(s, "all", 3) == 0) {
+		ctxt_reset(st);
+	} else if (n == 4 && strncasecmp(s, "none", 4) == 0) {
+		st->none = true;
+	} else if (is_model_filter(s, n)) {
+		st->model = n == 3 && strncmp(s, "pi4", 3) == 0 ? TRI_YES : TRI_NO;
+	} else {
+		/* [HDMI:0], [EDID=...], [gpio4=1], [0x1234abcd], [board-type=...],
+		 * [tryboot], anything unknown: may or may not hold on this Pi. */
+		st->other = true;
+		if (!st->filter[0])
+			snprintf(st->filter, sizeof st->filter, "[%.*s]", (int)(n < 60 ? n : 60), s);
+	}
+}
+
+static const char *next_line(const char *p, struct ctxt_line *l, struct ctxt_state *st)
 {
 	if (!*p)
 		return NULL;
@@ -451,13 +519,13 @@ static const char *next_line(const char *p, struct ctxt_line *l, bool *section_o
 	while (e > s && isspace((unsigned char)e[-1]))
 		e--;
 
-	l->is_gpu_mem = false;
-	l->applicable = *section_ok;
+	l->key = KEY_NONE;
+	l->applies = st->none || st->model == TRI_NO ? TRI_NO : st->other ? TRI_MAYBE : TRI_YES;
 	if (s < e && *s == '[') {
-		size_t n = (size_t)(e - s);
-		*section_ok = (n == 5 && strncasecmp(s, "[all]", 5) == 0) ||
-			      (n == 5 && strncasecmp(s, "[pi4]", 5) == 0);
-		l->applicable = false;
+		const char *close = memchr(s, ']', (size_t)(e - s));
+		if (close)
+			ctxt_section(st, s + 1, (size_t)(close - s - 1));
+		l->applies = TRI_NO;
 		return p;
 	}
 	if (s < e && *s == '#')
@@ -469,48 +537,106 @@ static const char *next_line(const char *p, struct ctxt_line *l, bool *section_o
 	const char *k_end = eq;
 	while (k_end > s && isspace((unsigned char)k_end[-1]))
 		k_end--;
-	if ((size_t)(k_end - s) == 7 && strncmp(s, "gpu_mem", 7) == 0) {
-		const char *v = eq + 1;
-		while (v < e && isspace((unsigned char)*v))
-			v++;
-		l->is_gpu_mem = true;
-		l->value = atoi(v);
-	}
+	size_t kn = (size_t)(k_end - s);
+	for (int k = KEY_GPU_MEM; k < KEY_COUNT; k++)
+		if (kn == strlen(gpu_key_name[k]) && strncmp(s, gpu_key_name[k], kn) == 0) {
+			const char *v = eq + 1;
+			while (v < e && isspace((unsigned char)*v))
+				v++;
+			l->key = (enum gpu_key)k;
+			l->value = atoi(v);
+		}
 	return p;
+}
+
+/* Per key: the last definite line, and whether a "maybe" line of the same
+ * key came after it. */
+struct ctxt_scan {
+	bool set[KEY_COUNT];
+	int  value[KEY_COUNT];
+	const char *start[KEY_COUNT], *end[KEY_COUNT];
+	bool maybe_after[KEY_COUNT];
+	char maybe_filter[KEY_COUNT][64];
+};
+
+static void ctxt_scan(const char *text, struct ctxt_scan *sc)
+{
+	struct ctxt_state st;
+	struct ctxt_line l;
+
+	memset(sc, 0, sizeof *sc);
+	ctxt_reset(&st);
+	for (const char *p = text; (p = next_line(p, &l, &st)) != NULL;) {
+		if (l.key == KEY_NONE)
+			continue;
+		if (l.applies == TRI_YES) {
+			sc->set[l.key] = true;
+			sc->value[l.key] = l.value;
+			sc->start[l.key] = l.start;
+			sc->end[l.key] = l.end;
+			sc->maybe_after[l.key] = false;
+		} else if (l.applies == TRI_MAYBE) {
+			if (!sc->maybe_after[l.key])
+				snprintf(sc->maybe_filter[l.key], sizeof sc->maybe_filter[0], "%s",
+					 st.filter);
+			sc->maybe_after[l.key] = true;
+		}
+	}
+}
+
+static enum gpu_key effective_key(const struct ctxt_scan *sc)
+{
+	return sc->set[KEY_GPU_MEM_1024] ? KEY_GPU_MEM_1024 :
+	       sc->set[KEY_GPU_MEM] ? KEY_GPU_MEM : KEY_NONE;
+}
+
+void configtxt_gpu_mem_info(const char *text, struct configtxt_gpu *out)
+{
+	struct ctxt_scan sc;
+
+	memset(out, 0, sizeof *out);
+	ctxt_scan(text, &sc);
+	enum gpu_key k = effective_key(&sc);
+	out->value = k == KEY_NONE ? -1 : sc.value[k];
+	out->key = gpu_key_name[k];
+	/* A maybe-gpu_mem_1024 would override anything; a maybe-gpu_mem only
+	 * matters while no definite gpu_mem_1024 overrides it. */
+	if (sc.maybe_after[KEY_GPU_MEM_1024]) {
+		out->uncertain = true;
+		snprintf(out->filter, sizeof out->filter, "%s", sc.maybe_filter[KEY_GPU_MEM_1024]);
+	} else if (!sc.set[KEY_GPU_MEM_1024] && sc.maybe_after[KEY_GPU_MEM]) {
+		out->uncertain = true;
+		snprintf(out->filter, sizeof out->filter, "%s", sc.maybe_filter[KEY_GPU_MEM]);
+	}
 }
 
 int configtxt_gpu_mem(const char *text)
 {
-	struct ctxt_line l;
-	bool section_ok = true;
-	int value = -1;
-
-	for (const char *p = text; (p = next_line(p, &l, &section_ok)) != NULL;)
-		if (l.is_gpu_mem && l.applicable)
-			value = l.value;
-	return value;
+	struct configtxt_gpu g;
+	configtxt_gpu_mem_info(text, &g);
+	return g.value;
 }
 
 int configtxt_set_gpu_mem(const char *text, int mb, char *out, size_t outlen)
 {
-	struct ctxt_line l;
-	bool section_ok = true;
-	const char *last_start = NULL, *last_end = NULL;
-
-	for (const char *p = text; (p = next_line(p, &l, &section_ok)) != NULL;)
-		if (l.is_gpu_mem && l.applicable) {
-			last_start = l.start;
-			last_end = l.end;
-		}
+	struct ctxt_scan sc;
+	ctxt_scan(text, &sc);
+	enum gpu_key k = effective_key(&sc);
 
 	int n;
-	if (last_start) {
-		n = snprintf(out, outlen, "%.*s" "gpu_mem=%d" "%s",
-			     (int)(last_start - text), text, mb, last_end);
+	if (k != KEY_NONE) {
+		const char *end = sc.end[k];
+		if (end > sc.start[k] && end[-1] == '\r')
+			end--;          /* keep the line's \r\n */
+		n = snprintf(out, outlen, "%.*s" "%s=%d" "%s",
+			     (int)(sc.start[k] - text), text, gpu_key_name[k], mb, end);
 	} else {
 		size_t len = strlen(text);
+		const char *nl1 = strchr(text, '\n');
+		const char *eol = nl1 && nl1 > text && nl1[-1] == '\r' ? "\r\n" : "\n";
 		bool nl = len == 0 || text[len - 1] == '\n';
-		n = snprintf(out, outlen, "%s%s[all]\ngpu_mem=%d\n", text, nl ? "" : "\n", mb);
+		n = snprintf(out, outlen, "%s%s[all]%sgpu_mem=%d%s", text, nl ? "" : eol, eol, mb,
+			     eol);
 	}
 	return (n < 0 || (size_t)n >= outlen) ? -1 : 0;
 }
@@ -668,20 +794,62 @@ int cfg_append_camera(const char *text, const char *name, const char *url, int c
 	return (n < 0 || (size_t)n >= outlen) ? -1 : 0;
 }
 
+const char *url_secret_reason(const char *url)
+{
+	const char *sch = strstr(url, "://");
+	if (!sch)
+		return NULL;                       /* a local file */
+	const char *auth = sch + 3;
+	size_t an = strcspn(auth, "/?#");
+	if (memchr(auth, '@', an))
+		return "a user name/password";
+	if (strpbrk(auth + an, "?#"))
+		return "a query string";
+	char masked[LAYOUT_URL_MAX];
+	layout_mask_url(url, masked, sizeof masked);
+	if (strcmp(masked, url) != 0)
+		return "a token-like path segment";
+	return NULL;
+}
+
 /* =========================================================== report masking */
 
+/* Key names that mark the value as a secret (case-insensitive). Long
+ * words match anywhere in the key ("loginPassword", "x_signature"); the
+ * short ones only as a whole component between '_', '-' and '.' ("sig",
+ * "api-key", "Auth") or, for key/pwd/psw, at the end of one ("apikey",
+ * "accesskey", "userpwd") — so "signal" or "author" stay readable. */
 static bool secret_key(const char *k, size_t n)
 {
-	static const char *words[] = { "pass", "token", "secret", "apikey", "api_key", "credential" };
+	static const char *const anywhere[] = { "pass", "token", "secret", "cred", "apikey",
+						"api_key", "signature", "loginpas" };
+	static const char *const component[] = { "pwd", "psw", "key", "sig", "auth" };
 	char low[64];
 	if (n == 0 || n >= sizeof low)
 		return false;
 	for (size_t i = 0; i < n; i++)
 		low[i] = (char)tolower((unsigned char)k[i]);
 	low[n] = '\0';
-	for (size_t i = 0; i < sizeof words / sizeof words[0]; i++)
-		if (strstr(low, words[i]))
+	for (size_t i = 0; i < sizeof anywhere / sizeof anywhere[0]; i++)
+		if (strstr(low, anywhere[i]))
 			return true;
+	for (char *c = low; *c;) {
+		size_t cn = strcspn(c, "_-.");
+		for (size_t i = 0; i < sizeof component / sizeof component[0]; i++) {
+			const char *w = component[i];
+			size_t wn = strlen(w);
+			if (cn == wn && strncmp(c, w, wn) == 0)
+				return true;
+			if (cn > wn && w[0] != 's' && w[0] != 'a' && strncmp(c + cn - wn, w, wn) == 0)
+				return true;     /* ...key, ...pwd, ...psw */
+			if (cn > wn && w[0] == 'a' && strncmp(c, w, wn) == 0 &&
+			    strncmp(c, "author", 6) != 0)
+				return true;     /* authkey, authtoken, ... */
+		}
+		c += cn;
+		if (*c)
+			c++;
+	}
 	return false;
 }
 

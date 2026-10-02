@@ -36,6 +36,10 @@ SupplementaryGroups=video render
 # restart loop:
 #   2 = config error / no cameras configured   (fix cameras.conf)
 #   3 = no H.264 hardware decoder (e.g. Pi 5)  (unsupported hardware)
+# 2 and 3 are used ONLY for permanent errors: transient start-up conditions
+# (no screen yet, DRM busy, network not up) make the daemon wait instead of
+# exiting, so they never reach these codes. A unit that ends up "failed" with
+# 2/3 is restarted by rtspwall-config.service after the config is fixed.
 Restart=on-failure
 RestartPreventExitStatus=2 3
 RestartSec=2
@@ -55,6 +59,8 @@ TimeoutStopSec=10
 #   systemctl start rtspwall; journalctl -u rtspwall -b
 #   systemd-analyze security rtspwall
 # ---------------------------------------------------------------------------
+# No core dumps: a crash must not write camera credentials (RTSP URLs) to disk.
+LimitCORE=0
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

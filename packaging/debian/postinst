@@ -43,25 +43,17 @@ case "$1" in
             systemctl daemon-reload || true
             # First install: watch cameras.conf for edits. Enabling the .path
             # unit does not start the wall; rtspwall.service stays disabled.
-            # (On upgrade an administrator's choice to disable it is kept.)
-            if [ -z "$2" ]; then
+            # Enabled on first install ($2 empty) and on re-install after
+            # "apt remove" (prerm left a marker because the package itself had
+            # it enabled; dpkg gives $2 = old version then). On a plain upgrade
+            # without marker an administrator's choice to disable it is kept.
+            marker=/var/lib/rtspwall/config-path-was-enabled
+            if [ -z "$2" ] || [ -e "$marker" ]; then
                 systemctl enable --now rtspwall-config.path >/dev/null 2>&1 || true
             fi
+            rm -f "$marker"
             # Upgrade: restart only if it was already running.
             systemctl try-restart rtspwall.service || true
-        fi
-
-        gpu=""
-        for f in /boot/firmware/config.txt /boot/config.txt; do
-            if [ -f "$f" ]; then
-                gpu=$(sed -n 's/^gpu_mem=\([0-9]\{1,\}\)[[:space:]]*$/\1/p' "$f" | tail -n1)
-                break
-            fi
-        done
-        if [ -z "$gpu" ] || [ "$gpu" -lt 256 ]; then
-            echo "rtspwall: WARNING: gpu_mem is ${gpu:-unset (default)} in config.txt;" >&2
-            echo "rtspwall: 4 or more concurrent 1080p decoders need 256. Run" >&2
-            echo "rtspwall: 'sudo rtspwall doctor --fix' (asks first, makes a backup), then reboot." >&2
         fi
 
         cat >&2 <<'NEXT'
@@ -69,6 +61,8 @@ rtspwall: installed. The wall is NOT started automatically. Next steps:
   sudo rtspwall demo          # 2x2 test wall, no cameras needed
   sudo rtspwall probe         # check a camera URL (codec, size, decoder budget)
   sudo rtspwall add NAME      # add a camera and start the wall
+After adding your cameras, run `sudo rtspwall doctor` once: it tells you
+if gpu_mem must be raised (and 'sudo rtspwall doctor --fix' repairs it).
 NEXT
         ;;
     abort-upgrade | abort-remove | abort-deconfigure) ;;

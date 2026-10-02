@@ -18,6 +18,9 @@ cd "$(dirname "$0")"
 
 CONF_DIR=/etc/rtspwall
 PREFIX=/usr/local
+# PREFIX is sed-ed into the unit files and ends up in ExecStart=: allow only a
+# plain absolute path (no spaces, quotes, "|", "&", "\\", "%" or "$").
+[[ $PREFIX =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "Invalid PREFIX '$PREFIX': use an absolute path of letters, digits, . _ / - only." >&2; exit 2; }
 UNIT_DIR=/etc/systemd/system
 UNITS=(rtspwall.service rtspwall-demo.service rtspwall-config.service rtspwall-config.path)
 

@@ -54,6 +54,27 @@ enum layout_ffmpeg_log {
 /* "quiet", "error", "warning" or "info" for a level. */
 const char *layout_ffmpeg_log_name(enum layout_ffmpeg_log level);
 
+/* UNIFI_REWRITE: what to do with UniFi Protect rtsps://HOST:7441/TOKEN URLs. */
+enum layout_unifi_mode {
+	LAYOUT_UNIFI_MODE_TLS,     /* default ("auto" is an alias): keep rtsps on 7441,
+				    * drop the Protect-only ?enableSrtp parameter */
+	LAYOUT_UNIFI_MODE_PLAIN,   /* rewrite to plain rtsp:// on port 7447 (the token
+				    * and the video travel unencrypted) */
+	LAYOUT_UNIFI_MODE_OFF,     /* leave the URL exactly as written */
+};
+
+/* What layout_unifi_apply did with one URL. */
+enum layout_unifi_result {
+	LAYOUT_UNIFI_NOT_UNIFI,    /* not a UniFi Protect rtsps URL: unchanged */
+	LAYOUT_UNIFI_KEPT_TLS,     /* UniFi, tls: rtsps/7441 kept, Protect parameters
+				    * removed (the URL may be unchanged if it had none) */
+	LAYOUT_UNIFI_PLAIN,        /* UniFi, plain: rewritten to rtsp:// port 7447 */
+	LAYOUT_UNIFI_OFF,          /* UniFi, off: unchanged */
+};
+
+/* "tls", "plain" or "off". */
+const char *layout_unifi_mode_name(enum layout_unifi_mode mode);
+
 /* ------------------------------------------------------------ single line */
 
 enum config_line_type {
@@ -101,7 +122,8 @@ struct layout_camera {
 	int  width, height, x, y;     /* tile on screen; set by layout_apply in grid mode */
 	int  delay_ms;                /* optional last field, default 0 */
 	int  n_numbers;               /* internal: numeric fields seen on the line */
-	bool unifi_rewritten;         /* url was rewritten by layout_unifi_rewrite */
+	bool unifi_rewritten;         /* url was rewritten to plain RTSP (UNIFI_REWRITE=plain) */
+	enum layout_unifi_result unifi;   /* what UNIFI_REWRITE did with url */
 };
 
 struct layout_config {
@@ -114,7 +136,8 @@ struct layout_config {
 	enum layout_ffmpeg_log ffmpeg_loglevel;   /* FFMPEG_LOGLEVEL */
 	int  mode_w, mode_h;          /* MODE=WxH[@Hz]; 0/0 = auto */
 	int  mode_mhz;                /* refresh in mHz, 0 = any */
-	bool unifi_rewrite;           /* UNIFI_REWRITE=auto (true, default) | off */
+	enum layout_unifi_mode unifi_mode;   /* UNIFI_REWRITE=tls (default, alias auto)
+					      * | plain | off */
 
 	struct layout_camera cam[LAYOUT_MAX_CAMERAS];
 	int  count;
@@ -140,19 +163,29 @@ int layout_parse(struct layout_config *cfg, const char *text,
  *
  * Always errors, in both modes:
  *   - a placeholder (see layout_has_placeholder) in a camera field or a
- *     global value, reported with its line number;
+ *     global value, reported with its line number. For the URL field the
+ *     message never repeats any part of the URL ("placeholder in the URL
+ *     of camera X"), because whatever looked like a placeholder may be
+ *     part of a real password;
  *   - a file without a single camera line: "no cameras configured: ..."
  *     (file-level message, no line number).
  * Unknown keys: warning (default) or error (LAYOUT_PARSE_STRICT), with
  * "did you mean X?" from layout_suggest_key when a known key is close.
- * When UNIFI_REWRITE is auto (the default) every camera URL is passed
- * through layout_unifi_rewrite after the whole file has been read;
- * rewritten cameras get unifi_rewritten = true (the caller logs it). */
+ * A URL with unencoded " ' < > { } \ ^ ` gets a warning (not an error)
+ * that names the camera and the characters, never the URL.
+ * After the whole file has been read every camera URL is passed through
+ * layout_unifi_apply with UNIFI_REWRITE (default tls); the result is in
+ * cam[i].unifi, and unifi_rewritten is true for a plain rewrite (the
+ * caller logs it). */
 int layout_parse_flags(struct layout_config *cfg, const char *text, unsigned flags,
 		       layout_warn_fn warn, void *warn_ctx, char *err, size_t errlen);
 
-/* True if `s` contains a template placeholder: "CHANGE_ME" (any case) or
- * "<something>" (a '<', at least one character, then '>'). */
+/* True if `s` contains a template placeholder: "CHANGE_ME" (any case)
+ * anywhere, or a whole field/segment of the form "<something>" (a '<', at
+ * least one character, then '>'), where segments are separated by any of
+ * : / @ ? & = # ; [ ] , | and whitespace. So "rtsp://<user>:<password>@
+ * <ip>/s" and "<name>" are placeholders, but a real password such as
+ * "ab<c>d" is not. */
 bool layout_has_placeholder(const char *s);
 
 /* Case-insensitive Levenshtein distance (edit distance). Strings longer
@@ -208,12 +241,29 @@ int layout_select_mode(const struct layout_mode *m, int n, int want_w, int want_
 /* ------------------------------------------------------------ URL helpers */
 
 /* UniFi Protect shows its streams as rtsps://HOST:7441/TOKEN?enableSrtp.
- * If `url` is such a URL (scheme rtsps, any case, port 7441) writes the
- * plain-RTSP equivalent to `out`: scheme rtsp, port 7447, userinfo/host/
- * path kept, every "enableSrtp" query parameter removed (the '?' too if
- * nothing is left). Returns 1 if rewritten, 0 if `url` is not a UniFi
- * Protect rtsps URL (out = copy of url), -1 if `out` is too small (out is
- * NUL-terminated but incomplete). */
+ * A UniFi Protect URL here is scheme rtsps (any case) with port 7441.
+ *
+ * layout_unifi_apply handles one URL according to UNIFI_REWRITE:
+ *   LAYOUT_UNIFI_MODE_TLS    rtsps, userinfo, host, port 7441, path and
+ *                            fragment kept; every "enableSrtp" query
+ *                            parameter removed (the '?' too if nothing is
+ *                            left) -> LAYOUT_UNIFI_KEPT_TLS
+ *   LAYOUT_UNIFI_MODE_PLAIN  as layout_unifi_rewrite below
+ *                            -> LAYOUT_UNIFI_PLAIN
+ *   LAYOUT_UNIFI_MODE_OFF    unchanged -> LAYOUT_UNIFI_OFF
+ * Any other URL: unchanged -> LAYOUT_UNIFI_NOT_UNIFI. `out` always gets
+ * the result (a copy when unchanged) and *result (may be NULL) what was
+ * done. Returns 0, or -1 if `out` is too small (out is NUL-terminated but
+ * incomplete). */
+int layout_unifi_apply(const char *url, enum layout_unifi_mode mode, char *out, size_t outlen,
+		       enum layout_unifi_result *result);
+
+/* The plain-RTSP rewrite (UNIFI_REWRITE=plain): writes scheme rtsp, port
+ * 7447, userinfo/host/path kept, every "enableSrtp" query parameter
+ * removed. Returns 1 if rewritten, 0 if `url` is not a UniFi Protect
+ * rtsps URL (out = copy of url), -1 if `out` is too small. Kept for
+ * existing callers; new code should use layout_unifi_apply with the
+ * configured mode. */
 int layout_unifi_rewrite(const char *url, char *out, size_t outlen);
 
 /* True for a network stream ("scheme://..." with any scheme but file),
@@ -231,7 +281,9 @@ bool layout_url_is_rtsp(const char *url);
  * namespace, written as a leading NUL followed by name. *len is the number
  * of significant bytes in sun_path (for the sockaddr length: offsetof
  * (struct sockaddr_un, sun_path) + *len). Returns 0, or -1 if env is NULL,
- * empty, relative, a bare "@" or does not fit in cap - 1 bytes. */
+ * empty, relative, a bare "@", or does not fit: a path needs room for its
+ * NUL (at most cap - 1 characters), an abstract name does not (the NUL
+ * plus at most cap - 1 name bytes). */
 int layout_notify_sockaddr(const char *env, char *sun_path, size_t cap, size_t *len);
 
 /* True if `comm` (a /proc/PID/comm value, trailing newline allowed) is a
@@ -244,6 +296,14 @@ bool layout_is_display_server(const char *comm);
  * on success, -1 with a message in `err` on failure. */
 int layout_apply(struct layout_config *cfg, int screen_w, int screen_h,
 		 layout_warn_fn warn, void *warn_ctx, char *err, size_t errlen);
+
+/* True if every tile fits a screen of screen_w x screen_h. Grid mode
+ * always fits (the tiles are made for the screen); in manual mode the
+ * right/bottom edge of every tile must lie on the screen. *need_w and
+ * *need_h (may be NULL) get the smallest screen the tiles fit (grid mode: the
+ * given size). */
+bool layout_tiles_fit(const struct layout_config *cfg, int screen_w, int screen_h,
+		      int *need_w, int *need_h);
 
 /* Geometry of one grid cell (1-based, row-major: 1 = top left, `cols` = top
  * right, cols+1 = first cell of the second row).
@@ -265,10 +325,23 @@ int layout_parse_size(const char *s, int *w, int *h);
  *
  *   - the password in the userinfo part:
  *       rtsp://user:secret@host/path  ->  rtsp://user:***@host/path
+ *     A userinfo without ':' may itself be a token and is masked whole
+ *     (rtsp://<masked>@host/path). An unencoded '/', '?' or '#' in the password
+ *     does not end the userinfo early: when the authority up to the first
+ *     '/', '?' or '#' has a ':' but no '@' and an '@' follows later, the
+ *     userinfo ends at the last '@' before the first '/' after the first
+ *     such '@' (rtsp://admin:pa/ss@1.2.3.4/s -> rtsp://admin:***@1.2.3.4/s).
+ *     A non-numeric "port" without any '@' (a URL cut short inside the
+ *     password) is masked too;
  *   - the whole query string (and fragment):
  *       realmonitor?channel=1&subtype=0  ->  realmonitor?***
  *   - every path segment that looks like a token, e.g. the UniFi segment
- *     in rtsp://host:7447/aB3dE5fG7hJ9kL1m becomes "***".
+ *     in rtsp://host:7447/aB3dE5fG7hJ9kL1m becomes "***";
+ *   - credentials in the path: a segment with both '&' and '=' is masked
+ *     whole (XMEye: /user=admin&password=x&channel=1 -> "/" + "***"), and in a
+ *     "key=value" segment or ";key=value" parameter whose key contains
+ *     pass, pwd, psw, pas, token, key, auth, sig, secret or cred (any
+ *     case) the value is masked (Foscam: ;pwd=x -> ;pwd=***).
  *
  * A path segment counts as a token if it is either
  *   (a) at least 16 characters, all [A-Za-z0-9] — UniFi Protect tokens are
@@ -285,7 +358,10 @@ void layout_mask_url(const char *url, char *out, size_t outlen);
 
 /* Copies free text (e.g. an FFmpeg log line) to `out`, running every
  * embedded "scheme://..." URL (up to whitespace or a quote/bracket)
- * through layout_mask_url. Always NUL-terminates. */
+ * through layout_mask_url. If the URL so found has a ':' but no '@' and
+ * no '/' after "://" (a password with ( ) ' " or a space in it), the URL
+ * is extended to the next '@' on the line so the whole userinfo is
+ * masked. Always NUL-terminates. */
 void layout_mask_urls_in_text(const char *in, char *out, size_t outlen);
 
 /* Replaces control characters (< 0x20 except '\t', and 0x7f) in place with

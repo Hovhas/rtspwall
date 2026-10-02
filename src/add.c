@@ -2,17 +2,26 @@
  * add.c — `rtspwall add [--config PATH] [--force] [--no-systemd] NAME [CELL]`.
  *
  * Adds one camera without the URL ever touching the command line:
- *   1. reads the URL from a hidden prompt (or stdin when it is not a
+ *   1. resolves the config path (realpath: a symlinked config is edited at
+ *      its target), refuses a target that is not a regular file or whose
+ *      directory other users can write to, and takes an exclusive lock on
+ *      <confdir>/.rtspwall.lock for the whole read - probe - write, so two
+ *      adds cannot lose each other's camera;
+ *   2. reads the URL from a hidden prompt (or stdin when it is not a
  *      terminal), checks it can live in a config line;
- *   2. probes it (and the cameras already configured, for the total
- *      decoder budget); a FAIL is refused unless --force;
- *   3. appends "NAME|URL|CELL" to the config — the first free cell unless
- *      CELL is given — by writing a temp file next to it, checking it with
- *      `rtspwall --check-config`, copying mode and owner (0640
- *      root:rtspwall) and renaming it over the original. Nothing else in
- *      the file changes; commented-out lines stay commented out;
- *   4. starts the wall: `systemctl enable --now` if the service is not
- *      enabled (and says how to undo that), otherwise `systemctl restart`.
+ *   3. probes it (and the cameras already configured, for the total
+ *      decoder budget; as root in unprivileged children, see sandbox.h);
+ *      a FAIL is refused unless --force;
+ *   4. appends "NAME|URL|CELL" — the first free cell unless CELL is given —
+ *      by writing a 0600 temp file (mkostemp, O_NOFOLLOW) in the config's
+ *      directory, checking it with `rtspwall --check-config`, copying mode
+ *      and owner (0640 root:rtspwall), and renaming it over the original
+ *      only if the original did not change meanwhile (device, inode, size,
+ *      mtime). SIGINT/SIGTERM/SIGHUP/SIGQUIT remove the temp file (it
+ *      holds the camera password). Nothing else in the file changes;
+ *   5. gets the wall running with the new camera (see start_service: when
+ *      rtspwall-config.path is active it does the restart, add only fills
+ *      in what it does not do).
  *
  * The line logic is pure and tested (cfg_* in clilogic.c).
  */
@@ -20,15 +29,22 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <grp.h>
 #include <libgen.h>
+#include <limits.h>
+#include <pwd.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cli.h"
 
 #define CONFIG_MAX_BYTES (1024 * 1024)
+#define LOCK_NAME        ".rtspwall.lock"
 
 static void add_usage(FILE *out)
 {
@@ -44,18 +60,157 @@ static void add_usage(FILE *out)
 		"  --no-systemd    only edit the file, do not start/restart the service\n");
 }
 
-/* Writes `text` to `path` atomically, keeping the original file's mode
- * and owner. `checked` is called with the temp file's path before the
- * rename; a non-zero return aborts. */
+/* ------------------------------------------------- temp-file cleanup */
+
+/* The temp file holds the camera's password until it is renamed into
+ * place: a signal must not leave it behind. */
+static char cleanup_path[PATH_MAX];
+static volatile sig_atomic_t cleanup_armed = 0;
+
+static void cleanup_signal(int sig)
+{
+	if (cleanup_armed)
+		unlink(cleanup_path);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+static void cleanup_install(void)
+{
+	static const int sigs[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT };
+	struct sigaction sa = { .sa_handler = cleanup_signal };
+	sigemptyset(&sa.sa_mask);
+	for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++)
+		sigaddset(&sa.sa_mask, sigs[i]);
+	for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++)
+		sigaction(sigs[i], &sa, NULL);
+}
+
+static void block_signals(bool block, sigset_t *old)
+{
+	if (block) {
+		sigset_t all;
+		sigfillset(&all);
+		sigprocmask(SIG_BLOCK, &all, old);
+	} else {
+		sigprocmask(SIG_SETMASK, old, NULL);
+	}
+}
+
+/* Creates the temp file (0600, O_EXCL + O_NOFOLLOW) and arms the cleanup
+ * in one step with the signals blocked: a signal in between would leave
+ * the file behind. `tmp` is the mkostemp template. */
+static int create_temp(char *tmp)
+{
+	sigset_t old;
+	block_signals(true, &old);
+	int fd = mkostemp(tmp, O_CLOEXEC | O_NOFOLLOW);
+	if (fd >= 0) {
+		snprintf(cleanup_path, sizeof cleanup_path, "%s", tmp);
+		cleanup_armed = 1;
+	}
+	int e = errno;
+	block_signals(false, &old);
+	errno = e;
+	return fd;
+}
+
+/* Removes the temp file (if `unlink_it`) and disarms, signals blocked. */
+static void cleanup_done(bool unlink_it)
+{
+	sigset_t old;
+	block_signals(true, &old);
+	if (unlink_it && cleanup_armed)
+		unlink(cleanup_path);
+	cleanup_armed = 0;
+	block_signals(false, &old);
+}
+
+/* ------------------------------------------------- file-system checks */
+
+static void describe(const struct stat *st, char *out, size_t outlen)
+{
+	struct passwd *p = getpwuid(st->st_uid);
+	struct group *g = getgrgid(st->st_gid);
+	snprintf(out, outlen, "%04o %s:%s", (unsigned)(st->st_mode & 07777),
+		 p ? p->pw_name : "?", g ? g->gr_name : "?");
+}
+
+/* Writable by someone other than root (and the user running add)? */
+static bool writable_by_others(const struct stat *st)
+{
+	uid_t me = geteuid();
+	gid_t my_gid = getegid();
+	if ((st->st_mode & S_IWUSR) && st->st_uid != 0 && st->st_uid != me)
+		return true;
+	if ((st->st_mode & S_IWGRP) && st->st_gid != 0 && (me == 0 || st->st_gid != my_gid))
+		return true;
+	return (st->st_mode & S_IWOTH) != 0;
+}
+
+static bool same_file_state(const struct stat *a, const struct stat *b)
+{
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size &&
+	       a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
+}
+
+/* Takes <dir>/.rtspwall.lock (exclusive flock, waits for another add).
+ * Returns the fd (kept open until exit), or -1 with a message. */
+static int take_lock(const char *dir)
+{
+	char path[PATH_MAX];
+	if (snprintf(path, sizeof path, "%s/" LOCK_NAME, dir) >= (int)sizeof path) {
+		fprintf(stderr, "rtspwall: path too long: %s\n", dir);
+		return -1;
+	}
+	int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		fprintf(stderr, "rtspwall: cannot create the lock file %s: %s%s\n", path,
+			strerror(errno), errno == EACCES ? " (run with sudo)" : "");
+		return -1;
+	}
+	struct stat st;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+		fprintf(stderr, "rtspwall: %s is not a regular file\n", path);
+		close(fd);
+		return -1;
+	}
+	if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+		if (errno != EWOULDBLOCK) {
+			fprintf(stderr, "rtspwall: cannot lock %s: %s\n", path, strerror(errno));
+			close(fd);
+			return -1;
+		}
+		fprintf(stderr, "rtspwall: another `rtspwall add` is editing this config; "
+				"waiting for it to finish (lock: %s) ...\n", path);
+		while (flock(fd, LOCK_EX) < 0) {
+			if (errno != EINTR) {
+				fprintf(stderr, "rtspwall: cannot lock %s: %s\n", path, strerror(errno));
+				close(fd);
+				return -1;
+			}
+		}
+	}
+	return fd;
+}
+
+/* -------------------------------------------------------------- write */
+
+/* Writes `text` next to `path` and renames it over `path`, keeping the
+ * original's mode and owner; aborts if `path` no longer matches `orig`.
+ * `checked` is called with the temp file's path before the rename; a
+ * non-zero return aborts. */
 static int write_atomic(const char *path, const char *text, const struct stat *orig,
 			int (*checked)(const char *tmp))
 {
-	char tmp[LAYOUT_PATH_MAX + 16];
+	char tmp[PATH_MAX];
 	if (snprintf(tmp, sizeof tmp, "%s.XXXXXX", path) >= (int)sizeof tmp) {
 		fprintf(stderr, "rtspwall: path too long: %s\n", path);
 		return -1;
 	}
-	int fd = mkstemp(tmp);
+	/* Mode 0600 from mkostemp: the password is never readable by others,
+	 * not even before the fchmod below. */
+	int fd = create_temp(tmp);
 	if (fd < 0) {
 		fprintf(stderr, "rtspwall: cannot create a temp file next to %s: %s\n", path,
 			strerror(errno));
@@ -75,34 +230,61 @@ static int write_atomic(const char *path, const char *text, const struct stat *o
 		}
 		off += (size_t)n;
 	}
-	if (!r && fchmod(fd, orig->st_mode & 07777) < 0) {
-		fprintf(stderr, "rtspwall: chmod %s: %s\n", tmp, strerror(errno));
-		r = -1;
-	}
 	if (!r && (orig->st_uid != geteuid() || orig->st_gid != getegid()) &&
 	    fchown(fd, orig->st_uid, orig->st_gid) < 0) {
 		fprintf(stderr, "rtspwall: cannot keep the owner of %s (%s); run with sudo\n",
 			path, strerror(errno));
 		r = -1;
 	}
+	if (!r && fchmod(fd, orig->st_mode & 07777) < 0) {
+		fprintf(stderr, "rtspwall: chmod %s: %s\n", tmp, strerror(errno));
+		r = -1;
+	}
 	if (!r && fsync(fd) < 0) {
 		fprintf(stderr, "rtspwall: fsync %s: %s\n", tmp, strerror(errno));
 		r = -1;
 	}
+	struct stat tst;
+	if (!r && fstat(fd, &tst) < 0)
+		r = -1;
 	close(fd);
 	if (!r && checked && checked(tmp) != 0)
 		r = -1;
-	if (!r && rename(tmp, path) < 0) {
-		fprintf(stderr, "rtspwall: rename %s -> %s: %s\n", tmp, path, strerror(errno));
+
+	/* What gets renamed must still be our temp file ... */
+	struct stat lst;
+	if (!r && (lstat(tmp, &lst) < 0 || !S_ISREG(lst.st_mode) || lst.st_ino != tst.st_ino ||
+		   lst.st_dev != tst.st_dev)) {
+		fprintf(stderr, "rtspwall: the temp file %s was replaced; nothing changed\n", tmp);
 		r = -1;
 	}
+	/* ... and the config must still be the one that was read and probed. */
+	struct stat now;
+	if (!r && (lstat(path, &now) < 0 || !S_ISREG(now.st_mode) ||
+		   !same_file_state(&now, orig))) {
+		fprintf(stderr, "rtspwall: %s was changed by someone else while the camera was "
+				"being probed; nothing was written - run add again\n", path);
+		r = -1;
+	}
+	if (!r) {
+		/* rename + disarm together: after the rename the name is gone. */
+		sigset_t old;
+		block_signals(true, &old);
+		if (rename(tmp, path) < 0) {
+			fprintf(stderr, "rtspwall: rename %s -> %s: %s\n", tmp, path, strerror(errno));
+			r = -1;
+		} else {
+			cleanup_armed = 0;
+		}
+		block_signals(false, &old);
+	}
 	if (r) {
-		unlink(tmp);
+		cleanup_done(true);
 		return -1;
 	}
 
 	/* Make the rename itself durable. */
-	char dir[LAYOUT_PATH_MAX + 16];
+	char dir[PATH_MAX];
 	snprintf(dir, sizeof dir, "%s", path);
 	int dfd = open(dirname(dir), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	if (dfd >= 0) {
@@ -131,6 +313,36 @@ static int check_with_daemon_parser(const char *tmp)
 	return -1;
 }
 
+/* ------------------------------------------------------------ service */
+
+static void sleep_ms(int ms)
+{
+	struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+	while (nanosleep(&ts, &ts) < 0 && errno == EINTR)
+		;
+}
+
+/* rtspwall-config.path fires on the rename; its service validates the
+ * file (after a 2 s debounce) and restarts the wall if it is enabled and
+ * running or failed. Waits until that run is over, so add never restarts
+ * the wall a second time. Returns true if the watcher ran. */
+static bool wait_for_watcher(void)
+{
+	bool seen = false;
+	for (int t = 0; t < 15000; t += 250) {
+		char st[64];
+		cli_unit_state(CLI_WATCH_SERVICE, st, sizeof st);
+		bool busy = strcmp(st, "activating") == 0 || strcmp(st, "active") == 0 ||
+			    strcmp(st, "deactivating") == 0;
+		if (busy)
+			seen = true;
+		else if (seen || t >= 2000)
+			break;     /* finished, or never started (older unit, no change) */
+		sleep_ms(250);
+	}
+	return seen;
+}
+
 static int start_service(void)
 {
 	if (!cli_have_systemd()) {
@@ -142,25 +354,59 @@ static int start_service(void)
 		printf("not root: start the service with: sudo systemctl restart rtspwall\n");
 		return 0;
 	}
-	if (!cli_unit_enabled(CLI_SERVICE)) {
-		if (cli_systemctl("enable", CLI_SERVICE) != 0 ||
-		    cli_systemctl("restart", CLI_SERVICE) != 0) {
-			fprintf(stderr, "rtspwall: could not enable/start %s; see: "
-					"journalctl -u rtspwall -b\n", CLI_SERVICE);
+
+	bool was_enabled = cli_unit_enabled(CLI_SERVICE);
+	bool watcher = cli_unit_active(CLI_WATCH_PATH);
+	if (!was_enabled) {
+		if (cli_systemctl("enable", CLI_SERVICE) != 0) {
+			fprintf(stderr, "rtspwall: could not enable %s; see: journalctl -u rtspwall "
+					"-b\n", CLI_SERVICE);
 			return 1;
 		}
-		printf("enabled and started %s: the wall now also starts at boot\n"
+		printf("enabled %s: the wall now also starts at boot\n"
 		       "  (undo: sudo systemctl disable --now rtspwall)\n", CLI_SERVICE);
+	}
+
+	/* The watcher only acts on an enabled wall (it was checked at the
+	 * moment of the rename, so an enable just now does not count). */
+	bool watcher_acted = false;
+	if (watcher) {
+		printf("waiting for %s to pick up the change ...\n", CLI_WATCH_PATH);
+		watcher_acted = wait_for_watcher() && was_enabled;
+	}
+
+	char state[64];
+	cli_unit_state(CLI_SERVICE, state, sizeof state);
+	bool running = strcmp(state, "active") == 0 || strcmp(state, "activating") == 0 ||
+		       strcmp(state, "reloading") == 0;
+	int rc = 0;
+	if (running && watcher_acted) {
+		printf("%s checked the new config and restarted %s\n", CLI_WATCH_PATH, CLI_SERVICE);
+	} else if (running) {
+		if (cli_systemctl("restart", CLI_SERVICE) != 0)
+			rc = 1;
+		else
+			printf("restarted %s\n", CLI_SERVICE);
 	} else {
-		if (cli_systemctl("restart", CLI_SERVICE) != 0) {
-			fprintf(stderr, "rtspwall: restart failed; see: journalctl -u rtspwall -b\n");
-			return 1;
+		if (strcmp(state, "failed") == 0) {
+			cli_systemctl("reset-failed", CLI_SERVICE);
+			printf("%s had failed: cleared the failed state\n", CLI_SERVICE);
 		}
-		printf("restarted %s\n", CLI_SERVICE);
+		if (cli_systemctl("start", CLI_SERVICE) != 0)
+			rc = 1;
+		else
+			printf("started %s\n", CLI_SERVICE);
+	}
+	if (rc) {
+		fprintf(stderr, "rtspwall: could not start %s; see: journalctl -u rtspwall -b\n",
+			CLI_SERVICE);
+		return 1;
 	}
 	printf("status:   systemctl status rtspwall    log: journalctl -u rtspwall -f\n");
 	return 0;
 }
+
+/* ------------------------------------------------------------- command */
 
 int cmd_add(int argc, char **argv)
 {
@@ -207,18 +453,65 @@ int cmd_add(int argc, char **argv)
 		fprintf(stderr, "rtspwall: invalid NAME \"%s\": %s\n", name, why);
 		return 2;
 	}
+	cleanup_install();
 
-	/* ---- the config as it is */
-	struct stat st;
-	if (stat(config, &st) < 0) {
+	/* ---- where the config really is, and may we write there */
+	char real[PATH_MAX];
+	if (!realpath(config, real)) {
 		fprintf(stderr, "rtspwall: %s: %s (is rtspwall installed? or use --config PATH)\n",
 			config, strerror(errno));
 		return 2;
 	}
-	char *text = cli_read_file(config, CONFIG_MAX_BYTES);
-	if (!text) {
-		fprintf(stderr, "rtspwall: cannot read %s: %s%s\n", config, strerror(errno),
+	if (strcmp(real, config) != 0) {
+		struct stat l;
+		if (lstat(config, &l) == 0 && S_ISLNK(l.st_mode))
+			printf("note:     %s is a symlink; editing its target %s\n", config, real);
+	}
+	char dirbuf[PATH_MAX];
+	snprintf(dirbuf, sizeof dirbuf, "%s", real);
+	const char *dir = dirname(dirbuf);
+	struct stat dst;
+	if (stat(dir, &dst) < 0) {
+		fprintf(stderr, "rtspwall: %s: %s\n", dir, strerror(errno));
+		return 2;
+	}
+	if (writable_by_others(&dst)) {
+		char m[96];
+		describe(&dst, m, sizeof m);
+		fprintf(stderr, "rtspwall: refusing to edit %s: its directory %s (%s) is writable "
+				"by other users, who could replace the config or the temp file (with "
+				"the camera password) before it is renamed into place.\nFix: sudo chown root:root %s && sudo chmod "
+				"go-w %s\n", real, dir, m, dir, dir);
+		return 2;
+	}
+
+	int lock_fd = take_lock(dir);
+	if (lock_fd < 0)
+		return 2;
+
+	/* ---- the config as it is (under the lock) */
+	int cfd = open(real, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+	struct stat st;
+	if (cfd < 0 || fstat(cfd, &st) < 0) {
+		fprintf(stderr, "rtspwall: cannot read %s: %s%s\n", real, strerror(errno),
 			errno == EACCES ? " (run with sudo)" : "");
+		if (cfd >= 0)
+			close(cfd);
+		close(lock_fd);
+		return 2;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "rtspwall: %s is not a regular file\n", real);
+		close(cfd);
+		close(lock_fd);
+		return 2;
+	}
+	char *text = cli_read_fd(cfd, CONFIG_MAX_BYTES);
+	int read_errno = errno;
+	close(cfd);
+	if (!text) {
+		fprintf(stderr, "rtspwall: cannot read %s: %s\n", real, strerror(read_errno));
+		close(lock_fd);
 		return 2;
 	}
 
@@ -273,16 +566,30 @@ int cmd_add(int argc, char **argv)
 		goto out;
 	}
 
-	/* ---- probe: the new camera, then the total with the existing ones */
+	/* ---- probe: the new camera (as the wall will play it with this
+	 * config's UNIFI_REWRITE), then the total with the existing ones */
+	size_t cap = strlen(text) + strlen(name) + strlen(url) + 32;
+	char *next = malloc(cap);
+	if (!next || cfg_append_camera(text, name, url, cell, next, cap) < 0) {
+		fprintf(stderr, "rtspwall: out of memory\n");
+		free(next);
+		goto out;
+	}
+	/* UNIFI_REWRITE as the file will have it (it may be set anywhere; an
+	 * empty config does not parse on its own). */
+	static struct layout_config cfg;
+	char err[768];
+	enum layout_unifi_mode mode = LAYOUT_UNIFI_MODE_TLS;
+	if (layout_parse(&cfg, next, NULL, NULL, err, sizeof err) == 0)
+		mode = cfg.unifi_mode;
+	bool cfg_ok = layout_parse(&cfg, text, NULL, NULL, err, sizeof err) == 0;
 	struct probe_result pr;
 	enum budget_verdict v;
-	probe_single(url, &pr, &v);
+	probe_single(url, mode, &pr, &v);
 
 	long others = 0;
 	int others_measured = 0, others_total = 0;
-	static struct layout_config cfg;
-	char err[768];
-	if (cli_load_config(config, &cfg, err, sizeof err) == 0 && cfg.count > 0) {
+	if (cfg_ok && cfg.count > 0) {
 		const char *urls[LAYOUT_MAX_CAMERAS];
 		static struct probe_result res[LAYOUT_MAX_CAMERAS];
 		for (int i = 0; i < cfg.count; i++)
@@ -312,20 +619,14 @@ int cmd_add(int argc, char **argv)
 	if (v == BUDGET_FAIL && !force) {
 		fprintf(stderr, "\nrtspwall: not added (probe: FAIL). Fix the stream, or add it "
 				"anyway with --force\n");
+		free(next);
 		goto out;
 	}
 	if (v == BUDGET_FAIL)
 		printf("--force: adding despite FAIL\n");
 
 	/* ---- write */
-	size_t cap = strlen(text) + strlen(name) + strlen(url) + 32;
-	char *next = malloc(cap);
-	if (!next || cfg_append_camera(text, name, url, cell, next, cap) < 0) {
-		fprintf(stderr, "rtspwall: out of memory\n");
-		free(next);
-		goto out;
-	}
-	if (write_atomic(config, next, &st, check_with_daemon_parser) < 0) {
+	if (write_atomic(real, next, &st, check_with_daemon_parser) < 0) {
 		free(next);
 		goto out;
 	}
@@ -333,11 +634,20 @@ int cmd_add(int argc, char **argv)
 
 	char masked[LAYOUT_URL_MAX];
 	layout_mask_url(url, masked, sizeof masked);
-	printf("\nadded:    %s|%s|%d to %s%s\n", name, masked, cell, config,
+	printf("\nadded:    %s|%s|%d to %s%s\n", name, masked, cell, real,
 	       rotation ? " (shares the cell: rotation group)" : "");
 
-	ret = no_systemd ? 0 : start_service();
+	if (no_systemd) {
+		if (cli_have_systemd() && cli_unit_active(CLI_WATCH_PATH) &&
+		    cli_unit_enabled(CLI_SERVICE))
+			printf("note:     --no-systemd: %s is active and restarts the wall by itself "
+			       "when it sees the change\n", CLI_WATCH_PATH);
+		ret = 0;
+	} else {
+		ret = start_service();
+	}
 out:
 	free(text);
+	close(lock_fd);
 	return ret;
 }

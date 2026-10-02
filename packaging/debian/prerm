@@ -4,6 +4,15 @@ set -e
 case "$1" in
     remove | deconfigure)
         if [ -d /run/systemd/system ]; then
+            # Remember that the watcher was enabled, so a re-install after
+            # "apt remove" (dpkg then passes the old version as $2 to postinst,
+            # so it cannot tell it from an upgrade) turns it on again. If an
+            # administrator had disabled it, no marker is written and that
+            # choice survives. postrm purge deletes the marker.
+            if systemctl is-enabled --quiet rtspwall-config.path 2>/dev/null; then
+                install -d -m 0755 /var/lib/rtspwall
+                : >/var/lib/rtspwall/config-path-was-enabled
+            fi
             systemctl disable --now rtspwall-config.path >/dev/null 2>&1 || true
             systemctl stop rtspwall-config.service rtspwall-demo.service || true
             systemctl stop rtspwall.service || true

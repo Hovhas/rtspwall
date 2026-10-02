@@ -32,7 +32,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git \
-            build-essential pkg-config dpkg-dev lintian ffmpeg \
+            build-essential pkg-config dpkg-dev lintian devscripts ffmpeg \
             libdrm-dev libavformat-dev libavcodec-dev libavutil-dev
       - uses: actions/checkout@v4
       - name: Build, test, package
@@ -89,6 +89,8 @@ jobs:
           subject-path: |
             dist/*.deb
             dist/*.tar.gz
+            dist/get.sh
+            dist/SHA256SUMS
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

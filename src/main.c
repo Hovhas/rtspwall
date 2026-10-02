@@ -72,6 +72,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -293,6 +294,12 @@ int main(int argc, char **argv)
 	static struct wall v;
 	int r = 1;
 
+	/* The config (camera passwords, UniFi tokens) lives in this process's
+	 * memory: no core dumps, and no ptrace/proc-mem access by other
+	 * processes of the same user. */
+	if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+		log_msg("prctl(PR_SET_DUMPABLE): %s", strerror(errno));
+
 	v.drmfd = -1;
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
@@ -311,12 +318,8 @@ int main(int argc, char **argv)
 	av_log_set_level(ffmpeg_level(v.cfg.ffmpeg_loglevel));
 
 	r = decoder_preflight(v.cfg.decoder);
-	if (r) {
-		if (r == RTSPWALL_EXIT_NO_DECODER)
-			notify_status("no H.264 hardware decoder at %s (Raspberry Pi 5 has none)",
-				      v.cfg.decoder);
+	if (r)
 		return quit ? 0 : r;
-	}
 	r = 1;
 
 	/* Ready as soon as the config is loaded and the decoder exists:

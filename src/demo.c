@@ -53,7 +53,7 @@ static pid_t start_tail(int *fd_out)
 	}
 	if (pid == 0) {
 		dup2(p[1], STDOUT_FILENO);
-		int devnull = open("/dev/null", O_RDWR);
+		int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
 		if (devnull >= 0) {
 			dup2(devnull, STDIN_FILENO);
 			dup2(devnull, STDERR_FILENO);
@@ -66,6 +66,20 @@ static pid_t start_tail(int *fd_out)
 	close(p[1]);
 	*fd_out = p[0];
 	return pid;
+}
+
+static void stop_tail(pid_t *tail, int *tail_fd)
+{
+	if (*tail > 0) {
+		kill(*tail, SIGTERM);
+		while (waitpid(*tail, NULL, 0) < 0 && errno == EINTR)
+			;
+		*tail = -1;
+	}
+	if (*tail_fd >= 0) {
+		close(*tail_fd);
+		*tail_fd = -1;
+	}
 }
 
 static void restore(bool was_active)
@@ -107,7 +121,9 @@ int cmd_demo(int argc, char **argv)
 		return 2;
 	}
 
-	bool was_active = cli_unit_active(CLI_SERVICE);
+	/* "running" includes activating (auto-restart between two attempts):
+	 * a wall that is retrying must come back after the demo too. */
+	bool was_active = cli_unit_running(CLI_SERVICE);
 
 	struct sigaction sa = { .sa_handler = on_signal };   /* no SA_RESTART */
 	sigemptyset(&sa.sa_mask);
@@ -121,8 +137,7 @@ int cmd_demo(int argc, char **argv)
 	if (cli_systemctl("start", CLI_DEMO_SERVICE) != 0) {
 		fprintf(stderr, "rtspwall: could not start %s; see: journalctl -u rtspwall-demo -b\n"
 				"and run: sudo rtspwall doctor\n", CLI_DEMO_SERVICE);
-		if (tail > 0)
-			kill(tail, SIGTERM);
+		stop_tail(&tail, &tail_fd);
 		restore(was_active);
 		return 1;
 	}
@@ -159,12 +174,7 @@ int cmd_demo(int argc, char **argv)
 		}
 	}
 
-	if (tail > 0) {
-		kill(tail, SIGTERM);
-		waitpid(tail, NULL, 0);
-	}
-	if (tail_fd >= 0)
-		close(tail_fd);
+	stop_tail(&tail, &tail_fd);
 	restore(was_active);
 	return rc;
 }

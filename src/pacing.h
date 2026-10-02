@@ -382,6 +382,36 @@ const char *pacing_fault_hint(enum pacing_fault f);
  * Deterministic: 5, 10, 20, 40, then 60 s. Transient: 2, 3, 4, then 5 s. */
 int64_t pacing_backoff_ms(enum pacing_fault f, unsigned attempt);
 
+/* Per-camera reconnect backoff (camera thread only).
+ *
+ * The attempt counter belongs to ONE fault: when the fault changes, the
+ * schedule of the new fault starts from its first step. Otherwise an NVR
+ * restart (refused x N, then 404 while the stream path is not ready yet)
+ * would hand the 404 attempt N+1 and wait 60 s.
+ *
+ * Once the camera has delivered video in this process (mark_live), 401
+ * and 404 count as transient: the credentials and the path were right
+ * before, so the server is most likely still starting. */
+struct pacing_backoff {
+	enum pacing_fault last;     /* fault of the previous failed attempt */
+	unsigned          failures; /* failed attempts in a row with `last` */
+	unsigned          total;    /* failed attempts in a row, any fault */
+	bool              was_live; /* delivered video at least once */
+};
+
+void pacing_backoff_init(struct pacing_backoff *b);
+/* The camera delivered video (sticky for the life of the process). */
+void pacing_backoff_mark_live(struct pacing_backoff *b);
+/* A healthy period ended the run of failures (keeps was_live). */
+void pacing_backoff_reset(struct pacing_backoff *b);
+/* Records a failed attempt with fault f and returns the delay before the
+ * next one. */
+int64_t pacing_backoff_next(struct pacing_backoff *b, enum pacing_fault f);
+/* Failed attempts in a row, whatever the fault (for "after N attempts"). */
+unsigned pacing_backoff_total(const struct pacing_backoff *b);
+/* pacing_fault_is_deterministic, except 401/404 after the camera was live. */
+bool pacing_backoff_is_deterministic(const struct pacing_backoff *b, enum pacing_fault f);
+
 /* ------------------------------------------------------------ log collapse
  *
  * Collapses repeated identical log lines: the first occurrence of a line is
@@ -446,9 +476,17 @@ enum pacing_pts_event {
 	PACING_PTS_JUMP,        /* jumped forward more than 1 s */
 };
 
+/* How far pts may step back and still continue the series: packets
+ * arrive in DECODE order, so with B-frames (I0 P3 B1 B2 ...) pts goes
+ * back by a few frame periods all the time. 500 ms covers two B-frames
+ * even at 5 fps; a looped clip or a camera restarting its clock goes back
+ * by far more. */
+#define PACING_PTS_REORDER_US 500000
+
 /* Classifies pts_us against the previous pts (last_us < 0 = none yet).
- * The caller re-anchors on anything but OK and then uses pts_us itself as
- * the new reference, so a looped clip re-anchors exactly once. */
+ * A step back of up to PACING_PTS_REORDER_US is reordering, not a new
+ * series. The caller re-anchors on anything but OK and then uses pts_us
+ * itself as the new reference, so a looped clip re-anchors exactly once. */
 enum pacing_pts_event pacing_pts_classify(int64_t last_us, int64_t pts_us);
 
 /* Reads a local file at its natural speed (like ffmpeg -re): the wall

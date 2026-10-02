@@ -5,6 +5,7 @@
  */
 #include "pacing.h"
 
+#include <limits.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -457,6 +458,51 @@ int64_t pacing_backoff_ms(enum pacing_fault f, unsigned attempt)
 	return 2000 + (int64_t)(attempt - 1) * 1000;
 }
 
+void pacing_backoff_init(struct pacing_backoff *b)
+{
+	memset(b, 0, sizeof *b);
+	b->last = PACING_FAULT_NONE;
+}
+
+void pacing_backoff_mark_live(struct pacing_backoff *b)
+{
+	b->was_live = true;
+}
+
+void pacing_backoff_reset(struct pacing_backoff *b)
+{
+	b->last = PACING_FAULT_NONE;
+	b->failures = 0;
+	b->total = 0;
+}
+
+bool pacing_backoff_is_deterministic(const struct pacing_backoff *b, enum pacing_fault f)
+{
+	if (b->was_live && (f == PACING_FAULT_UNAUTHORIZED || f == PACING_FAULT_NOT_FOUND))
+		return false;
+	return pacing_fault_is_deterministic(f);
+}
+
+int64_t pacing_backoff_next(struct pacing_backoff *b, enum pacing_fault f)
+{
+	if (f != b->last) {
+		b->last = f;
+		b->failures = 0;
+	}
+	if (b->failures < UINT_MAX)
+		b->failures++;
+	if (b->total < UINT_MAX)
+		b->total++;
+	/* PACING_FAULT_OTHER follows the transient schedule */
+	return pacing_backoff_ms(pacing_backoff_is_deterministic(b, f) ? f : PACING_FAULT_OTHER,
+				 b->failures);
+}
+
+unsigned pacing_backoff_total(const struct pacing_backoff *b)
+{
+	return b->total;
+}
+
 /* ------------------------------------------------------------ log collapse */
 
 void pacing_dedup_init(struct pacing_dedup *d, int64_t interval_us)
@@ -574,7 +620,7 @@ enum pacing_pts_event pacing_pts_classify(int64_t last_us, int64_t pts_us)
 {
 	if (last_us < 0)
 		return PACING_PTS_OK;
-	if (pts_us < last_us)
+	if (pts_us < last_us - PACING_PTS_REORDER_US)
 		return PACING_PTS_BACKWARDS;
 	if (pts_us - last_us > 1000000)
 		return PACING_PTS_JUMP;

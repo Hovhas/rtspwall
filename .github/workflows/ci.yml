@@ -39,7 +39,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git \
-            build-essential pkg-config dpkg-dev lintian \
+            build-essential pkg-config dpkg-dev lintian devscripts \
             libdrm-dev libavformat-dev libavcodec-dev libavutil-dev ffmpeg
       - uses: actions/checkout@v4
       - name: Build and test

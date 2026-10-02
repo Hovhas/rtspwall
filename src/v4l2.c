@@ -267,48 +267,80 @@ static bool takes_h264(int fd)
 	return false;
 }
 
+/* At boot udev may still be applying the "video" group to the device
+ * node when the service starts: EACCES/EPERM is retried this long before
+ * it counts as a permanent permission problem. */
+#define DECODER_ACCESS_WAIT_MS 30000
+
 int decoder_preflight(const char *device)
 {
 	int fd = -1;
+	int e = 0;
+	bool told_missing = false, told_access = false;
 
 	/* The codec driver may still be loading at boot: give the device
-	 * node up to 15 s to appear before calling it missing. */
-	for (int i = 0; i < 150 && !quit; i++) {
+	 * node up to 15 s to appear before calling it missing, and udev up
+	 * to 30 s to set its permissions. */
+	for (int waited_ms = 0; !quit; waited_ms += 100) {
 		fd = open(device, O_RDWR | O_CLOEXEC | O_NONBLOCK);
-		if (fd >= 0 || errno != ENOENT)
+		if (fd >= 0)
 			break;
-		if (i == 0)
-			log_msg("decoder: %s does not exist yet - waiting up to 15 s", device);
+		e = errno;
+		if (e == ENOENT && waited_ms < 15000) {
+			if (!told_missing)
+				log_msg("decoder: %s does not exist yet - waiting up to 15 s", device);
+			told_missing = true;
+		} else if ((e == EACCES || e == EPERM) && waited_ms < DECODER_ACCESS_WAIT_MS) {
+			if (!told_access) {
+				log_msg("decoder: cannot open %s: %s - waiting up to %d s (udev may "
+					"still be setting its permissions at boot)", device, strerror(e),
+					DECODER_ACCESS_WAIT_MS / 1000);
+				notify_status("waiting for access to the decoder %s", device);
+			}
+			told_access = true;
+		} else {
+			break;
+		}
 		usleep(100000);
 	}
 	if (quit && fd < 0)
 		return 1;
 	if (fd < 0) {
-		int e = errno;
 		if (e == ENOENT) {
 			log_msg("no H.264 hardware decoder found at %s (Raspberry Pi 5 has none)",
 				device);
 			log_msg("rtspwall needs the Raspberry Pi 4's (or 3's) H.264 hardware decoder; "
 				"if this is a Pi 4, check DECODER= in the config and that "
 				"/dev/video10 exists (bcm2835-codec)");
+			notify_status("no H.264 hardware decoder at %s (Raspberry Pi 5 has none)",
+				      device);
 			return RTSPWALL_EXIT_NO_DECODER;
 		}
 		if (e == EACCES || e == EPERM) {
 			log_msg("decoder: cannot open %s: %s - the service user needs access to "
 				"the video devices (group \"video\")", device, strerror(e));
+			notify_status("no access to the decoder %s: the service user needs the "
+				      "group \"video\"", device);
 			return RTSPWALL_EXIT_NO_DECODER;
 		}
 		log_msg("decoder: cannot open %s: %s", device, strerror(e));
 		return 1;
 	}
+	if (told_access)
+		log_msg("decoder: %s is accessible now", device);
 
 	struct v4l2_capability cap = { 0 };
 	bool ok = false;
-	if (xioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
-		uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
-				? cap.device_caps : cap.capabilities;
-		ok = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) && takes_h264(fd);
+	if (xioctl(fd, VIDIOC_QUERYCAP, &cap) != 0) {
+		/* Not an answer about what the device is: restartable. */
+		e = errno;
+		close(fd);
+		log_msg("decoder: VIDIOC_QUERYCAP on %s failed: %s", device, strerror(e));
+		return 1;
 	}
+	uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
+			? cap.device_caps : cap.capabilities;
+	ok = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) && takes_h264(fd);
 	close(fd);
 	if (!ok) {
 		log_msg("no H.264 hardware decoder found at %s (Raspberry Pi 5 has none)", device);
@@ -316,6 +348,7 @@ int decoder_preflight(const char *device)
 			log_msg("decoder: %s is \"%.32s\" (driver %.16s), not a multi-planar H.264 "
 				"memory-to-memory decoder - check DECODER= in the config",
 				device, (const char *)cap.card, (const char *)cap.driver);
+		notify_status("no H.264 hardware decoder at %s (Raspberry Pi 5 has none)", device);
 		return RTSPWALL_EXIT_NO_DECODER;
 	}
 	log_msg("decoder: %s is \"%.32s\" (driver %.16s), H.264 ok", device,
