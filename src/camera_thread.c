@@ -461,6 +461,12 @@ static void camera_leak_push(struct camera *k, uint32_t fb, uint32_t handle, int
 static void teardown_stream(struct wall *v, struct camera *k)
 {
 	pthread_mutex_lock(&k->lock);
+	/* A frame the compositor popped from the fifo (its step A) but has not
+	 * committed yet (step C) belongs to the buffers torn down below: the
+	 * new generation makes step C drop it instead of committing its fb or
+	 * pushing its index into the next connection's ring (see generation
+	 * in struct camera). */
+	k->generation++;
 	pacing_fifo_init(&k->fifo);       /* contents released without QBUF, the queue is torn down anyway */
 	k->ring_head = k->ring_tail = 0;
 
@@ -515,20 +521,23 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	 * the exact bug class the rest of this function exists to close, just
 	 * in the narrower "compositor stood still for 2 s" case (and since all
 	 * cameras share the same flip gate, the WHOLE wall stalls then, not
-	 * only this camera). k->in_flight and k->plane_attached are NOT
-	 * adjusted based on gave_up — they are reset REGARDLESS a few lines
-	 * down, but that is harmless: the kernel guarantees that a commit
-	 * already submitted delivers its flip event sooner or later, and
-	 * complete_flip then reads in_flight == -1 and becomes a no-op for this
-	 * camera (neither the -2 nor the >= 0 branch matches) — plane_attached
-	 * stays what it was (conservative: if it is still true the plane may
-	 * still show the leaked buffer, and the NEXT teardown cycle for the
-	 * same camera then attempts a new, harmless (possibly redundant)
-	 * detach). The protected indices are leaked DELIBERATELY right here
-	 * (no release_buffer for them in this function) — rare and visible
-	 * through the log line below, better than a use-after-free against the
-	 * display. The leak is NOT permanent though: fb/handle/dmafd are saved in
-	 * k->leaked (see camera_leak_push) and cleaned up by complete_flip on
+	 * only this camera). k->in_flight is reset REGARDLESS a few lines
+	 * down: the kernel guarantees that a commit already submitted
+	 * delivers its flip event sooner or later, and complete_flip then
+	 * reads in_flight == -1 and becomes a no-op for this camera (neither
+	 * the -2 nor the >= 0 branch matches). plane_attached is therefore
+	 * left true if it was (the plane may still show the leaked buffer;
+	 * the NEXT teardown cycle, a rotation that idles the camera or a
+	 * connector switch then makes a new, harmless (possibly redundant)
+	 * detach) — and SET if a real frame was in flight: once that flip
+	 * lands the plane shows it, but complete_flip, seeing -1, would never
+	 * record that. Left false, nothing would ever detach the plane, and a
+	 * connector switch (display_remodeset) would free the leaked buffer
+	 * while it is still scanned out. The protected indices are leaked
+	 * DELIBERATELY right here (no release_buffer for them in this
+	 * function) — rare and visible through the log line below, better
+	 * than a use-after-free against the display. The leak is NOT
+	 * permanent though: fb/handle/dmafd are saved in k->leaked (see camera_leak_push) and cleaned up by complete_flip on
 	 * the next confirmed flip for the camera, or at program exit — without
 	 * that the fd/GEM handle would be lost for good the next time
 	 * start_capture overwrote the same index. Limbo indices count as "may
@@ -567,6 +576,11 @@ static void teardown_stream(struct wall *v, struct camera *k)
 			log_msg("%s: CRITICAL: teardown gave up (shown=%d in_flight=%d limbo=%d plane_attached=%d) - leaking %d live buffer(s) instead of destroying them",
 				k->name, k->shown, k->in_flight, k->n_limbo, k->plane_attached, n_keep);
 	}
+	/* A real frame still in flight will be on screen once its flip lands
+	 * (see above). Only after the candidates are chosen: a stale "shown"
+	 * of a confirmed-detached plane must not be leaked for nothing. */
+	if (k->in_flight >= 0)
+		k->plane_attached = true;
 	k->shown = -1;
 	k->in_flight = -1;
 	k->n_limbo = 0;   /* the indices die with the buffers below */

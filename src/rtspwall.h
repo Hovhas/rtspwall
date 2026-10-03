@@ -170,7 +170,12 @@ struct camera {
 	 * plane_attached — the plane is currently showing a real buffer (the
 	 *                  latest confirmed commit had FB_ID != 0). Set true
 	 *                  in complete_flip when a real frame is confirmed,
-	 *                  false when the detach commit is confirmed.
+	 *                  false when the detach commit is confirmed. Also
+	 *                  set by teardown_stream when it gives up with a
+	 *                  real frame in flight (that flip lands unrecorded,
+	 *                  see teardown_stream): true means "may show
+	 *                  something", which is what every detach decision
+	 *                  needs.
 	 * detached       — condvar complete_flip signals when the detach
 	 *                  commit is confirmed. teardown_stream waits
 	 *                  (pthread_cond_timedwait, `lock` held, TEARDOWN_WAIT_S
@@ -186,6 +191,25 @@ struct camera {
 	 *                  connection attempt died before a single frame was
 	 *                  shown) the wait condition is false at once — no
 	 *                  commit, no wait.
+	 * generation     — bumped by teardown_stream under `lock` in the same
+	 *                  critical section that sets tearing_down. Closes the
+	 *                  window between compositor() step A (a frame is
+	 *                  popped from the fifo, `lock` dropped) and step C
+	 *                  (`lock` taken again, the frame committed or handed
+	 *                  back): with nothing in flight and the plane not
+	 *                  attached (first frame of a connection, an idle
+	 *                  rotation member) teardown_stream does not wait and
+	 *                  can run from start to end inside that window,
+	 *                  destroying the frame's fb and resetting the ring.
+	 *                  Step A records the generation with the frame; step
+	 *                  C uses the frame only if it is unchanged (and
+	 *                  tearing_down is not set), reading cap[i].fb while
+	 *                  still holding `lock` — otherwise the frame belongs
+	 *                  to a torn-down connection and is simply dropped
+	 *                  (neither committed nor ring_push()ed). Once step C
+	 *                  has set in_flight under `lock`, a teardown waits for
+	 *                  it (or keeps its fb alive in leaked[]), so the fb id
+	 *                  read there stays valid until the commit.
 	 *
 	 * leaked/n_leaked — when teardown_stream gives up and DELIBERATELY
 	 *                  leaks a protected index (shown/in flight/limbo,
@@ -239,6 +263,7 @@ struct camera {
 	bool             tearing_down;    /* teardown_stream wants the plane detached */
 	bool             plane_attached;  /* the plane shows a real buffer right now */
 	pthread_cond_t   detached;        /* signalled when the detach is confirmed */
+	unsigned         generation;      /* bumped per teardown, see above */
 
 	pthread_t        thread;
 	bool             thread_started;
