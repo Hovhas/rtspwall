@@ -216,10 +216,10 @@ static void complete_flip(struct wall *v, int64_t flip_time_us)
 
 		if (n_leaked_copy > 0) {
 			for (int j = 0; j < n_leaked_copy; j++) {
-				if (leaked_copy[j].fb)
-					drmModeRmFB(v->drmfd, leaked_copy[j].fb);
-				if (leaked_copy[j].dmafd >= 0)
-					close(leaked_copy[j].dmafd);
+				release_buffer(v->drmfd, leaked_copy[j].fb,
+					       leaked_copy[j].handle, leaked_copy[j].dmafd);
+				if (leaked_copy[j].handle)
+					atomic_fetch_sub(&k->bufs_held, 1);
 			}
 			log_msg("%s: cleaned up %d previously leaked buffer(s) after a confirmed flip",
 				k->name, n_leaked_copy);
@@ -306,6 +306,10 @@ static void percentile_str(const struct pacing_histogram *h, int percentile, cha
  *     previous line, leaks_active how many are still waiting right now.
  *     Should normally be 0/0 — visibility should a teardown timeout (the
  *     CRITICAL line in teardown_stream) ever happen.
+ *   - "bufs": imported decoder buffers (GEM handles) currently held for the
+ *     camera, live plus leaked (see bufs_held in struct camera). Should
+ *     equal the decoder's buffer count while streaming and must not grow
+ *     from reconnect to reconnect.
  *   The main line's dropped percentage is the most important receipt of
  *   smooth delivery: it should stay below 1 %. */
 static void report(struct wall *v)
@@ -375,8 +379,11 @@ static void report(struct wall *v)
 		percentile_str(&regulated, 50, rd50s, sizeof rd50s);
 		percentile_str(&regulated, 95, rd95s, sizeof rd95s);
 
-		log_msg("%s: diag regulated ptsdelta p5=%sms p50=%sms p95=%sms synthetic=%lu leaks_closed=%lu leaks_active=%d",
-			k->name, rd5s, rd50s, rd95s, synthetic, leaks_closed, n_leaked_now);
+		/* bufs_held is atomic (several writing threads, see struct
+		 * camera) — read without the lock. */
+		log_msg("%s: diag regulated ptsdelta p5=%sms p50=%sms p95=%sms synthetic=%lu leaks_closed=%lu leaks_active=%d bufs=%d",
+			k->name, rd5s, rd50s, rd95s, synthetic, leaks_closed, n_leaked_now,
+			atomic_load(&k->bufs_held));
 
 		k->m_shown = 0;
 		k->m_skipped = 0;

@@ -22,29 +22,44 @@
 
 /* ------------------------------------------------------------ V4L2 helpers */
 
+/* The fb references the GEM object, so it goes first, then the handle,
+ * then the dmabuf fd. The handle is the part that actually pins the
+ * imported dmabuf (and the decoder's CMA buffer behind it) for the life of
+ * the DRM fd — neither drmModeRmFB nor close(dmafd) drops that reference.
+ * drmCloseBufferHandle needs libdrm >= 2.4.109 (the build already requires
+ * 2.4.113). */
+void release_buffer(int drmfd, uint32_t fb, uint32_t handle, int dmafd)
+{
+	if (fb)
+		drmModeRmFB(drmfd, fb);
+	if (handle)
+		drmCloseBufferHandle(drmfd, handle);
+	if (dmafd >= 0)
+		close(dmafd);
+}
+
 /* CAPTURE indices marked in `keep` (NULL = none) must NOT be touched: the
  * teardown's timeout/quit/display-gone escape path in teardown_stream may
  * have to leave live buffers alone (leak them) instead of destroying them,
- * see the comment there. */
-void close_buffers(struct camera *k, const bool *keep)
+ * see the comment there. Their fb/handle/dmafd have already been handed
+ * to k->leaked, which owns them from then on. */
+void close_buffers(int drmfd, struct camera *k, const bool *keep)
 {
 	for (int i = 0; i < k->n_out; i++)
 		if (k->out[i].map) {
 			munmap(k->out[i].map, k->out[i].length);
 			k->out[i].map = NULL;
 		}
-	for (int i = 0; i < k->n_cap; i++) {
-		if (keep && i < CAPTURE_BUFFERS && keep[i])
+	for (int i = 0; i < k->n_cap && i < CAPTURE_BUFFERS; i++) {
+		if (keep && keep[i])
 			continue;
-		if (k->cap[i].fb) {
-			/* The fb belongs to the DRM fd and is cleaned up when the
-			 * program exits. On reconnect it is removed explicitly. */
-			k->cap[i].fb = 0;
-		}
-		if (k->cap[i].dmafd >= 0) {
-			close(k->cap[i].dmafd);
-			k->cap[i].dmafd = -1;
-		}
+		struct buffer *b = &k->cap[i];
+		release_buffer(drmfd, b->fb, b->handle, b->dmafd);
+		if (b->handle)
+			atomic_fetch_sub(&k->bufs_held, 1);
+		b->fb = 0;
+		b->handle = 0;
+		b->dmafd = -1;
 	}
 	k->n_out = k->n_cap = 0;
 	k->n_free = 0;
@@ -202,6 +217,16 @@ int start_capture(struct wall *v, struct camera *k)
 	}
 	k->n_cap = rb.count;
 
+	/* Start from empty slots. close_buffers has released every index of
+	 * the previous connection except the ones teardown_stream had to keep
+	 * (leak); those are owned by k->leaked now, and their stale values
+	 * must not survive in k->cap: should this function fail half-way, the
+	 * following teardown releases k->cap[0..n_cap) and would otherwise
+	 * free them a second time (a GEM handle or fb id may by then even
+	 * have been reused for a different buffer). */
+	for (int i = 0; i < CAPTURE_BUFFERS; i++)
+		k->cap[i] = (struct buffer){ .dmafd = -1 };
+
 	for (int i = 0; i < k->n_cap; i++) {
 		struct v4l2_exportbuffer eb = {
 			.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
@@ -219,6 +244,9 @@ int start_capture(struct wall *v, struct camera *k)
 			log_msg("%s: PrimeFDToHandle %d: %s", k->name, i, strerror(errno));
 			return -1;
 		}
+		/* Stored so teardown can close it — see struct buffer. */
+		k->cap[i].handle = handle;
+		atomic_fetch_add(&k->bufs_held, 1);
 
 		/* NV12 contiguous: Y first, then interleaved CbCr. */
 		uint32_t h[4] = { handle, handle, 0, 0 };
@@ -228,6 +256,13 @@ int start_capture(struct wall *v, struct camera *k)
 		if (drmModeAddFB2(v->drmfd, k->fb_width, k->fb_height,
 				  DRM_FORMAT_NV12, h, p, o, &k->cap[i].fb, 0)) {
 			log_msg("%s: AddFB2 %d: %s", k->name, i, strerror(errno));
+			/* Close the handle right here and clear it (and fb, which
+			 * a failed AddFB2 leaves unspecified) so the teardown
+			 * that follows only closes this slot's dmafd. */
+			drmCloseBufferHandle(v->drmfd, handle);
+			atomic_fetch_sub(&k->bufs_held, 1);
+			k->cap[i].handle = 0;
+			k->cap[i].fb = 0;
 			return -1;
 		}
 
