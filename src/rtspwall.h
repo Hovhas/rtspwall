@@ -170,7 +170,12 @@ struct camera {
 	 * plane_attached — the plane is currently showing a real buffer (the
 	 *                  latest confirmed commit had FB_ID != 0). Set true
 	 *                  in complete_flip when a real frame is confirmed,
-	 *                  false when the detach commit is confirmed.
+	 *                  false when the detach commit is confirmed. Also
+	 *                  set by teardown_stream when it gives up with a
+	 *                  real frame in flight (that flip lands unrecorded,
+	 *                  see teardown_stream): true means "may show
+	 *                  something", which is what every detach decision
+	 *                  needs.
 	 * detached       — condvar complete_flip signals when the detach
 	 *                  commit is confirmed. teardown_stream waits
 	 *                  (pthread_cond_timedwait, `lock` held, TEARDOWN_WAIT_S
