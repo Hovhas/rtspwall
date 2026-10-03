@@ -51,7 +51,6 @@
 #endif
 
 #define SERVICE_USER "rtspwall"
-#define GPU_MEM_DEFAULT_MB 76      /* Pi 4 firmware default */
 
 /* Kernels the wall has been verified on, one entry per tested kernel
  * (uname -r), NULL-terminated. */
@@ -221,46 +220,17 @@ static void check_decoder(struct doctor *d)
 			  dev, (const char *)cap.driver, (const char *)cap.card);
 }
 
-static void find_configtxt(struct doctor *d)
-{
-	static const char *paths[] = { "/boot/firmware/config.txt", "/boot/config.txt" };
-	d->configtxt_path[0] = '\0';
-	for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++)
-		if (access(paths[i], F_OK) == 0) {
-			snprintf(d->configtxt_path, sizeof d->configtxt_path, "%s", paths[i]);
-			return;
-		}
-}
-
-static int vcgencmd_gpu_mem(void)
-{
-	char out[128];
-	char *argv[] = { "vcgencmd", "get_mem", "gpu", NULL };
-	if (cli_run(argv, out, sizeof out, 5000) != 0)
-		return -1;
-	const char *eq = strchr(out, '=');
-	return eq ? atoi(eq + 1) : -1;
-}
-
 static void check_gpu_mem(struct doctor *d)
 {
-	find_configtxt(d);
-	int conf_mb = -1;
+	struct cli_gpu_mem g;
+	cli_gpu_mem_read(&g);
+	snprintf(d->configtxt_path, sizeof d->configtxt_path, "%s", g.configtxt_path);
+	d->gpu_info = g.info;
 	struct configtxt_gpu *gi = &d->gpu_info;
-	memset(gi, 0, sizeof *gi);
-	gi->value = -1;
-	gi->key = "";
-	if (d->configtxt_path[0]) {
-		char *t = cli_read_file(d->configtxt_path, 256 * 1024);
-		if (t) {
-			configtxt_gpu_mem_info(t, gi);
-			conf_mb = gi->value;
-			free(t);
-		}
-	}
+	int conf_mb = g.configtxt;
 	d->gpu_configtxt = conf_mb;
-	int live_mb = vcgencmd_gpu_mem();
-	d->gpu_effective = live_mb > 0 ? live_mb : conf_mb > 0 ? conf_mb : GPU_MEM_DEFAULT_MB;
+	int live_mb = g.live;
+	d->gpu_effective = live_mb > 0 ? live_mb : conf_mb > 0 ? conf_mb : CLI_GPU_MEM_DEFAULT_MB;
 
 	char have[200];
 	snprintf(have, sizeof have, "gpu_mem %d MB (%s%s%s%s)", d->gpu_effective,
@@ -296,23 +266,26 @@ static void check_gpu_mem(struct doctor *d)
 		urls[i] = d->cfg.cam[i].url;
 	probe_urls(urls, d->cfg.count, CLI_PROBE_TIMEOUT_MS, res);
 	long total = 0;
-	int measured = 0;
+	int measured = 0, n_large = 0;
 	for (int i = 0; i < d->cfg.count; i++) {
-		long m = res[i].err == PROBE_OK && res[i].s.codec == PROBE_CODEC_H264
-			 ? budget_stream_mbps(res[i].s.width, res[i].s.height, res[i].s.fps) : 0;
+		bool h264 = res[i].err == PROBE_OK && res[i].s.codec == PROBE_CODEC_H264;
+		long m = h264 ? budget_stream_mbps(res[i].s.width, res[i].s.height, res[i].s.fps) : 0;
 		if (m > 0) {
 			total += m;
 			measured++;
 		}
+		if (h264 && gpu_mem_large_stream(res[i].s.width, res[i].s.height))
+			n_large++;
 	}
-	if (!measured) {
+	if (!measured && !n_large) {
 		char fix[300];
 		snprintf(fix, sizeof fix, "sudo rtspwall probe %.200s", d->config);
 		add_check(d, L_INFO, "gpu_mem", fix, "%s; need unknown (no camera could be probed)",
 			  have);
 		return;
 	}
-	d->gpu_needed = doctor_gpu_mem_needed(total, d->cfg.count);
+	unsigned why = GPU_NEED_NONE;
+	d->gpu_needed = doctor_gpu_mem_needed(total, n_large, &why);
 	if (d->gpu_needed && d->gpu_effective < d->gpu_needed && conf_mb >= d->gpu_needed) {
 		add_check(d, L_WARN, "gpu_mem", "sudo reboot",
 			  "%s; %s=%d is set in config.txt but not active until a reboot",
@@ -326,8 +299,10 @@ static void check_gpu_mem(struct doctor *d)
 				 "then: sudo reboot)", gi->key[0] ? gi->key : "gpu_mem", d->gpu_needed,
 				 d->configtxt_path[0] ? d->configtxt_path : "config.txt");
 		add_check(d, L_WARN, "gpu_mem", fix,
-			  "%s; the cameras use %.0f %% of the decoder%s and need %d MB%s%s%s", have,
+			  "%s; the cameras use %.0f %% of the decoder%s%s and need %d MB%s%s%s", have,
 			  budget_percent(total), measured < d->cfg.count ? " (lower bound)" : "",
+			  (why & GPU_NEED_LARGE)
+				  ? " with 4 or more streams of 1080p or larger" : "",
 			  d->gpu_needed, gi->uncertain ? " (config.txt also sets gpu_mem under " : "",
 			  gi->uncertain ? gi->filter : "",
 			  gi->uncertain ? ", which may or may not apply here)" : "");

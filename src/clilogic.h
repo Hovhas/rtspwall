@@ -139,9 +139,41 @@ int configtxt_gpu_mem(const char *text);
  * `out` is too small. */
 int configtxt_set_gpu_mem(const char *text, int mb, char *out, size_t outlen);
 
-/* gpu_mem in MB the current camera load needs, or 0 if the firmware
- * default is enough. `total_mbps` is the budget sum (budget.h). */
-int doctor_gpu_mem_needed(long total_mbps, int n_cameras);
+/* gpu_mem in MB the camera load needs, or 0 if the firmware default
+ * (76 MB) is enough. `total_mbps` is the budget sum (budget.h) of the
+ * streams that could be measured; `n_large` counts the H.264 streams of
+ * 1080p or larger (gpu_mem_large_stream), frame rate known or not.
+ *
+ * 256 MB when the load is above half the decoder budget, or with 4 or more
+ * large streams. Evidence (Pi 4, gpu_mem=76): 4 x 1920x1080 wedged the
+ * codec until a reboot ("Not enough GPU mem"); 4 x 1024x576 at 25-30 fps
+ * (~46 %) works.
+ *
+ * `why` (may be NULL) gets the rules that fired, GPU_NEED_* flags. The
+ * large-stream rule matches what wedged the codec on hardware; the budget
+ * rule is an unvalidated heuristic, so add only refuses on GPU_NEED_LARGE
+ * (doctor WARNs on both). */
+#define GPU_MEM_LARGE_COUNT 4
+#define GPU_NEED_NONE   0u
+#define GPU_NEED_BUDGET 1u      /* above half the decoder budget */
+#define GPU_NEED_LARGE  2u      /* GPU_MEM_LARGE_COUNT+ streams of >= 1080p */
+int doctor_gpu_mem_needed(long total_mbps, int n_large, unsigned *why);
+
+/* True for a stream of at least 1920x1080 pixels (either orientation). */
+bool gpu_mem_large_stream(int width, int height);
+
+enum gpu_check {
+	GPU_CHECK_OK,          /* nothing needed, or the active value is enough */
+	GPU_CHECK_UNKNOWN,     /* needed, but the active value is unknown */
+	GPU_CHECK_LOW,         /* the active value is too low */
+	GPU_CHECK_LOW_REBOOT,  /* too low, but config.txt already has enough:
+				  active after a reboot */
+};
+
+/* Compares the need (doctor_gpu_mem_needed) with the active gpu_mem
+ * (`live`, from vcgencmd; <= 0 = unknown) and config.txt's value
+ * (`configtxt`, -1 = unset). An unknown active value is never LOW. */
+enum gpu_check gpu_mem_check(int need, int live, int configtxt);
 
 /* dmesg patterns worth reporting: returns a short label for the line, or
  * NULL. Patterns: "Not enough GPU mem", vb2 "driver bug", MMAL timeouts. */
