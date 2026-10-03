@@ -81,9 +81,9 @@ int open_decoder(const char *device, struct camera *k)
 
 	/* Width and height are deliberately left 0 ("unknown"). Given a size
 	 * here, bcm2835-codec copies it to its CAPTURE port up front; when the
-	 * stream then decodes to exactly that format (e.g. the 640x360 demo
-	 * clips) the firmware sees no format change, sends no
-	 * V4L2_EVENT_SOURCE_CHANGE, and waits for CAPTURE buffers that
+	 * stream then decodes to that format (seen with the 640x360 demo
+	 * clips) the firmware may send no V4L2_EVENT_SOURCE_CHANGE, and the
+	 * decoder waits for CAPTURE buffers that
 	 * check_events would only set up after that event - the decoder stops
 	 * taking OUTPUT buffers ("no free OUTPUT buffer for 10 s"). With 0x0
 	 * the event always comes once the SPS is parsed, and start_capture
