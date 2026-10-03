@@ -266,6 +266,13 @@ struct camera {
 	enum { PTS_MODE_UNKNOWN, PTS_MODE_SOURCE, PTS_MODE_ARRIVAL } pts_mode;
 	bool             pts_mode_logged;
 
+	/* Set once the first decoded frame of the connection has been paired
+	 * with the arrival queue; reset per connection next to
+	 * pts_mode_logged. Before it, packets without a matching frame are
+	 * normal (dropped ahead of the first IDR), not a corrupt frame — see
+	 * pacing_unmatched_classify. Written by the camera thread only. */
+	bool             first_frame_seen;
+
 	int64_t          last_pts_us;      /* -1 = no pts yet in this connection */
 	struct pacing_anchor anchor;
 

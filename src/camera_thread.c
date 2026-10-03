@@ -279,9 +279,22 @@ static void collect_decoded(struct wall *v, struct camera *k)
 				unsigned slot = i % ARRIVAL_QUEUE_SIZE;
 				pts_us = k->arrival_queue[slot].pts_us;
 				arrival_us = k->arrival_queue[slot].arrival_us;
-				if (i > k->arrival_out)
+				unsigned n = i - k->arrival_out;
+				switch (pacing_unmatched_classify(k->first_frame_seen, n)) {
+				case PACING_UNMATCHED_STARTUP:
+					/* Packets ahead of the first IDR, or fed
+					 * before the CAPTURE queue was set up, are
+					 * dropped by the decoder — not corruption. */
+					log_msg("%s: pacing: first frame after %u packet(s) (normal at connect)",
+						k->name, n);
+					break;
+				case PACING_UNMATCHED_SKIPPED:
 					log_msg("%s: pacing: %u packet(s) without a matching frame (the decoder skipped a corrupt frame)",
-						k->name, i - k->arrival_out);
+						k->name, n);
+					break;
+				case PACING_UNMATCHED_NONE:
+					break;
+				}
 				k->arrival_out = i + 1;
 			} else if (k->arrival_out < k->arrival_in) {
 				/* No match — queue out of sync. Queue order is all
@@ -316,6 +329,7 @@ static void collect_decoded(struct wall *v, struct camera *k)
 				pts_us = arrival_us = now;
 			}
 		}
+		k->first_frame_seen = true;
 
 		int64_t target_us;
 		bool have_jitter = false;
@@ -775,6 +789,7 @@ void *camera_thread(void *arg)
 		k->last_pts_us = -1;
 		k->pts_mode = PTS_MODE_UNKNOWN;
 		k->pts_mode_logged = false;
+		k->first_frame_seen = false;
 		pacing_pll_init(&k->pll);
 		k->r_prev_frame_us = -1;
 

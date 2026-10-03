@@ -53,9 +53,12 @@
 #define SERVICE_USER "rtspwall"
 #define GPU_MEM_DEFAULT_MB 76      /* Pi 4 firmware default */
 
-/* Kernels the wall has been verified on (MMP-11 fills this in; one entry
- * per tested kernel, e.g. "6.6.51+rpt-rpi-v8"). */
-static const char *const tested_kernels[] = { NULL };
+/* Kernels the wall has been verified on, one entry per tested kernel
+ * (uname -r), NULL-terminated. */
+static const char *const tested_kernels[] = {
+	"6.18.50+rpt-rpi-v8",
+	NULL,
+};
 
 enum level { L_PASS, L_INFO, L_WARN, L_FAIL };
 static const char *const level_name[] = { "PASS", "INFO", "WARN", "FAIL" };

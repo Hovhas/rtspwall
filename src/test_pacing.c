@@ -1337,6 +1337,20 @@ static void test_conn_follow(void)
 	ASSERT_EQ_I(pacing_conn_follow_update(&f, true, false, true, 400 * S, STABLE), PACING_CONN_STAY);
 }
 
+static void test_unmatched_classify(void)
+{
+	/* every packet produced a frame: nothing to report */
+	ASSERT_EQ_I(pacing_unmatched_classify(false, 0), PACING_UNMATCHED_NONE);
+	ASSERT_EQ_I(pacing_unmatched_classify(true, 0), PACING_UNMATCHED_NONE);
+	/* before the first frame of a connection: packets ahead of the
+	 * first IDR are dropped by the decoder, which is normal */
+	ASSERT_EQ_I(pacing_unmatched_classify(false, 1), PACING_UNMATCHED_STARTUP);
+	ASSERT_EQ_I(pacing_unmatched_classify(false, 26), PACING_UNMATCHED_STARTUP);
+	/* after the first frame: the decoder skipped a frame mid-stream */
+	ASSERT_EQ_I(pacing_unmatched_classify(true, 1), PACING_UNMATCHED_SKIPPED);
+	ASSERT_EQ_I(pacing_unmatched_classify(true, 26), PACING_UNMATCHED_SKIPPED);
+}
+
 int main(void)
 {
 	test_anchor_sliding_minimum();
@@ -1412,6 +1426,9 @@ int main(void)
 	test_retry_backoff();
 	test_teardown_skip_wait();
 	test_conn_follow();
+
+	/* unmatched packets at connect are not corruption */
+	test_unmatched_classify();
 
 	return test_summary("test_pacing");
 }
