@@ -138,7 +138,7 @@ All commands that touch the system need `sudo`.
 - If the config changed while it probed the camera, it writes nothing and tells you to run `add` again.
 - It writes a temporary file next to the config. Ctrl-C removes that file, because it holds the camera password.
 - It refuses to run if the config's directory is writable by other users.
-- Before it writes, it checks [`gpu_mem`](glossary.md#gpu_mem) for all cameras in the new config. With 4 or more streams of 1080p or larger and too little active `gpu_mem`, it adds nothing. That setup has locked up the decoder until a reboot. It tells you to run `sudo rtspwall doctor --fix` and then reboot, or to use the camera's sub-stream. `--force` adds the camera anyway.
+- Before it writes, it checks [`gpu_mem`](glossary.md#gpu_mem) for all cameras in the new config. With 4 or more streams of 1080p or larger and too little active `gpu_mem`, it adds nothing. On a Pi 4, four 1920x1080 streams at the default 76 MB locked up the decoder until a reboot. It tells you to run `sudo rtspwall doctor --fix` and then reboot, or to use the camera's sub-stream. `--force` adds the camera anyway.
 - If the cameras only use more than half the decoder budget, `add` warns and still adds the camera. That rule is an estimate, not tested on hardware. It also only warns if it cannot read the active value (`vcgencmd` is missing).
 - After the change, the watcher `rtspwall-config.path` restarts the wall when it is active. Otherwise `add` starts or restarts the service itself.
 
@@ -146,7 +146,7 @@ All commands that touch the system need `sudo`.
 
 - **Config permissions:** `FAIL` if the config is writable by anyone but root.
 - **UniFi:** `WARN` for each camera that uses `UNIFI_REWRITE=plain`. The warning is stronger when the default route goes over Wi-Fi (`wlan`).
-- **`gpu_mem`:** the cameras need 256 MB when 4 or more of them send 1080p or larger, even when the frame rate is unknown. Four 1080p streams at the default 76 MB have locked up the decoder. Doctor also asks for 256 MB when the cameras use more than half the decoder budget. That rule is an estimate, not tested on hardware. Both give a `WARN`. It understands `gpu_mem_1024`, which overrides `gpu_mem` on a Pi 4, and the section filters in `config.txt`. If a `gpu_mem` line sits under a filter doctor cannot evaluate (for example `[HDMI:0]` or `[board-type=...]`), it gives a `WARN` instead of a guess. `doctor --fix` then changes nothing and tells you to set the value by hand under `[all]`.
+- **`gpu_mem`:** the cameras need 256 MB when 4 or more of them send 1080p or larger, even when the frame rate is unknown (see [How `add` edits the file](#how-add-edits-the-file)). Doctor also asks for 256 MB when the cameras use more than half the decoder budget. That rule is an estimate, not tested on hardware. Both give a `WARN`. It understands `gpu_mem_1024`, which overrides `gpu_mem` on a Pi 4, and the section filters in `config.txt`. If a `gpu_mem` line sits under a filter doctor cannot evaluate (for example `[HDMI:0]` or `[board-type=...]`), it gives a `WARN` instead of a guess. `doctor --fix` then changes nothing and tells you to set the value by hand under `[all]`.
 
 ### Exit codes of the wall
 
