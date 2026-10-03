@@ -277,7 +277,7 @@ static void check_gpu_mem(struct doctor *d)
 		if (h264 && gpu_mem_large_stream(res[i].s.width, res[i].s.height))
 			n_large++;
 	}
-	if (!measured && !n_large) {
+	if (!measured && n_large < GPU_MEM_LARGE_COUNT) {
 		char fix[300];
 		snprintf(fix, sizeof fix, "sudo rtspwall probe %.200s", d->config);
 		add_check(d, L_INFO, "gpu_mem", fix, "%s; need unknown (no camera could be probed)",
