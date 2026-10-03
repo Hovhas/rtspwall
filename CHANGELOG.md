@@ -71,6 +71,7 @@ Formerly named rpi4-rtsp (renamed before the first release).
 - A camera that reconnected at the exact moment one of its frames was being put on screen could make that display update fail. That frame is now dropped.
 - Moving the wall to another HDMI port now detaches every camera from the old port first.
 - A failed display update now wakes a camera that is waiting to shut down, so it does not wait out its timeout.
+- A normal stop no longer logs `NAME: CRITICAL: teardown gave up ...` and `NAME: cleaned up N leaked buffer(s) on exit` for every camera, or a TLS error (`ffmpeg: [tls @ ...] Error decoding the received TLS packet.`).
 
 ### Security
 

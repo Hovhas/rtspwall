@@ -95,10 +95,10 @@ Camera lines have this shape: `NAME: <label>: <detail> - <hint>; next attempt in
 | `NAME: UniFi Protect rtsps URL rewritten to plain RTSP on port 7447 (UNIFI_REWRITE=plain) (...)` followed by `NAME: WARNING: plaintext: the UniFi token and video travel unencrypted on your LAN - UNIFI_REWRITE=tls keeps rtsps` | You set `UNIFI_REWRITE=plain`. | Remove that line from the config to go back to encrypted `rtsps`. See [SECURITY.md](../SECURITY.md#the-unifi-tls-trade-off). |
 | `NAME: local file - played at its natural speed and looped` | The URL is a local video file, not a camera. | Nothing. It is used for tests and demos. |
 | `NAME: unknown option ignored: ...` | Harmless. | Nothing. |
-| `ffmpeg: ...` | FFmpeg's own message, with URLs masked. | Set `FFMPEG_LOGLEVEL=warning` or `info` for more. |
+| `ffmpeg: ...` | FFmpeg's own message, with URLs masked. Errors are not logged while the wall stops. | Set `FFMPEG_LOGLEVEL=warning` or `info` for more. |
 | `rotation: skipping NAME (no fresh frame for > 3 s), staying on NAME` | A camera in a rotation group has no picture. | Fix that camera. The wall carries on. |
-| `NAME: CRITICAL: teardown gave up ...` or `CRITICAL: leak list full` | A buffer was kept on purpose instead of freed. | Report it with `doctor --report`. The counters `leaks_closed` and `leaks_active` show it in the 60 s lines. `bufs` (decoder buffers held, usually 16 while the camera plays) must not grow from reconnect to reconnect. |
-| `NAME: cleaned up N previously leaked buffer(s) after a confirmed flip`, `NAME: cleaned up N previously leaked buffer(s) after the display switch` or `NAME: cleaned up N leaked buffer(s) on exit` | Buffers that were kept earlier are now freed. | Nothing. It is the all-clear after a `CRITICAL` line. |
+| `NAME: CRITICAL: teardown gave up ...` or `CRITICAL: leak list full` | A buffer was kept on purpose instead of freed. `teardown gave up` is not printed on a normal stop. | Report it with `doctor --report`. The counters `leaks_closed` and `leaks_active` show it in the 60 s lines. `bufs` (decoder buffers held, usually 16 while the camera plays) must not grow from reconnect to reconnect. |
+| `NAME: cleaned up N previously leaked buffer(s) after a confirmed flip` or `NAME: cleaned up N previously leaked buffer(s) after the display switch` | Buffers that were kept earlier are now freed. | Nothing. It is the all-clear after a `CRITICAL` line. |
 
 ### Other lines in the log
 

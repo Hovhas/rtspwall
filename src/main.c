@@ -179,7 +179,8 @@ void av_last_error_clear(void)
  * (default errors only), every URL in the line masked (libav messages can
  * quote the URL it was given, credentials included), and control
  * characters replaced so a stream or server cannot inject terminal escape
- * sequences or fake lines into the journal. */
+ * sequences or fake lines into the journal. Error lines are dropped once
+ * quit is set (the aborted reads of a normal stop, see below). */
 static void av_log_masked(void *avcl, int level, const char *fmt, va_list vl)
 {
 	char line[1024], masked[1024];
@@ -200,6 +201,12 @@ static void av_log_masked(void *avcl, int level, const char *fmt, va_list vl)
 	if (level <= AV_LOG_ERROR)
 		snprintf(av_last_err, sizeof av_last_err, "%.255s", masked);
 	if (level > shown)
+		return;
+	/* Stopping: interrupt_cb aborts every blocking read, and libav
+	 * reports that as an error (e.g. "[tls @ 0x...] Error decoding the
+	 * received TLS packet.") - an expected consequence of the stop, not
+	 * a fault, so not logged. */
+	if (quit && level <= AV_LOG_ERROR)
 		return;
 
 	/* A camera retrying with a wrong password makes FFmpeg repeat the
@@ -408,7 +415,10 @@ out:
 	/* Leaked buffers: by now ALL camera threads have been joined — nobody
 	 * writes k->leaked any more, no lock needed. Clean up whatever never
 	 * got confirmed by a flip (see .leaked in struct camera and
-	 * complete_flip). */
+	 * complete_flip). Not logged: almost every entry here comes from the
+	 * teardown at quit itself (a normal stop, see `stopping` in
+	 * teardown_stream), and any older one was already logged when it was
+	 * leaked - an "on exit" line would only add noise to every stop. */
 	for (int i = 0; i < v.count; i++) {
 		struct camera *k = &v.cam[i];
 		for (int j = 0; j < k->n_leaked; j++) {
@@ -417,8 +427,6 @@ out:
 			if (k->leaked[j].handle)
 				atomic_fetch_sub(&k->bufs_held, 1);
 		}
-		if (k->n_leaked)
-			log_msg("%s: cleaned up %d leaked buffer(s) on exit", k->name, k->n_leaked);
 		k->n_leaked = 0;
 	}
 
