@@ -45,10 +45,10 @@ Use the user name and hostname you set in Step 0. If `.local` names do not work 
 curl -fsSL https://github.com/Hovhas/rtspwall/releases/latest/download/get.sh | sudo bash
 ```
 
-> **Testing the release candidate?** v0.1.0 is not out yet, so the command above does not work until it is. Install v0.1.0-rc2 with:
+> **Testing the release candidate?** v0.1.0 is not out yet, so the command above does not work until it is. Install v0.1.0-rc3 with:
 >
 > ```bash
-> curl -fsSL https://github.com/Hovhas/rtspwall/releases/download/v0.1.0-rc2/get.sh | sudo RTSPWALL_VERSION=v0.1.0-rc2 bash
+> curl -fsSL https://github.com/Hovhas/rtspwall/releases/download/v0.1.0-rc3/get.sh | sudo RTSPWALL_VERSION=v0.1.0-rc3 bash
 > ```
 >
 > Reports are welcome through the [issue forms](https://github.com/Hovhas/rtspwall/issues/new/choose), especially the camera report.

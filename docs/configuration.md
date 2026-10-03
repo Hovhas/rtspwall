@@ -127,7 +127,7 @@ All commands that touch the system need `sudo`.
 | `rtspwall --check-config [--mode WxH] [CONFIG]` | Validate a config and print the layout. `--mode` sets the screen size to lay out for (default `1920x1080`). |
 | `rtspwall --help`, `rtspwall --version` | Help and version. |
 | `rtspwall probe [--insecure-argv] [URL \| - \| CONFIG \| FILE]` | Check a stream without playing it. No argument: hidden prompt. `-`: read the URL from stdin. A config file: probe every camera. A local video file: probe the file. A URL with a password, query string or token on the command line is **refused**, because the command line ends up in shell history, `ps` and the `sudo` log. `--insecure-argv` allows it anyway. As root, each probe runs as the user `rtspwall` in a sandbox. Only regular files are probed. Exit status: 0 `PASS`, 1 `WARN`, 2 `FAIL` or error. |
-| `rtspwall add [--config PATH] [--force] [--no-systemd] NAME [CELL]` | Probe a camera, add it to the first free cell (or `CELL`), then start or restart the service. A taken `CELL` makes a rotation group. `--force` adds despite a `FAIL`. `--no-systemd` only edits the file. Needs a `GRID=` line and grid-style config. See [How `add` edits the file](#how-add-edits-the-file). |
+| `rtspwall add [--config PATH] [--force] [--no-systemd] NAME [CELL]` | Probe a camera, add it to the first free cell (or `CELL`), then start or restart the service. A taken `CELL` makes a rotation group. `--force` adds despite a `FAIL` or too little `gpu_mem` for 4 or more 1080p streams. `--no-systemd` only edits the file. Needs a `GRID=` line and grid-style config. See [How `add` edits the file](#how-add-edits-the-file). |
 | `rtspwall doctor [--config PATH] [--fix] [--yes] [--report] [--summary] [--no-hardware] [--no-probe]` | Self-test with one `PASS`, `INFO`, `WARN` or `FAIL` line per check and a fix to copy. `--fix` offers to set `gpu_mem=256` (asks first, backs up `config.txt`, prints the command to undo it, never reboots). `--yes` answers yes without a terminal. `--report` prints one block for bug reports with URLs and tokens masked. `--summary` prints only problems and totals. `--no-hardware` skips checks that need the Pi. `--no-probe` does not contact the cameras. Exit status: 0 all pass, 1 warnings, 2 failures. See [What `doctor` checks](#what-doctor-checks). |
 | `rtspwall demo` | Show the built-in 2x2 demo wall. Ctrl-C stops it and restores the previous state. |
 
@@ -138,13 +138,15 @@ All commands that touch the system need `sudo`.
 - If the config changed while it probed the camera, it writes nothing and tells you to run `add` again.
 - It writes a temporary file next to the config. Ctrl-C removes that file, because it holds the camera password.
 - It refuses to run if the config's directory is writable by other users.
+- Before it writes, it checks [`gpu_mem`](glossary.md#gpu_mem) for all cameras in the new config. With 4 or more streams of 1080p or larger and too little active `gpu_mem`, it adds nothing. On a Pi 4, four 1920x1080 streams at the default 76 MB locked up the decoder until a reboot. It tells you to run `sudo rtspwall doctor --fix` and then reboot, or to use the camera's sub-stream. `--force` adds the camera anyway.
+- If the cameras only use more than half the decoder budget, `add` warns and still adds the camera. That rule is an estimate, not tested on hardware. It also only warns if it cannot read the active value (`vcgencmd` is missing).
 - After the change, the watcher `rtspwall-config.path` restarts the wall when it is active. Otherwise `add` starts or restarts the service itself.
 
 ### What `doctor` checks
 
 - **Config permissions:** `FAIL` if the config is writable by anyone but root.
 - **UniFi:** `WARN` for each camera that uses `UNIFI_REWRITE=plain`. The warning is stronger when the default route goes over Wi-Fi (`wlan`).
-- **`gpu_mem`:** it understands `gpu_mem_1024`, which overrides `gpu_mem` on a Pi 4, and the section filters in `config.txt`. If a `gpu_mem` line sits under a filter doctor cannot evaluate (for example `[HDMI:0]` or `[board-type=...]`), it gives a `WARN` instead of a guess. `doctor --fix` then changes nothing and tells you to set the value by hand under `[all]`.
+- **`gpu_mem`:** the cameras need 256 MB when 4 or more of them send 1080p or larger, even when the frame rate is unknown (see [How `add` edits the file](#how-add-edits-the-file)). Doctor also asks for 256 MB when the cameras use more than half the decoder budget. That rule is an estimate, not tested on hardware. Both give a `WARN`. It understands `gpu_mem_1024`, which overrides `gpu_mem` on a Pi 4, and the section filters in `config.txt`. If a `gpu_mem` line sits under a filter doctor cannot evaluate (for example `[HDMI:0]` or `[board-type=...]`), it gives a `WARN` instead of a guess. `doctor --fix` then changes nothing and tells you to set the value by hand under `[all]`.
 
 ### Exit codes of the wall
 

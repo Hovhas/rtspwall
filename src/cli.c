@@ -495,3 +495,38 @@ bool cli_unit_exists(const char *unit)
 		return false;
 	return strncmp(out, "loaded", 6) == 0;
 }
+
+/* ---------------------------------------------------------------- gpu_mem */
+
+static int vcgencmd_gpu_mem(void)
+{
+	char out[128];
+	char *argv[] = { "vcgencmd", "get_mem", "gpu", NULL };
+	if (cli_run(argv, out, sizeof out, 5000) != 0)
+		return -1;
+	const char *eq = strchr(out, '=');
+	return eq ? atoi(eq + 1) : -1;
+}
+
+void cli_gpu_mem_read(struct cli_gpu_mem *g)
+{
+	static const char *paths[] = { "/boot/firmware/config.txt", "/boot/config.txt" };
+	memset(g, 0, sizeof *g);
+	g->info.value = -1;
+	g->info.key = "";
+	g->configtxt = -1;
+	for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++)
+		if (access(paths[i], F_OK) == 0) {
+			snprintf(g->configtxt_path, sizeof g->configtxt_path, "%s", paths[i]);
+			break;
+		}
+	if (g->configtxt_path[0]) {
+		char *t = cli_read_file(g->configtxt_path, 256 * 1024);
+		if (t) {
+			configtxt_gpu_mem_info(t, &g->info);
+			g->configtxt = g->info.value;
+			free(t);
+		}
+	}
+	g->live = vcgencmd_gpu_mem();
+}

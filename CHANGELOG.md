@@ -51,10 +51,13 @@ Formerly named rpi4-rtsp (renamed before the first release).
 - The per-camera diagnostic line ends with a new field, `bufs=N`: the decoder buffers the camera holds (usually 16 while it plays). It must not grow from one reconnect to the next.
 - New log line when packets arrive before the first picture of a connection: `NAME: pacing: first frame after N packet(s) (normal at connect)`.
 - `doctor` lists kernel 6.18.50+rpt-rpi-v8 as tested.
+- `doctor` says that 4 or more streams of 1080p or larger need `gpu_mem=256`, even when the frame rate is unknown. Before, only a load above half the decoder budget counted. Both rules give a `WARN`.
 
 ### Fixed
 
 - The issue form `bug.yml` was invalid YAML and is corrected.
+- `add` checked the decoder budget but not `gpu_mem`. Four 1080p streams at the default `gpu_mem=76` passed, and the decoder firmware ran out of memory and stayed locked up until a reboot. `add` now refuses when the new config has 4 or more streams of 1080p or larger and less `gpu_mem` is active than they need (`rtspwall: not added (gpu_mem: ...)`). It tells you to run `sudo rtspwall doctor --fix` and then reboot, or to use the camera's sub-stream. `--force` adds anyway. When the cameras only use more than half the decoder budget (an estimate, not tested on hardware), or `vcgencmd` is missing, it warns and still adds the camera.
+- `rtspwall demo` showed black tiles and logged `NAME: no free OUTPUT buffer for 10 s`. The wall told the decoder a picture size in advance; with the 640x360 demo clips the decoder then never reported the stream's size, and decoding stopped. The wall no longer gives a size, so the decoder always reports it, for cameras too.
 - Without `CONNECTOR`, the wall follows the HDMI cable to the other port after 10 s instead of waiting on a disconnected one, moves back when the original port returns, and never moves to (or starts on) DSI or composite outputs while an HDMI/DVI/DP output exists.
 - `MODE=auto` no longer stays on a reserve mode (e.g. 1024x768) when the TV was in standby at boot; it switches once the real modes appear.
 - DNS failures are reported as `unreachable` with a hint instead of a generic error.
@@ -68,6 +71,7 @@ Formerly named rpi4-rtsp (renamed before the first release).
 - A camera that reconnected at the exact moment one of its frames was being put on screen could make that display update fail. That frame is now dropped.
 - Moving the wall to another HDMI port now detaches every camera from the old port first.
 - A failed display update now wakes a camera that is waiting to shut down, so it does not wait out its timeout.
+- A normal stop no longer logs `NAME: CRITICAL: teardown gave up ...` and `NAME: cleaned up N leaked buffer(s) on exit` for every camera, or a TLS error (`ffmpeg: [tls @ ...] Error decoding the received TLS packet.`).
 
 ### Security
 

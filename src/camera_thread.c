@@ -515,8 +515,13 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	}
 	/* The wait may also have ended because quit was set while we waited
 	 * (see the broadcast at the end of main()) — same "gave up" state as
-	 * ETIMEDOUT, just sooner. */
-	if (quit && (k->plane_attached || k->in_flight != -1))
+	 * ETIMEDOUT, just sooner, and handled the same safe way below
+	 * (keep[]/leak list, freed by main() after the threads are joined).
+	 * That is a normal stop, though, not a fault: on quit the leak is not
+	 * logged (stopping = true), so a clean shutdown never prints the
+	 * CRITICAL line users are told to report. */
+	bool stopping = quit;
+	if (stopping && (k->plane_attached || k->in_flight != -1))
 		gave_up = true;
 	k->tearing_down = false;
 
@@ -540,11 +545,12 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	 * connector switch (display_remodeset) would free the leaked buffer
 	 * while it is still scanned out. The protected indices are leaked
 	 * DELIBERATELY right here (no release_buffer for them in this
-	 * function) — rare and visible through the log line below, better
-	 * than a use-after-free against the display. The leak is NOT
-	 * permanent though: fb/handle/dmafd are saved in k->leaked (see camera_leak_push) and cleaned up by complete_flip on
-	 * the next confirmed flip for the camera, or at program exit — without
-	 * that the fd/GEM handle would be lost for good the next time
+	 * function) — rare and visible through the log line below (except
+	 * on a normal stop), better than a use-after-free against the
+	 * display. The leak is NOT permanent though: fb/handle/dmafd are
+	 * saved in k->leaked (see camera_leak_push) and cleaned up by
+	 * complete_flip on the next confirmed flip for the camera, or at
+	 * program exit — without that the fd/GEM handle would be lost for good the next time
 	 * start_capture overwrote the same index. Limbo indices count as "may
 	 * be on screen" exactly like shown/in_flight: the abandoned flip that
 	 * parked them was never confirmed. */
@@ -573,11 +579,13 @@ static void teardown_stream(struct wall *v, struct camera *k)
 			 * unchanged because the handle is still held. */
 			camera_leak_push(k, k->cap[c].fb, k->cap[c].handle, k->cap[c].dmafd);
 		}
-		if (n_keep && skip_wait)
+		/* Not logged on a normal stop (stopping, see above). */
+		bool log_leak = n_keep && !stopping;
+		if (log_leak && skip_wait)
 			log_msg("%s: display disconnected - not waiting for the plane to detach; %d "
 				"buffer(s) that may still be on screen are freed after the next "
 				"confirmed flip", k->name, n_keep);
-		else if (n_keep)
+		else if (log_leak)
 			log_msg("%s: CRITICAL: teardown gave up (shown=%d in_flight=%d limbo=%d plane_attached=%d) - leaking %d live buffer(s) instead of destroying them",
 				k->name, k->shown, k->in_flight, k->n_limbo, k->plane_attached, n_keep);
 	}
@@ -905,8 +913,7 @@ void *camera_thread(void *arg)
 			}
 		}
 
-		if (open_decoder(v->cfg.decoder, k, cp->width ? cp->width : 1024,
-				 cp->height ? cp->height : 576) < 0) {
+		if (open_decoder(v->cfg.decoder, k) < 0) {
 			fault = PACING_FAULT_DECODER;
 			snprintf(what, sizeof what, "the hardware decoder %s could not be set up",
 				 v->cfg.decoder);

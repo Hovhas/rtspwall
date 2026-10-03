@@ -148,4 +148,17 @@ void cli_unit_state(const char *unit, char *out, size_t outlen);
 bool cli_unit_running(const char *unit);
 bool cli_unit_exists(const char *unit);
 
+/* gpu_mem (doctor, add) */
+#define CLI_GPU_MEM_DEFAULT_MB 76      /* Pi 4 firmware default */
+
+struct cli_gpu_mem {
+	char configtxt_path[64];     /* /boot/firmware/config.txt, /boot/config.txt or "" */
+	int  configtxt;              /* MB in config.txt, -1 = unset or unreadable */
+	struct configtxt_gpu info;   /* which key, filters that cannot be evaluated */
+	int  live;                   /* MB active now (vcgencmd get_mem gpu), -1 = unknown */
+};
+
+/* Reads config.txt (configtxt_gpu_mem_info) and the active value. */
+void cli_gpu_mem_read(struct cli_gpu_mem *g);
+
 #endif
