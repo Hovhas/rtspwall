@@ -74,18 +74,25 @@ extern volatile sig_atomic_t quit;
 
 /* -------------------------------------------------------------- data structures */
 
+/* CAPTURE buffers own three DRM/dmabuf resources, released together by
+ * release_buffer (v4l2.c): fb == 0, handle == 0 and dmafd == -1 each mean
+ * "nothing to do" for that part. The GEM handle matters most: it holds a
+ * reference to the imported dmabuf (and the decoder's CMA buffer behind
+ * it) that neither drmModeRmFB nor close(dmafd) drops — only
+ * drmCloseBufferHandle does, or closing the DRM fd. */
 struct buffer {
 	void     *map;          /* mmap'ed address (only OUTPUT needs it) */
 	size_t    length;
-	int       dmafd;        /* dmabuf fd (only CAPTURE) */
-	uint32_t  fb;           /* DRM framebuffer built from the dmabuf */
+	int       dmafd;        /* dmabuf fd (only CAPTURE), -1 = none */
+	uint32_t  handle;       /* GEM handle from drmPrimeFDToHandle, 0 = none */
+	uint32_t  fb;           /* DRM framebuffer built from the dmabuf, 0 = none */
 };
 
-/* A DELIBERATELY leaked fb/dmafd (see .leaked in struct camera). fb == 0
- * and dmafd == -1 mean "nothing to do" for the respective part — same
- * convention as struct buffer above. */
+/* A DELIBERATELY leaked fb/handle/dmafd (see .leaked in struct camera).
+ * Same "nothing to do" convention as struct buffer above. */
 struct leaked_buffer {
 	uint32_t  fb;
+	uint32_t  handle;
 	int       dmafd;
 };
 
@@ -182,18 +189,37 @@ struct camera {
 	 *
 	 * leaked/n_leaked — when teardown_stream gives up and DELIBERATELY
 	 *                  leaks a protected index (shown/in flight/limbo,
-	 *                  see teardown_stream and close_buffers) its fb/dmafd is saved HERE
+	 *                  see teardown_stream and close_buffers) its
+	 *                  fb/handle/dmafd is saved HERE
 	 *                  instead of just being left in k->cap[i] — where
 	 *                  start_capture would otherwise overwrite it without
 	 *                  closing/destroying on the next connection, losing
-	 *                  the fd and GEM handle for good. Drained (drmModeRmFB
-	 *                  + close) by complete_flip on the next CONFIRMED flip
+	 *                  the fd and GEM handle for good. Drained
+	 *                  (release_buffer) by complete_flip on the next CONFIRMED flip
 	 *                  for this camera (the plane then provably can no
 	 *                  longer reference them, whether it was a real frame
 	 *                  or a detach that was confirmed) or at program exit
 	 *                  (main(), after all camera threads are joined).
 	 *                  m_leaks_closed counts the total (same "never reset,
 	 *                  diffed via rep_ snapshot" pattern as m_synthetic).
+	 *
+	 * bufs_held      — number of imported GEM handles (decoder CAPTURE
+	 *                  buffers) currently held for this camera: the live
+	 *                  k->cap[] of the current connection plus the
+	 *                  entries in leaked[]. Incremented by start_capture
+	 *                  (camera thread) on every successful import,
+	 *                  decremented wherever such a handle is closed —
+	 *                  start_capture/close_buffers (camera thread),
+	 *                  complete_flip/planes_detached (compositor thread)
+	 *                  and main() at exit. Moving an index to leaked[] does
+	 *                  not change it (the handle is still held). More than
+	 *                  one writing thread, so it is an atomic rather than
+	 *                  a lock-protected field: no lock needed. report()
+	 *                  prints it as bufs=N; while streaming it should be
+	 *                  the decoder's buffer count (at most CAPTURE_BUFFERS)
+	 *                  plus any deliberately leaked entries still waiting
+	 *                  (leaks_active) — a value that grows from reconnect
+	 *                  to reconnect is a buffer leak.
 	 */
 	pthread_mutex_t  lock;
 	struct pacing_fifo fifo;
@@ -208,6 +234,7 @@ struct camera {
 	int                  limbo[MAX_LIMBO];   /* under `lock`, see abandon_flip */
 	int                  n_limbo;
 	unsigned long        m_leaks_closed, rep_leaks_closed;
+	_Atomic int          bufs_held;          /* see the comment above */
 
 	bool             tearing_down;    /* teardown_stream wants the plane detached */
 	bool             plane_attached;  /* the plane shows a real buffer right now */
@@ -474,9 +501,14 @@ bool display_poll(struct wall *v);
 
 /* ------------------------------------------------------------------ v4l2.c */
 
-/* Unmaps/closes the camera's V4L2 buffers, except the CAPTURE indices
- * marked in keep[CAPTURE_BUFFERS] (may be NULL), which are left alone. */
-void close_buffers(struct camera *k, const bool *keep);
+/* Releases one CAPTURE buffer's resources on `drmfd`, in this order:
+ * drmModeRmFB (if fb), drmCloseBufferHandle (if handle), close (if
+ * dmafd >= 0). Any part may be "none" (see struct buffer). */
+void release_buffer(int drmfd, uint32_t fb, uint32_t handle, int dmafd);
+/* Unmaps the camera's OUTPUT buffers and releases its CAPTURE buffers
+ * (release_buffer on `drmfd`), except the CAPTURE indices marked in
+ * keep[CAPTURE_BUFFERS] (may be NULL), which are left alone. */
+void close_buffers(int drmfd, struct camera *k, const bool *keep);
 int open_decoder(const char *device, struct camera *k, unsigned width, unsigned height);
 /* VIDIOC_QUERYCAP + ENUM_FMT on the decoder before any camera starts.
  * Waits up to 15 s for the device node to appear and up to 30 s (in all)

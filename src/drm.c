@@ -886,10 +886,9 @@ static void planes_detached(struct wall *v)
 		}
 		pthread_mutex_unlock(&k->lock);
 		for (int j = 0; j < n_leaked; j++) {
-			if (leaked[j].fb)
-				drmModeRmFB(v->drmfd, leaked[j].fb);
-			if (leaked[j].dmafd >= 0)
-				close(leaked[j].dmafd);
+			release_buffer(v->drmfd, leaked[j].fb, leaked[j].handle, leaked[j].dmafd);
+			if (leaked[j].handle)
+				atomic_fetch_sub(&k->bufs_held, 1);
 		}
 		if (n_leaked)
 			log_msg("%s: cleaned up %d previously leaked buffer(s) after the display switch",

@@ -427,19 +427,21 @@ static void requeue_returned(struct camera *k)
 	}
 }
 
-/* Queues a deliberately leaked fb/dmafd (see .leaked in struct camera) for
- * later cleanup. The caller must hold `k->lock` (shared with complete_flip,
- * which drains the list). If the list is (unusually) full this is logged
- * and the entry really leaks — better visible and rare than a write outside
- * the array. */
-static void camera_leak_push(struct camera *k, uint32_t fb, int dmafd)
+/* Queues a deliberately leaked fb/handle/dmafd (see .leaked in struct
+ * camera) for later cleanup. The caller must hold `k->lock` (shared with
+ * complete_flip, which drains the list). If the list is (unusually) full
+ * this is logged and the entry really leaks — better visible and rare than
+ * a write outside the array. */
+static void camera_leak_push(struct camera *k, uint32_t fb, uint32_t handle, int dmafd)
 {
 	if (k->n_leaked >= MAX_LEAKED) {
-		log_msg("%s: CRITICAL: leak list full (%d) - fb %u/dmafd %d leaks permanently",
-			k->name, k->n_leaked, fb, dmafd);
+		log_msg("%s: CRITICAL: leak list full (%d) - fb %u/handle %u/dmafd %d leaks permanently",
+			k->name, k->n_leaked, fb, handle, dmafd);
 		return;
 	}
-	k->leaked[k->n_leaked++] = (struct leaked_buffer){ .fb = fb, .dmafd = dmafd };
+	k->leaked[k->n_leaked++] = (struct leaked_buffer){
+		.fb = fb, .handle = handle, .dmafd = dmafd,
+	};
 }
 
 static void teardown_stream(struct wall *v, struct camera *k)
@@ -509,9 +511,9 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	 * still show the leaked buffer, and the NEXT teardown cycle for the
 	 * same camera then attempts a new, harmless (possibly redundant)
 	 * detach). The protected indices are leaked DELIBERATELY right here
-	 * (neither RmFB nor close(dmafd) in this function) — rare and visible
+	 * (no release_buffer for them in this function) — rare and visible
 	 * through the log line below, better than a use-after-free against the
-	 * display. The leak is NOT permanent though: fb/dmafd are saved in
+	 * display. The leak is NOT permanent though: fb/handle/dmafd are saved in
 	 * k->leaked (see camera_leak_push) and cleaned up by complete_flip on
 	 * the next confirmed flip for the camera, or at program exit — without
 	 * that the fd/GEM handle would be lost for good the next time
@@ -535,10 +537,13 @@ static void teardown_stream(struct wall *v, struct camera *k)
 				continue;
 			keep[c] = true;
 			n_keep++;
-			/* Save fb/dmafd in the leak list BEFORE k->cap[c] can be
-			 * overwritten by the next start_capture. Done here, still
-			 * under `lock` — the list is shared with complete_flip. */
-			camera_leak_push(k, k->cap[c].fb, k->cap[c].dmafd);
+			/* Save fb/handle/dmafd in the leak list BEFORE k->cap[c]
+			 * can be overwritten by the next start_capture. Done here,
+			 * still under `lock` — the list is shared with
+			 * complete_flip. From here on the list owns them:
+			 * close_buffers skips index c (keep[]), and bufs_held is
+			 * unchanged because the handle is still held. */
+			camera_leak_push(k, k->cap[c].fb, k->cap[c].handle, k->cap[c].dmafd);
 		}
 		if (n_keep && skip_wait)
 			log_msg("%s: display disconnected - not waiting for the plane to detach; %d "
@@ -564,15 +569,8 @@ static void teardown_stream(struct wall *v, struct camera *k)
 		xioctl(k->v4l2fd, VIDIOC_STREAMOFF, &t1);
 		xioctl(k->v4l2fd, VIDIOC_STREAMOFF, &t2);
 	}
-	for (int i = 0; i < k->n_cap; i++) {
-		if (i < CAPTURE_BUFFERS && keep[i])
-			continue;
-		if (k->cap[i].fb) {
-			drmModeRmFB(v->drmfd, k->cap[i].fb);
-			k->cap[i].fb = 0;
-		}
-	}
-	close_buffers(k, keep);
+	/* RmFB + close GEM handle + close dmafd for every index not kept. */
+	close_buffers(v->drmfd, k, keep);
 	if (k->v4l2fd >= 0) {
 		close(k->v4l2fd);
 		k->v4l2fd = -1;
