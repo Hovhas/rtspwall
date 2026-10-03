@@ -89,7 +89,7 @@ Camera lines have this shape: `NAME: <label>: <detail> - <hint>; next attempt in
 | `NAME: connected, WxH` | Good. | Nothing. `(after N failed attempts)` says how long it took. |
 | `NAME: pts ... - re-anchoring` | The camera's timestamps jumped. | Usually harmless. If constant, report the camera model. |
 | `NAME: packet of N B larger than buffer ... - dropped` | A very large packet. | Lower the camera's bitrate or resolution. |
-| `NAME: pacing: first frame after N packet(s) (normal at connect)` | Packets before the first picture of a connection, for example before the first key frame. Normal. | Nothing. |
+| `NAME: pacing: first frame after N packet(s) (normal at connect)` | Packets before the first picture of a connection, for example before the first [key frame](glossary.md#key-frame). Normal. | Nothing. |
 | `NAME: pacing: N packet(s) without a matching frame (the decoder skipped a corrupt frame)` | A damaged frame, often from packet loss. | Check the network. Use `FFMPEG_LOGLEVEL=warning`. |
 | `NAME: UniFi Protect URL: kept rtsps on port 7441 (TLS), Protect-only ?enableSrtp removed` | Normal. This is the default (`UNIFI_REWRITE=tls`). | Nothing. |
 | `NAME: UniFi Protect rtsps URL rewritten to plain RTSP on port 7447 (UNIFI_REWRITE=plain) (...)` followed by `NAME: WARNING: plaintext: the UniFi token and video travel unencrypted on your LAN - UNIFI_REWRITE=tls keeps rtsps` | You set `UNIFI_REWRITE=plain`. | Remove that line from the config to go back to encrypted `rtsps`. See [SECURITY.md](../SECURITY.md#the-unifi-tls-trade-off). |
@@ -97,7 +97,7 @@ Camera lines have this shape: `NAME: <label>: <detail> - <hint>; next attempt in
 | `NAME: unknown option ignored: ...` | Harmless. | Nothing. |
 | `ffmpeg: ...` | FFmpeg's own message, with URLs masked. | Set `FFMPEG_LOGLEVEL=warning` or `info` for more. |
 | `rotation: skipping NAME (no fresh frame for > 3 s), staying on NAME` | A camera in a rotation group has no picture. | Fix that camera. The wall carries on. |
-| `NAME: CRITICAL: teardown gave up ...` or `CRITICAL: leak list full` | A buffer was kept on purpose instead of freed. | Report it with `doctor --report`. The counters `leaks_closed` and `leaks_active` show it in the 60 s lines. |
+| `NAME: CRITICAL: teardown gave up ...` or `CRITICAL: leak list full` | A buffer was kept on purpose instead of freed. | Report it with `doctor --report`. The counters `leaks_closed` and `leaks_active` show it in the 60 s lines. `bufs` (decoder buffers held, 16 per connected camera) should not grow from reconnect to reconnect. |
 | `NAME: cleaned up N previously leaked buffer(s) after a confirmed flip` or `NAME: cleaned up N leaked buffer(s) on exit` | Buffers that were kept earlier are now freed. | Nothing. It is the all-clear after a `CRITICAL` line. |
 
 ### Other lines in the log

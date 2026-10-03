@@ -38,6 +38,10 @@ Hardware Video Scaler. The part of the Pi's display hardware that shrinks and pl
 
 A short waiting room for video frames. Network delivery is uneven, so frames wait briefly and are shown at an even pace. The wait is set by `BUFFER_MS`.
 
+## Key frame
+
+A video frame that is a complete picture. The frames after it only store what changed. A decoder cannot show a picture until it has received a key frame, so a new connection can wait a moment for one.
+
 ## Lite and Desktop
 
 The two main Raspberry Pi OS images. Desktop has a graphical desktop. Lite has only a text console. rtspwall needs Lite, because a desktop holds the [DRM master](#drm-master).

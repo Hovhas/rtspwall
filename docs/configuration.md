@@ -179,7 +179,7 @@ Once a minute there are also diagnostic lines:
 
 | Line | Meaning |
 |---|---|
-| `NAME: diag regulated ptsdelta p5=...ms p50=...ms p95=...ms synthetic=N leaks_closed=N leaks_active=N` | How even the frame timing is after correction (`p5`, `p50`, `p95`). `synthetic`, `leaks_closed` and `leaks_active` should normally be 0. |
+| `NAME: diag regulated ptsdelta p5=...ms p50=...ms p95=...ms synthetic=N leaks_closed=N leaks_active=N bufs=N` | How even the frame timing is after correction (`p5`, `p50`, `p95`). `synthetic`, `leaks_closed` and `leaks_active` should normally be 0. `bufs` is the number of decoder buffers the camera holds now: 16 per connected camera, and it should not grow from one reconnect to the next. |
 | `diag: busy_drops=N switches=N` | Since the last line: frames that were never shown because a display update (atomic commit) failed, and rotation switches. `busy_drops` should normally be 0. |
 | `diag: WARNING late1+=N flips confirmed >=1 vblank after target (regression?)` | Picture updates landed one display refresh later than planned. |
 
