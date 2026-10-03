@@ -744,17 +744,23 @@ void compositor(struct wall *v)
 				 * dropped. A failed detach commit (in_flight == -2)
 				 * has no buffer to hand back — only in_flight is
 				 * reset, so compositor() retries the detach next
-				 * round. */
+				 * round. Whenever in_flight changes, `detached` is
+				 * broadcast: a teardown_stream waiting for
+				 * in_flight == -1 (e.g. on the first frame of a
+				 * connection, plane not attached) can then finish at
+				 * once instead of sleeping TEARDOWN_WAIT_S and giving
+				 * up; one still waiting for plane_attached re-checks
+				 * and keeps waiting. */
 				for (int i = 0; i < v->count; i++) {
 					struct camera *k = &v->cam[i];
 					int p;
 					pthread_mutex_lock(&k->lock);
 					p = k->in_flight;
-					if (p >= 0) {
+					if (p >= 0)
 						ring_push(k, p);
+					if (p != -1) {
 						k->in_flight = -1;
-					} else if (p == -2) {
-						k->in_flight = -1;
+						pthread_cond_broadcast(&k->detached);
 					}
 					pthread_mutex_unlock(&k->lock);
 					if (p >= 0) {

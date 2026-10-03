@@ -485,7 +485,12 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	 * hanging forever. The cap is longer than the compositor's flip
 	 * timeout (FLIP_TIMEOUT_US): an abandoned detach is NOT taken as
 	 * confirmed (see abandon_flip) but made again, and this wait must
-	 * outlast that second attempt. */
+	 * outlast that second attempt. `detached` is broadcast whenever the
+	 * compositor clears what we wait for: a confirmed detach
+	 * (complete_flip), a failed commit that resets in_flight, a connector
+	 * switch (planes_detached). A timeout re-checks the condition before
+	 * giving up — it may have cleared exactly at the deadline, and giving
+	 * up then would leak buffers for nothing. */
 	k->tearing_down = true;
 	/* Display disconnected (TV off, cable out): the detach may never be
 	 * confirmed, and waiting TEARDOWN_WAIT_S would only stretch every
@@ -503,7 +508,7 @@ static void teardown_stream(struct wall *v, struct camera *k)
 		deadline.tv_sec += TEARDOWN_WAIT_S;
 		while ((k->plane_attached || k->in_flight != -1) && !quit) {
 			if (pthread_cond_timedwait(&k->detached, &k->lock, &deadline) == ETIMEDOUT) {
-				gave_up = true;
+				gave_up = k->plane_attached || k->in_flight != -1;
 				break;
 			}
 		}

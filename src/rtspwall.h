@@ -177,7 +177,9 @@ struct camera {
 	 *                  something", which is what every detach decision
 	 *                  needs.
 	 * detached       — condvar complete_flip signals when the detach
-	 *                  commit is confirmed. teardown_stream waits
+	 *                  commit is confirmed (also broadcast when a failed
+	 *                  commit resets in_flight, and by planes_detached
+	 *                  after a connector switch). teardown_stream waits
 	 *                  (pthread_cond_timedwait, `lock` held, TEARDOWN_WAIT_S
 	 *                  cap) until
 	 *                  NEITHER in_flight != -1 NOR plane_attached holds —
