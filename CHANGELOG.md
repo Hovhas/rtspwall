@@ -72,6 +72,7 @@ Formerly named rpi4-rtsp (renamed before the first release).
 - Moving the wall to another HDMI port now detaches every camera from the old port first.
 - A failed display update now wakes a camera that is waiting to shut down, so it does not wait out its timeout.
 - A normal stop no longer logs `NAME: CRITICAL: teardown gave up ...` and `NAME: cleaned up N leaked buffer(s) on exit` for every camera, or a TLS error (`ffmpeg: [tls @ ...] Error decoding the received TLS packet.`).
+- A dev build such as `0.1.0-rc3-dev2` gets the Debian version `0.1.0~rc3~dev2` (it was `0.1.0~rc3-dev2`). lintian no longer reports `debian-changelog-file-missing-or-wrong-name`, and `apt` installs the release over a dev build as an upgrade instead of refusing it as a downgrade.
 
 ### Security
 

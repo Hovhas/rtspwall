@@ -5,7 +5,8 @@
 # DIST comes from /etc/os-release (VERSION_CODENAME, e.g. bookworm or trixie),
 # ARCH from dpkg. VERSION defaults to the latest git tag (without "v"), or 0.0.0.
 # A pre-release VERSION such as 0.1.0-rc1 is kept in file names; the package's
-# Debian version becomes 0.1.0~rc1 (see DEB_VERSION below).
+# Debian version gets every "-" turned into "~": 0.1.0~rc1, and a dev build
+# 0.1.0-rc3-dev2 becomes 0.1.0~rc3~dev2 (see DEB_VERSION below).
 # Build dependencies: build-essential pkg-config libdrm-dev libavformat-dev
 # libavcodec-dev libavutil-dev ffmpeg (ffmpeg generates the demo clips with
 # `make demo-clips`; build-time only, not a runtime Depends) (+ dpkg-dev for
@@ -31,10 +32,16 @@ if [[ -z $VERSION ]]; then
 fi
 [[ $VERSION =~ ^[0-9][A-Za-z0-9.+~-]*$ ]] || { echo "Invalid version: $VERSION" >&2; exit 2; }
 # VERSION is the release version as tagged (0.1.0-rc1): it goes into the file
-# names and `rtspwall --version`. The Debian Version field gets the first "-"
-# turned into "~" (0.1.0~rc1) so a pre-release sorts BEFORE 0.1.0; a plain
+# names and `rtspwall --version`. The Debian Version field gets EVERY "-"
+# turned into "~" (0.1.0-rc1 -> 0.1.0~rc1, 0.1.0-rc3-dev2 -> 0.1.0~rc3~dev2).
+# Why every one: a "-" left in the Debian version starts a Debian revision.
 # "0.1.0-rc1" would be upstream 0.1.0 with revision rc1, i.e. newer than 0.1.0.
-DEB_VERSION=${VERSION/-/'~'}
+# "0.1.0~rc3-dev2" would be a non-native package (lintian then wants
+# changelog.Debian.gz) that sorts AFTER 0.1.0~rc3, so apt refuses to install
+# the release over the dev build. With no "-" the package is native, and each
+# "~" sorts before the release it leads to: 0.1.0~rc2 < 0.1.0~rc3~dev2 <
+# 0.1.0~rc3 < 0.1.0.
+DEB_VERSION=${VERSION//-/'~'}
 
 ARCH=$(dpkg --print-architecture)
 # shellcheck source=/dev/null
