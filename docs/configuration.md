@@ -110,7 +110,8 @@ Calculated examples from the model:
 
 | Cameras | Load | Verdict | Run on hardware? |
 |---|---|---|---|
-| 6 x 1024x576 at 30 fps | 79.4 % | `PASS` | Yes, the reference setup (see [Benchmarks](benchmarks.md)) |
+| 3 x 1024x576 at 25 fps and 1 x 1024x576 at 30 fps | 46.3 % | `PASS` | Yes, 4 UniFi cameras over `rtsps` on a Pi 4 (see [Benchmarks](benchmarks.md)) |
+| 6 x 1024x576 at 30 fps | 79.4 % | `PASS` | Yes, the earlier reference setup: 6 cameras at 25 to 30 fps over plain RTSP, so its real load was a little lower than this example (see [Benchmarks](benchmarks.md#earlier-measurements-6-cameras-plain-rtsp-rc1)) |
 | 4 x 1920x1080 at 15 fps | 93.8 % | `WARN` | No, calculated only |
 | 6 x 1280x720 at 30 fps | 124 % | `FAIL` | No, calculated only |
 
@@ -179,7 +180,7 @@ Once a minute there are also diagnostic lines:
 
 | Line | Meaning |
 |---|---|
-| `NAME: diag regulated ptsdelta p5=...ms p50=...ms p95=...ms synthetic=N leaks_closed=N leaks_active=N bufs=N` | How even the frame timing is after correction (`p5`, `p50`, `p95`). `synthetic`, `leaks_closed` and `leaks_active` should normally be 0. `bufs` is the number of decoder buffers the camera holds now: 16 per connected camera, and it should not grow from one reconnect to the next. |
+| `NAME: diag regulated ptsdelta p5=...ms p50=...ms p95=...ms synthetic=N leaks_closed=N leaks_active=N bufs=N` | How even the frame timing is after correction (`p5`, `p50`, `p95`). `synthetic`, `leaks_closed` and `leaks_active` should normally be 0. `bufs` is the number of decoder buffers the camera holds now: usually 16 while the camera plays, plus `leaks_active`. It must not grow from one reconnect to the next. |
 | `diag: busy_drops=N switches=N` | Since the last line: frames that were never shown because a display update (atomic commit) failed, and rotation switches. `busy_drops` should normally be 0. |
 | `diag: WARNING late1+=N flips confirmed >=1 vblank after target (regression?)` | Picture updates landed one display refresh later than planned. |
 

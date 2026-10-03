@@ -73,12 +73,12 @@ After adding cameras, run `sudo rtspwall doctor`. It names any problem, says if 
 
 ## Why rtspwall
 
-Every number below comes from one reference setup: **6 UniFi Protect cameras (Medium stream, 1024x576 at 25 to 30 fps) on a Pi 4 with 8 GB, Raspberry Pi OS Trixie, one 1080p60 display.** Method and gaps are in [docs/benchmarks.md](docs/benchmarks.md).
+Every number below comes from one measured setup (build 0.1.0-rc2-dev, 2026-10-03): **4 UniFi Protect cameras over `rtsps` (H.264, 1024x576, three at 25 fps and one at 30 fps) on a Pi 4 with 8 GB, Raspberry Pi OS Trixie 64-bit, wired Ethernet, one 1920x1080 60 Hz display, `GRID=2x2`, default `BUFFER_MS=160`.** Method and gaps are in [docs/benchmarks.md](docs/benchmarks.md).
 
-- **Smooth.** Each camera has its own jitter buffer. In the reference setup 0.0 to 0.2 % of frames were dropped.
-- **Live.** About 150 ms from the network to the screen in the reference setup.
-- **Recovers by itself.** After all cameras were blocked for 15 s, the wall was back 4 to 6 s after the block ended.
-- **Light on the CPU.** The video decoder and the display's scaler do the pixel work. In the reference setup `top` showed low single-digit to low double-digit percent for the process. A proper figure as a share of all four cores is still missing ([benchmarks](docs/benchmarks.md)).
+- **Smooth.** Each camera has its own jitter buffer. In eight consecutive one-minute lines per camera, 0.0 to 0.3 % of frames were dropped. The one 30 fps camera needed `delay_ms=40` for that ([why](docs/troubleshooting.md#the-picture-is-choppy)).
+- **Live.** About 150 ms from the network to the screen (149 to 156 ms for the 25 fps cameras), and about 185 ms (177 to 189 ms) for the camera with the extra 40 ms delay.
+- **Recovers by itself.** After the NVR was blocked for 15 s (three runs), the cameras reconnected 1 to 2 s after the block ended and the picture was back within 2 to 6 s.
+- **Light on the CPU.** The video decoder and the display's scaler do the pixel work. The rtspwall process used 2.2 % of all four cores (8.8 % of one core) over 60 s, with no throttling (`vcgencmd get_throttled` read `0x0`).
 - **Plain Debian.** Packages for Bookworm and Trixie that use the stock FFmpeg, under the MIT licence. Only Trixie is tested on hardware so far ([compatibility](docs/compatibility.md)).
 
 Not measured yet, so not promised: how many days in a row it runs without a restart.

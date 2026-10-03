@@ -32,7 +32,7 @@ If you have a desktop image, `rtspwall doctor` finds the program that holds the 
 
 ## How many cameras can I show?
 
-The limit is the decoder, not the screen. The Pi 4 decoder is specified for about 1080p60 in total. `rtspwall probe` computes your total against that budget. Six 1024x576 streams at 30 fps use about 79 % of it. Four 1080p streams at 15 fps are calculated at about 94 %. The numbers and the method are in [Configuration](configuration.md#decoder-budget). The software maximum is 16 cameras.
+The limit is the decoder, not the screen. The Pi 4 decoder is specified for about 1080p60 in total. `rtspwall probe` computes your total against that budget. Four 1024x576 streams (three at 25 fps, one at 30 fps) use about 46 % of it. That setup ran on a Pi 4 with 4 UniFi cameras. The earlier reference setup, six 1024x576 streams at 25 to 30 fps, was calculated at 79 % when all six run at 30 fps. Four 1080p streams at 15 fps are calculated at about 94 %. The numbers and the method are in [Configuration](configuration.md#decoder-budget). The software maximum is 16 cameras.
 
 Cameras in a rotation group all decode all the time, so rotation does not raise the number of cameras you can run. Use sub-streams.
 

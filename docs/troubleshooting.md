@@ -97,8 +97,8 @@ Camera lines have this shape: `NAME: <label>: <detail> - <hint>; next attempt in
 | `NAME: unknown option ignored: ...` | Harmless. | Nothing. |
 | `ffmpeg: ...` | FFmpeg's own message, with URLs masked. | Set `FFMPEG_LOGLEVEL=warning` or `info` for more. |
 | `rotation: skipping NAME (no fresh frame for > 3 s), staying on NAME` | A camera in a rotation group has no picture. | Fix that camera. The wall carries on. |
-| `NAME: CRITICAL: teardown gave up ...` or `CRITICAL: leak list full` | A buffer was kept on purpose instead of freed. | Report it with `doctor --report`. The counters `leaks_closed` and `leaks_active` show it in the 60 s lines. `bufs` (decoder buffers held, 16 per connected camera) should not grow from reconnect to reconnect. |
-| `NAME: cleaned up N previously leaked buffer(s) after a confirmed flip` or `NAME: cleaned up N leaked buffer(s) on exit` | Buffers that were kept earlier are now freed. | Nothing. It is the all-clear after a `CRITICAL` line. |
+| `NAME: CRITICAL: teardown gave up ...` or `CRITICAL: leak list full` | A buffer was kept on purpose instead of freed. | Report it with `doctor --report`. The counters `leaks_closed` and `leaks_active` show it in the 60 s lines. `bufs` (decoder buffers held, usually 16 while the camera plays) must not grow from reconnect to reconnect. |
+| `NAME: cleaned up N previously leaked buffer(s) after a confirmed flip`, `NAME: cleaned up N previously leaked buffer(s) after the display switch` or `NAME: cleaned up N leaked buffer(s) on exit` | Buffers that were kept earlier are now freed. | Nothing. It is the all-clear after a `CRITICAL` line. |
 
 ### Other lines in the log
 
@@ -203,6 +203,17 @@ Read the 60 s line of the camera (`journalctl -u rtspwall | grep ': 60s'`).
 - `dropped` is high but `late` is low: the source delivers unevenly. A bigger `BUFFER_MS` helps. The `diag regulated ptsdelta` line shows how even the source is.
 - `dec` is below the camera's frame rate: the network, the camera or the decoder is the bottleneck.
 - One camera is worse than the rest: give it a `delay_ms` in its line.
+
+Worked example. On the maintainer's Pi 4 (4 UniFi cameras at 1024x576 over `rtsps`, one 1920x1080 60 Hz display, `BUFFER_MS=160`), one camera at 30 fps was choppy while the three at 25 fps were fine. Over 151 one-minute lines (rc1) it showed `late` 41 to 63 per minute, `jitter` p95 about 110 ms and 1.2 to 1.6 % dropped (typical). `diag regulated ptsdelta` was tight at 33 ms, so the camera sent evenly and the frames arrived from the network in bursts. Adding `delay_ms=40` to that camera's line brought `late` to 0 per minute, `jitter` p95 to about 50 ms and dropped to 0.0 %. The price was about 40 ms more latency (the `latency` field read 137 to 147 ms without the delay and 177 to 189 ms with it). Numbers and conditions: [Benchmarks](benchmarks.md).
+
+To do the same, append `|40` to the camera line. In a grid layout the delay is the fourth field:
+
+```
+GRID=2x2
+cam-4|rtsps://192.168.1.10:7441/TOKEN?enableSrtp|4|40
+```
+
+For a manual layout it is the last field, after `y`. Save the file. The wall restarts within a few seconds. Then read the 60 s line again.
 
 ### The picture is juddery on a 4K TV
 

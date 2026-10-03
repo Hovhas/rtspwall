@@ -2,13 +2,13 @@
 
 Short answers for the technical words in these docs. Pages link here the first time they use a word.
 
-## Codec
-
-The way a video is compressed. The camera compresses, the Pi unpacks. See [H.264 and H.265](#h264-and-h265).
-
 ## CMA
 
 Contiguous Memory Allocator. Memory that Linux sets aside for devices that need one solid block. Not the same as [`gpu_mem`](#gpu_mem), which is set in `config.txt`.
+
+## Codec
+
+The way a video is compressed. The camera compresses, the Pi unpacks. See [H.264 and H.265](#h264-and-h265).
 
 ## DRM master
 

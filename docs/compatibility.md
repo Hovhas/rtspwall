@@ -8,7 +8,7 @@ This page lists only things somebody ran. Everything else says **community repor
 
 | Board | OS | Kernel | Result | Tested by |
 |---|---|---|---|---|
-| Pi 4, 8 GB | Raspberry Pi OS Trixie, 64-bit | 6.18.50+rpt-rpi-v8 | Works: the reference setup in [Benchmarks](benchmarks.md) | Project maintainer |
+| Pi 4, 8 GB | Raspberry Pi OS Trixie, 64-bit | 6.18.50+rpt-rpi-v8 | Works: the measured setup and the earlier 6-camera setup in [Benchmarks](benchmarks.md) | Project maintainer |
 | Pi 4, 8 GB | Raspberry Pi OS Bookworm, 64-bit | not tested | Package is built in CI. **Not tested on hardware.** Community reports welcome | |
 | Pi 4, 2 GB or 4 GB | any | not tested | Community reports welcome | |
 | Pi 400, CM4 | any | not tested | Same chip as the Pi 4, so it should work. Community reports welcome | |
@@ -21,7 +21,7 @@ This page lists only things somebody ran. Everything else says **community repor
 | Brand or system | Model and firmware | Stream | Result | Reporter |
 |---|---|---|---|---|
 | UniFi Protect | 6 cameras, console and firmware not recorded | Medium stream, H.264, 1024x576 at 25 to 30 fps, through the UniFi URL rewrite to plain RTSP (the default at the time; the default is now `rtsps` kept, see [Cameras](cameras.md#unifi-protect)) | Works with the plain rewrite | Project maintainer |
-| UniFi Protect | 4 cameras, console and firmware not recorded | H.264, 1024x576 at 25 and 30 fps, `UNIFI_REWRITE=tls` (default: `rtsps` on port 7441 kept, `?enableSrtp` removed). rtspwall 0.1.0-rc1 | Works: all four connect and play. No long-run test is documented | Project maintainer |
+| UniFi Protect | 4 cameras, console and firmware not recorded | H.264, 1024x576 at 25 and 30 fps, `UNIFI_REWRITE=tls` (default: `rtsps` on port 7441 kept, `?enableSrtp` removed). rtspwall 0.1.0-rc1 and 0.1.0-rc2-dev | Works: all four connect and play. Numbers for rc2-dev are in [Benchmarks](benchmarks.md). No long-run test is documented | Project maintainer |
 | Reolink | | | Community reports welcome | |
 | Hikvision, ABUS | | | Community reports welcome | |
 | Dahua, Amcrest | | | Community reports welcome | |
@@ -33,7 +33,7 @@ This page lists only things somebody ran. Everything else says **community repor
 
 | Display | Mode | Result |
 |---|---|---|
-| One 1080p display at 60 Hz | 1920x1080 at 60 Hz | Works (the reference setup) |
+| One 1080p display at 60 Hz | 1920x1080 at 60 Hz | Works (both setups in [Benchmarks](benchmarks.md)) |
 | TV on HDMI-A-2 (HDMI1, the port away from the USB-C power port) | 1920x1080 at 60 Hz, `MODE=auto` picked the preferred mode | Works |
 | 4K TV | `MODE=auto` should pick 1080p at 60 Hz | Not tested on hardware. Community reports welcome |
 | TV standby, input switch, unplugged cable while running | | Built to recover by itself. Not tested on hardware with several TV brands. Community reports welcome |

@@ -76,7 +76,7 @@ The cost of this design is that every camera in a group uses a decoder instance 
 
 When a stream is torn down (reconnect after the watchdog fires, or shutdown), the camera thread first asks the compositor to detach the plane, and waits for confirmation. Only then are the framebuffers removed (`drmModeRmFB`). The screen therefore never shows a frame from a buffer that no longer exists.
 
-If confirmation does not arrive within the timeout, the buffer still in use is deliberately leaked rather than destroyed (logged as `CRITICAL: teardown gave up`), and cleaned up after a later confirmed flip or on exit. The `leaks_closed` and `leaks_active` counters make this visible; both should normally be 0. The `bufs` field of the same line is the number of decoder buffers the camera holds (16 while connected); it must stay the same across reconnects.
+If confirmation does not arrive within the timeout, the buffer still in use is deliberately leaked rather than destroyed (logged as `CRITICAL: teardown gave up`), and cleaned up after a later confirmed flip or on exit. The `leaks_closed` and `leaks_active` counters make this visible; both should normally be 0. The `bufs` field of the same line is the number of decoder buffers the camera holds (usually 16 while the camera plays, plus any leaked buffers still waiting); it must not grow from one reconnect to the next.
 
 On shutdown the main thread wakes waiting camera threads immediately, so a stop does not wait out the full teardown timeout.
 
