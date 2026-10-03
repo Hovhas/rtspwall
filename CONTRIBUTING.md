@@ -78,7 +78,7 @@ For maintainers.
 
 - **Tag format:** `vX.Y.Z` or `vX.Y.Z-PRE`, where PRE is `rc1`, `beta2` and so on.
 - **Tag and CHANGELOG:** the first `## [` heading in `CHANGELOG.md` must be the base version. The tags `v0.1.0-rc1`, `v0.1.0-rc2` and `v0.1.0` all release from `## [0.1.0]`. A final tag (without `-PRE`) also needs a date in the heading instead of `Unreleased`. The text of that section becomes the release notes, so it must not be empty. `scripts/release-notes.sh TAG` checks this.
-- **Versions in names:** file names and `rtspwall --version` use `0.1.0-rc1`. The Debian package version is `0.1.0~rc1`, so that a release candidate sorts before the final release.
+- **Versions in names:** file names and `rtspwall --version` use `0.1.0-rc1`. The Debian package version turns every `-` into `~`: `0.1.0~rc1`, and a dev build `0.1.0-rc3-dev2` becomes `0.1.0~rc3~dev2`. A release candidate then sorts before the final release, and a dev build before the release it leads to.
 - **What `release.yml` does:** builds the packages for Bookworm and Trixie (arm64), installs them in a clean container as a test, and publishes the `.deb` and `.tar.gz` files, fixed-name copies (`rtspwall_bookworm_arm64.deb`, `rtspwall_trixie_arm64.deb`), `get.sh`, `SHA256SUMS` and build-provenance attestations. Tags with `-rc` or `-beta` become pre-releases automatically.
 - **Pre-release testing:** `get.sh` takes `RTSPWALL_VERSION=v0.1.0-rc1` to install a specific tag.
 - Keep [docs/compatibility.md](docs/compatibility.md) and [docs/benchmarks.md](docs/benchmarks.md) honest: add only what was run, with the date.
