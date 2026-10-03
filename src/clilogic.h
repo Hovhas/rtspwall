@@ -159,7 +159,9 @@ int configtxt_set_gpu_mem(const char *text, int mb, char *out, size_t outlen);
 #define GPU_NEED_LARGE  2u      /* GPU_MEM_LARGE_COUNT+ streams of >= 1080p */
 int doctor_gpu_mem_needed(long total_mbps, int n_large, unsigned *why);
 
-/* True for a stream of at least 1920x1080 pixels (either orientation). */
+/* True for a stream of at least 1920x1080 pixels (either orientation)
+ * that the wall decodes: at most 1920 in both dimensions (larger streams
+ * are refused, PACING_FAULT_TOO_LARGE, and hold no decoder memory). */
 bool gpu_mem_large_stream(int width, int height);
 
 enum gpu_check {

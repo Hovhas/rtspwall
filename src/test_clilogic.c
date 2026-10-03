@@ -256,8 +256,14 @@ static void test_gpu_need_large_streams(void)
 
 	ASSERT(gpu_mem_large_stream(1920, 1080));
 	ASSERT(gpu_mem_large_stream(1080, 1920));     /* portrait */
-	ASSERT(gpu_mem_large_stream(2560, 1440));
-	ASSERT(gpu_mem_large_stream(3840, 2160));
+	ASSERT(gpu_mem_large_stream(1920, 1920));     /* the decoder's maximum */
+	ASSERT(gpu_mem_large_stream(1440, 1920));
+	/* above 1920 in either dimension the wall refuses the stream
+	 * (PACING_FAULT_TOO_LARGE): it never holds decoder memory */
+	ASSERT(!gpu_mem_large_stream(2560, 1440));
+	ASSERT(!gpu_mem_large_stream(3840, 2160));
+	ASSERT(!gpu_mem_large_stream(1921, 1080));
+	ASSERT(!gpu_mem_large_stream(1080, 1921));
 	ASSERT(!gpu_mem_large_stream(1280, 720));
 	ASSERT(!gpu_mem_large_stream(1920, 1072));
 	ASSERT(!gpu_mem_large_stream(0, 0));

@@ -662,7 +662,10 @@ int doctor_gpu_mem_needed(long total_mbps, int n_large, unsigned *why)
 
 bool gpu_mem_large_stream(int width, int height)
 {
-	return width > 0 && height > 0 && (long)width * height >= 1920L * 1080L;
+	/* Above 1920 in either dimension the wall refuses the stream
+	 * (PACING_FAULT_TOO_LARGE, camera_thread.c): no decoder memory used. */
+	return width > 0 && height > 0 && width <= 1920 && height <= 1920 &&
+	       (long)width * height >= 1920L * 1080L;
 }
 
 enum gpu_check gpu_mem_check(int need, int live, int configtxt)
