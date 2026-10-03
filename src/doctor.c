@@ -298,11 +298,19 @@ static void check_gpu_mem(struct doctor *d)
 			snprintf(fix, sizeof fix, "sudo rtspwall doctor --fix   (sets %s=%d in %s, "
 				 "then: sudo reboot)", gi->key[0] ? gi->key : "gpu_mem", d->gpu_needed,
 				 d->configtxt_path[0] ? d->configtxt_path : "config.txt");
+		/* Nothing measured (frame rates unknown): no 0 % load to quote;
+		 * only the large-stream rule can have fired. */
+		char load[160];
+		if (measured)
+			snprintf(load, sizeof load, "use %.0f %% of the decoder%s%s",
+				 budget_percent(total),
+				 measured < d->cfg.count ? " (lower bound)" : "",
+				 (why & GPU_NEED_LARGE)
+					 ? " with 4 or more streams of 1080p or larger" : "");
+		else
+			snprintf(load, sizeof load, "have 4 or more streams of 1080p or larger");
 		add_check(d, L_WARN, "gpu_mem", fix,
-			  "%s; the cameras use %.0f %% of the decoder%s%s and need %d MB%s%s%s", have,
-			  budget_percent(total), measured < d->cfg.count ? " (lower bound)" : "",
-			  (why & GPU_NEED_LARGE)
-				  ? " with 4 or more streams of 1080p or larger" : "",
+			  "%s; the cameras %s and need %d MB%s%s%s", have, load,
 			  d->gpu_needed, gi->uncertain ? " (config.txt also sets gpu_mem under " : "",
 			  gi->uncertain ? gi->filter : "",
 			  gi->uncertain ? ", which may or may not apply here)" : "");
