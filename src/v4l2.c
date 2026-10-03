@@ -26,8 +26,8 @@
  * then the dmabuf fd. The handle is the part that actually pins the
  * imported dmabuf (and the decoder's CMA buffer behind it) for the life of
  * the DRM fd — neither drmModeRmFB nor close(dmafd) drops that reference.
- * drmCloseBufferHandle needs libdrm >= 2.4.109 (the build already requires
- * 2.4.113). */
+ * drmCloseBufferHandle needs libdrm >= 2.4.109 (drm.c already needs libdrm
+ * 2.4.113 for drmModeGetConnectorTypeName). */
 void release_buffer(int drmfd, uint32_t fb, uint32_t handle, int dmafd)
 {
 	if (fb)
