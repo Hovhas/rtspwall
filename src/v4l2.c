@@ -66,7 +66,7 @@ void close_buffers(int drmfd, struct camera *k, const bool *keep)
 	k->capture_on = false;
 }
 
-int open_decoder(const char *device, struct camera *k, unsigned width, unsigned height)
+int open_decoder(const char *device, struct camera *k)
 {
 	/* O_NONBLOCK is not optional. The decoder stops consuming OUTPUT until
 	 * the CAPTURE queue is set up, and it announces that with an event.
@@ -79,10 +79,18 @@ int open_decoder(const char *device, struct camera *k, unsigned width, unsigned 
 		return -1;
 	}
 
+	/* Width and height are deliberately left 0 ("unknown"). Given a size
+	 * here, bcm2835-codec copies it to its CAPTURE port up front; when the
+	 * stream then decodes to exactly that format (e.g. the 640x360 demo
+	 * clips) the firmware sees no format change, sends no
+	 * V4L2_EVENT_SOURCE_CHANGE, and waits for CAPTURE buffers that
+	 * check_events would only set up after that event - the decoder stops
+	 * taking OUTPUT buffers ("no free OUTPUT buffer for 10 s"). With 0x0
+	 * the event always comes once the SPS is parsed, and start_capture
+	 * reads the real size from G_FMT. */
 	struct v4l2_format f = {
 		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
 		.fmt.pix_mp = {
-			.width = width, .height = height,
 			.pixelformat = V4L2_PIX_FMT_H264,
 			.num_planes = 1,
 			.plane_fmt[0].sizeimage = OUTPUT_BUFFER_SIZE,
