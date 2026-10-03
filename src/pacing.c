@@ -769,3 +769,10 @@ enum pacing_conn_action pacing_conn_follow_update(struct pacing_conn_follow *f,
 		return PACING_CONN_MOVE_AWAY;
 	return PACING_CONN_STAY;
 }
+
+enum pacing_unmatched pacing_unmatched_classify(bool first_frame_seen, unsigned n_unmatched)
+{
+	if (!n_unmatched)
+		return PACING_UNMATCHED_NONE;
+	return first_frame_seen ? PACING_UNMATCHED_SKIPPED : PACING_UNMATCHED_STARTUP;
+}
