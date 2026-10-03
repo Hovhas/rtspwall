@@ -40,8 +40,9 @@ else echo "cameras.conf changed but is INVALID (or unreadable by user rtspwall):
 # over the AF_UNIX socket /run/systemd/private, so no network, no devices.
 # CAP_SETUID/CAP_SETGID are what setpriv needs to drop to user rtspwall (root
 # switching user uses capabilities, so NoNewPrivileges does not get in the way).
-# OVERIFIERAT PA PI (and on a real systemd host; only `systemd-analyze verify`
-# was run): that setpriv + systemctl work under this sandbox. If the log shows
+# Verified on a Raspberry Pi 4 with Raspberry Pi OS Trixie on 2026-10-03: saving
+# a valid cameras.conf restarted the wall, so setpriv and systemctl work under
+# this sandbox. If the log shows
 # "Operation not permitted", "Bad system call" or "Failed to connect to bus",
 # relax in this order: SystemCallFilter, PrivateNetwork, ProtectSystem.
 # ---------------------------------------------------------------------------

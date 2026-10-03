@@ -412,10 +412,10 @@ out:
 	for (int i = 0; i < v.count; i++) {
 		struct camera *k = &v.cam[i];
 		for (int j = 0; j < k->n_leaked; j++) {
-			if (k->leaked[j].fb)
-				drmModeRmFB(v.drmfd, k->leaked[j].fb);
-			if (k->leaked[j].dmafd >= 0)
-				close(k->leaked[j].dmafd);
+			release_buffer(v.drmfd, k->leaked[j].fb, k->leaked[j].handle,
+				       k->leaked[j].dmafd);
+			if (k->leaked[j].handle)
+				atomic_fetch_sub(&k->bufs_held, 1);
 		}
 		if (k->n_leaked)
 			log_msg("%s: cleaned up %d leaked buffer(s) on exit", k->name, k->n_leaked);

@@ -886,10 +886,9 @@ static void planes_detached(struct wall *v)
 		}
 		pthread_mutex_unlock(&k->lock);
 		for (int j = 0; j < n_leaked; j++) {
-			if (leaked[j].fb)
-				drmModeRmFB(v->drmfd, leaked[j].fb);
-			if (leaked[j].dmafd >= 0)
-				close(leaked[j].dmafd);
+			release_buffer(v->drmfd, leaked[j].fb, leaked[j].handle, leaked[j].dmafd);
+			if (leaked[j].handle)
+				atomic_fetch_sub(&k->bufs_held, 1);
 		}
 		if (n_leaked)
 			log_msg("%s: cleaned up %d previously leaked buffer(s) after the display switch",
@@ -970,13 +969,18 @@ static int display_remodeset(struct wall *v, const drmModeModeInfo *m,
 			drmModeAtomicAddProperty(req, v->primary_plane, v->pp_fb, 0);
 			drmModeAtomicAddProperty(req, v->primary_plane, v->pp_crtc, 0);
 		}
+		/* EVERY camera plane, not only those with plane_attached:
+		 * planes_detached below frees every camera's leaked[] buffers
+		 * on the strength of this commit alone, so it must not depend
+		 * on plane_attached being exact. (It was not always: a frame
+		 * still in flight when teardown_stream gave up landed with
+		 * in_flight already reset, leaving plane_attached false while
+		 * the leaked buffer was on screen - see teardown_stream.)
+		 * Detaching a plane that is already off (FB_ID 0, CRTC_ID 0)
+		 * is valid in atomic and changes nothing, and every camera
+		 * has its own plane; no page flip is pending here. */
 		for (int i = 0; i < v->count; i++) {
 			struct camera *k = &v->cam[i];
-			pthread_mutex_lock(&k->lock);
-			bool attached = k->plane_attached;
-			pthread_mutex_unlock(&k->lock);
-			if (!attached)
-				continue;
 			drmModeAtomicAddProperty(req, k->plane_id, k->p_fb, 0);
 			drmModeAtomicAddProperty(req, k->plane_id, k->p_crtc, 0);
 		}

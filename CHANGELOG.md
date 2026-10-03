@@ -48,6 +48,9 @@ Formerly named rpi4-rtsp (renamed before the first release).
 - GitHub Actions upgraded to Node 24 versions: `actions/checkout` v7, `actions/upload-artifact` v7, `actions/download-artifact` v8, `actions/attest-build-provenance` v4.
 - Build-provenance attestation is skipped for private repositories.
 - The README has a rendered demo illustration (`docs/media/demo.gif`).
+- The per-camera diagnostic line ends with a new field, `bufs=N`: the decoder buffers the camera holds (usually 16 while it plays). It must not grow from one reconnect to the next.
+- New log line when packets arrive before the first picture of a connection: `NAME: pacing: first frame after N packet(s) (normal at connect)`.
+- `doctor` lists kernel 6.18.50+rpt-rpi-v8 as tested.
 
 ### Fixed
 
@@ -60,6 +63,11 @@ Formerly named rpi4-rtsp (renamed before the first release).
 - Retries after refused vblank waits back off up to 60 s instead of re-setting the mode every second.
 - Reconnects while the display is off no longer wait 5 s for a plane that cannot detach; abandoned page flips can no longer lose decoder buffers.
 - `rtspwall add` keeps the config file's extended attributes and ACLs.
+- Reconnects no longer leak decoder (CMA) memory. The handles of the decoder buffers were not closed, so rc1 lost about 55 MB of free CMA memory per NVR outage with four 1024x576 cameras. Free CMA memory (`CmaFree` in `/proc/meminfo`) was the same after three outages with the fix.
+- The line `NAME: pacing: N packet(s) without a matching frame (the decoder skipped a corrupt frame)` no longer appears when a connection starts. Packets that arrive before the first picture are not a damaged frame.
+- A camera that reconnected at the exact moment one of its frames was being put on screen could make that display update fail. That frame is now dropped.
+- Moving the wall to another HDMI port now detaches every camera from the old port first.
+- A failed display update now wakes a camera that is waiting to shut down, so it does not wait out its timeout.
 
 ### Security
 
@@ -74,7 +82,7 @@ Formerly named rpi4-rtsp (renamed before the first release).
 
 - H.264 only; no H.265/HEVC.
 - Raspberry Pi 4 only (Pi 400 and CM4 untested). Raspberry Pi 5 is not supported.
-- Tested on hardware: Pi 4 (8 GB), Trixie, UniFi Protect. Bookworm and other camera brands are untested. The UniFi test used the plain rewrite; the new `tls` default is not yet tested on hardware.
+- Tested on hardware: Pi 4 (8 GB), Trixie, UniFi Protect. Bookworm and other camera brands are untested. The earlier 6-camera UniFi test used the plain rewrite. The `tls` default (`rtsps`) was later tested with 4 UniFi Protect cameras on the same Pi (Trixie, kernel 6.18.50+rpt-rpi-v8, build 0.1.0-rc2-dev): all four connected and played. A display at 1920x1080 at 60 Hz on HDMI-A-2 (HDMI1) worked, and `MODE=auto` picked the preferred mode. The dropped-frame, latency, recovery and CPU numbers of that run are in [docs/benchmarks.md](docs/benchmarks.md). No long-run test is documented.
 - `gpu_mem=256` is required for 4 or more concurrent 1080p streams.
 
 ### Upgrade notes

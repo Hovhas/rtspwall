@@ -279,9 +279,22 @@ static void collect_decoded(struct wall *v, struct camera *k)
 				unsigned slot = i % ARRIVAL_QUEUE_SIZE;
 				pts_us = k->arrival_queue[slot].pts_us;
 				arrival_us = k->arrival_queue[slot].arrival_us;
-				if (i > k->arrival_out)
+				unsigned n = i - k->arrival_out;
+				switch (pacing_unmatched_classify(k->first_frame_seen, n)) {
+				case PACING_UNMATCHED_STARTUP:
+					/* Packets ahead of the first IDR, or fed
+					 * before the CAPTURE queue was set up, are
+					 * dropped by the decoder — not corruption. */
+					log_msg("%s: pacing: first frame after %u packet(s) (normal at connect)",
+						k->name, n);
+					break;
+				case PACING_UNMATCHED_SKIPPED:
 					log_msg("%s: pacing: %u packet(s) without a matching frame (the decoder skipped a corrupt frame)",
-						k->name, i - k->arrival_out);
+						k->name, n);
+					break;
+				case PACING_UNMATCHED_NONE:
+					break;
+				}
 				k->arrival_out = i + 1;
 			} else if (k->arrival_out < k->arrival_in) {
 				/* No match — queue out of sync. Queue order is all
@@ -316,6 +329,7 @@ static void collect_decoded(struct wall *v, struct camera *k)
 				pts_us = arrival_us = now;
 			}
 		}
+		k->first_frame_seen = true;
 
 		int64_t target_us;
 		bool have_jitter = false;
@@ -427,24 +441,32 @@ static void requeue_returned(struct camera *k)
 	}
 }
 
-/* Queues a deliberately leaked fb/dmafd (see .leaked in struct camera) for
- * later cleanup. The caller must hold `k->lock` (shared with complete_flip,
- * which drains the list). If the list is (unusually) full this is logged
- * and the entry really leaks — better visible and rare than a write outside
- * the array. */
-static void camera_leak_push(struct camera *k, uint32_t fb, int dmafd)
+/* Queues a deliberately leaked fb/handle/dmafd (see .leaked in struct
+ * camera) for later cleanup. The caller must hold `k->lock` (shared with
+ * complete_flip, which drains the list). If the list is (unusually) full
+ * this is logged and the entry really leaks — better visible and rare than
+ * a write outside the array. */
+static void camera_leak_push(struct camera *k, uint32_t fb, uint32_t handle, int dmafd)
 {
 	if (k->n_leaked >= MAX_LEAKED) {
-		log_msg("%s: CRITICAL: leak list full (%d) - fb %u/dmafd %d leaks permanently",
-			k->name, k->n_leaked, fb, dmafd);
+		log_msg("%s: CRITICAL: leak list full (%d) - fb %u/handle %u/dmafd %d leaks permanently",
+			k->name, k->n_leaked, fb, handle, dmafd);
 		return;
 	}
-	k->leaked[k->n_leaked++] = (struct leaked_buffer){ .fb = fb, .dmafd = dmafd };
+	k->leaked[k->n_leaked++] = (struct leaked_buffer){
+		.fb = fb, .handle = handle, .dmafd = dmafd,
+	};
 }
 
 static void teardown_stream(struct wall *v, struct camera *k)
 {
 	pthread_mutex_lock(&k->lock);
+	/* A frame the compositor popped from the fifo (its step A) but has not
+	 * committed yet (step C) belongs to the buffers torn down below: the
+	 * new generation makes step C drop it instead of committing its fb or
+	 * pushing its index into the next connection's ring (see generation
+	 * in struct camera). */
+	k->generation++;
 	pacing_fifo_init(&k->fifo);       /* contents released without QBUF, the queue is torn down anyway */
 	k->ring_head = k->ring_tail = 0;
 
@@ -463,7 +485,12 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	 * hanging forever. The cap is longer than the compositor's flip
 	 * timeout (FLIP_TIMEOUT_US): an abandoned detach is NOT taken as
 	 * confirmed (see abandon_flip) but made again, and this wait must
-	 * outlast that second attempt. */
+	 * outlast that second attempt. `detached` is broadcast whenever the
+	 * compositor clears what we wait for: a confirmed detach
+	 * (complete_flip), a failed commit that resets in_flight, a connector
+	 * switch (planes_detached). A timeout re-checks the condition before
+	 * giving up — it may have cleared exactly at the deadline, and giving
+	 * up then would leak buffers for nothing. */
 	k->tearing_down = true;
 	/* Display disconnected (TV off, cable out): the detach may never be
 	 * confirmed, and waiting TEARDOWN_WAIT_S would only stretch every
@@ -481,7 +508,7 @@ static void teardown_stream(struct wall *v, struct camera *k)
 		deadline.tv_sec += TEARDOWN_WAIT_S;
 		while ((k->plane_attached || k->in_flight != -1) && !quit) {
 			if (pthread_cond_timedwait(&k->detached, &k->lock, &deadline) == ETIMEDOUT) {
-				gave_up = true;
+				gave_up = k->plane_attached || k->in_flight != -1;
 				break;
 			}
 		}
@@ -499,20 +526,23 @@ static void teardown_stream(struct wall *v, struct camera *k)
 	 * the exact bug class the rest of this function exists to close, just
 	 * in the narrower "compositor stood still for 2 s" case (and since all
 	 * cameras share the same flip gate, the WHOLE wall stalls then, not
-	 * only this camera). k->in_flight and k->plane_attached are NOT
-	 * adjusted based on gave_up — they are reset REGARDLESS a few lines
-	 * down, but that is harmless: the kernel guarantees that a commit
-	 * already submitted delivers its flip event sooner or later, and
-	 * complete_flip then reads in_flight == -1 and becomes a no-op for this
-	 * camera (neither the -2 nor the >= 0 branch matches) — plane_attached
-	 * stays what it was (conservative: if it is still true the plane may
-	 * still show the leaked buffer, and the NEXT teardown cycle for the
-	 * same camera then attempts a new, harmless (possibly redundant)
-	 * detach). The protected indices are leaked DELIBERATELY right here
-	 * (neither RmFB nor close(dmafd) in this function) — rare and visible
-	 * through the log line below, better than a use-after-free against the
-	 * display. The leak is NOT permanent though: fb/dmafd are saved in
-	 * k->leaked (see camera_leak_push) and cleaned up by complete_flip on
+	 * only this camera). k->in_flight is reset REGARDLESS a few lines
+	 * down: the kernel guarantees that a commit already submitted
+	 * delivers its flip event sooner or later, and complete_flip then
+	 * reads in_flight == -1 and becomes a no-op for this camera (neither
+	 * the -2 nor the >= 0 branch matches). plane_attached is therefore
+	 * left true if it was (the plane may still show the leaked buffer;
+	 * the NEXT teardown cycle, a rotation that idles the camera or a
+	 * connector switch then makes a new, harmless (possibly redundant)
+	 * detach) — and SET if a real frame was in flight: once that flip
+	 * lands the plane shows it, but complete_flip, seeing -1, would never
+	 * record that. Left false, nothing would ever detach the plane, and a
+	 * connector switch (display_remodeset) would free the leaked buffer
+	 * while it is still scanned out. The protected indices are leaked
+	 * DELIBERATELY right here (no release_buffer for them in this
+	 * function) — rare and visible through the log line below, better
+	 * than a use-after-free against the display. The leak is NOT
+	 * permanent though: fb/handle/dmafd are saved in k->leaked (see camera_leak_push) and cleaned up by complete_flip on
 	 * the next confirmed flip for the camera, or at program exit — without
 	 * that the fd/GEM handle would be lost for good the next time
 	 * start_capture overwrote the same index. Limbo indices count as "may
@@ -535,10 +565,13 @@ static void teardown_stream(struct wall *v, struct camera *k)
 				continue;
 			keep[c] = true;
 			n_keep++;
-			/* Save fb/dmafd in the leak list BEFORE k->cap[c] can be
-			 * overwritten by the next start_capture. Done here, still
-			 * under `lock` — the list is shared with complete_flip. */
-			camera_leak_push(k, k->cap[c].fb, k->cap[c].dmafd);
+			/* Save fb/handle/dmafd in the leak list BEFORE k->cap[c]
+			 * can be overwritten by the next start_capture. Done here,
+			 * still under `lock` — the list is shared with
+			 * complete_flip. From here on the list owns them:
+			 * close_buffers skips index c (keep[]), and bufs_held is
+			 * unchanged because the handle is still held. */
+			camera_leak_push(k, k->cap[c].fb, k->cap[c].handle, k->cap[c].dmafd);
 		}
 		if (n_keep && skip_wait)
 			log_msg("%s: display disconnected - not waiting for the plane to detach; %d "
@@ -548,6 +581,11 @@ static void teardown_stream(struct wall *v, struct camera *k)
 			log_msg("%s: CRITICAL: teardown gave up (shown=%d in_flight=%d limbo=%d plane_attached=%d) - leaking %d live buffer(s) instead of destroying them",
 				k->name, k->shown, k->in_flight, k->n_limbo, k->plane_attached, n_keep);
 	}
+	/* A real frame still in flight will be on screen once its flip lands
+	 * (see above). Only after the candidates are chosen: a stale "shown"
+	 * of a confirmed-detached plane must not be leaked for nothing. */
+	if (k->in_flight >= 0)
+		k->plane_attached = true;
 	k->shown = -1;
 	k->in_flight = -1;
 	k->n_limbo = 0;   /* the indices die with the buffers below */
@@ -564,15 +602,8 @@ static void teardown_stream(struct wall *v, struct camera *k)
 		xioctl(k->v4l2fd, VIDIOC_STREAMOFF, &t1);
 		xioctl(k->v4l2fd, VIDIOC_STREAMOFF, &t2);
 	}
-	for (int i = 0; i < k->n_cap; i++) {
-		if (i < CAPTURE_BUFFERS && keep[i])
-			continue;
-		if (k->cap[i].fb) {
-			drmModeRmFB(v->drmfd, k->cap[i].fb);
-			k->cap[i].fb = 0;
-		}
-	}
-	close_buffers(k, keep);
+	/* RmFB + close GEM handle + close dmafd for every index not kept. */
+	close_buffers(v->drmfd, k, keep);
 	if (k->v4l2fd >= 0) {
 		close(k->v4l2fd);
 		k->v4l2fd = -1;
@@ -777,6 +808,7 @@ void *camera_thread(void *arg)
 		k->last_pts_us = -1;
 		k->pts_mode = PTS_MODE_UNKNOWN;
 		k->pts_mode_logged = false;
+		k->first_frame_seen = false;
 		pacing_pll_init(&k->pll);
 		k->r_prev_frame_us = -1;
 

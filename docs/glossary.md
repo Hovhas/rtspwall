@@ -2,13 +2,13 @@
 
 Short answers for the technical words in these docs. Pages link here the first time they use a word.
 
-## Codec
-
-The way a video is compressed. The camera compresses, the Pi unpacks. See [H.264 and H.265](#h264-and-h265).
-
 ## CMA
 
 Contiguous Memory Allocator. Memory that Linux sets aside for devices that need one solid block. Not the same as [`gpu_mem`](#gpu_mem), which is set in `config.txt`.
+
+## Codec
+
+The way a video is compressed. The camera compresses, the Pi unpacks. See [H.264 and H.265](#h264-and-h265).
 
 ## DRM master
 
@@ -37,6 +37,10 @@ Hardware Video Scaler. The part of the Pi's display hardware that shrinks and pl
 ## Jitter buffer
 
 A short waiting room for video frames. Network delivery is uneven, so frames wait briefly and are shown at an even pace. The wait is set by `BUFFER_MS`.
+
+## Key frame
+
+A video frame that is a complete picture. The frames after it only store what changed. A decoder cannot show a picture until it has received a key frame, so a new connection can wait a moment for one.
 
 ## Lite and Desktop
 

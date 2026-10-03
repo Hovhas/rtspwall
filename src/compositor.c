@@ -216,10 +216,10 @@ static void complete_flip(struct wall *v, int64_t flip_time_us)
 
 		if (n_leaked_copy > 0) {
 			for (int j = 0; j < n_leaked_copy; j++) {
-				if (leaked_copy[j].fb)
-					drmModeRmFB(v->drmfd, leaked_copy[j].fb);
-				if (leaked_copy[j].dmafd >= 0)
-					close(leaked_copy[j].dmafd);
+				release_buffer(v->drmfd, leaked_copy[j].fb,
+					       leaked_copy[j].handle, leaked_copy[j].dmafd);
+				if (leaked_copy[j].handle)
+					atomic_fetch_sub(&k->bufs_held, 1);
 			}
 			log_msg("%s: cleaned up %d previously leaked buffer(s) after a confirmed flip",
 				k->name, n_leaked_copy);
@@ -306,6 +306,10 @@ static void percentile_str(const struct pacing_histogram *h, int percentile, cha
  *     previous line, leaks_active how many are still waiting right now.
  *     Should normally be 0/0 — visibility should a teardown timeout (the
  *     CRITICAL line in teardown_stream) ever happen.
+ *   - "bufs": imported decoder buffers (GEM handles) currently held for the
+ *     camera, live plus leaked (see bufs_held in struct camera). Should
+ *     equal the decoder's buffer count while streaming and must not grow
+ *     from reconnect to reconnect.
  *   The main line's dropped percentage is the most important receipt of
  *   smooth delivery: it should stay below 1 %. */
 static void report(struct wall *v)
@@ -375,8 +379,11 @@ static void report(struct wall *v)
 		percentile_str(&regulated, 50, rd50s, sizeof rd50s);
 		percentile_str(&regulated, 95, rd95s, sizeof rd95s);
 
-		log_msg("%s: diag regulated ptsdelta p5=%sms p50=%sms p95=%sms synthetic=%lu leaks_closed=%lu leaks_active=%d",
-			k->name, rd5s, rd50s, rd95s, synthetic, leaks_closed, n_leaked_now);
+		/* bufs_held is atomic (several writing threads, see struct
+		 * camera) — read without the lock. */
+		log_msg("%s: diag regulated ptsdelta p5=%sms p50=%sms p95=%sms synthetic=%lu leaks_closed=%lu leaks_active=%d bufs=%d",
+			k->name, rd5s, rd50s, rd95s, synthetic, leaks_closed, n_leaked_now,
+			atomic_load(&k->bufs_held));
 
 		k->m_shown = 0;
 		k->m_skipped = 0;
@@ -564,6 +571,7 @@ void compositor(struct wall *v)
 			bool ripe[PACING_MAX_GROUP_SIZE];
 			bool tearing_arr[PACING_MAX_GROUP_SIZE];
 			struct pacing_frame chosen[PACING_MAX_GROUP_SIZE];
+			unsigned chosen_gen[PACING_MAX_GROUP_SIZE];
 			int n_skipped_arr[PACING_MAX_GROUP_SIZE];
 
 			/* Step A: drain EVERY member's fifo this vblank — idle
@@ -574,7 +582,9 @@ void compositor(struct wall *v)
 			 * BEFORE setting tearing_down) so ripe[] is always false
 			 * for it — no special case needed here. Groups with a
 			 * single (fixed) member go through exactly the same code,
-			 * with grp->count == 1. */
+			 * with grp->count == 1. chosen_gen[m] records which
+			 * connection chosen[m] belongs to, for step C (see
+			 * generation in struct camera). */
 			for (int m = 0; m < grp->count; m++) {
 				struct camera *k = &v->cam[grp->index[m]];
 				struct pacing_frame skipped[PACING_FIFO_MAX];
@@ -582,6 +592,7 @@ void compositor(struct wall *v)
 
 				pthread_mutex_lock(&k->lock);
 				tearing_arr[m] = k->tearing_down;
+				chosen_gen[m] = k->generation;
 				ripe[m] = pacing_fifo_select(&k->fifo, next_vblank_us, &chosen[m],
 							     skipped, &n_skipped);
 				for (int j = 0; j < n_skipped; j++)
@@ -625,15 +636,29 @@ void compositor(struct wall *v)
 			 * configuration (not just FB_ID) — the same code as a
 			 * normal update, which is exactly right: DRM atomic wants
 			 * the whole plane configuration when a plane goes from
-			 * detached to attached. */
+			 * detached to attached.
+			 *
+			 * `lock` was dropped between step A and here, and a
+			 * teardown that does not need to wait (nothing in flight,
+			 * plane not attached) can have run completely in between:
+			 * chosen[m] then refers to a destroyed buffer. A changed
+			 * generation drops the frame — no commit, no ring_push
+			 * (the index means nothing in the next connection), and
+			 * ripe[m] is cleared so the statistics below count
+			 * nothing for it. The fb id is read while `lock` is still
+			 * held, in the same critical section that sets in_flight
+			 * (see generation in struct camera). */
 			for (int m = 0; m < grp->count; m++) {
 				struct camera *k = &v->cam[grp->index[m]];
 				bool emit_attach = false;
 				bool emit_detach = false;
 				bool was_tearing;
+				uint32_t attach_fb = 0;
 
 				pthread_mutex_lock(&k->lock);
 				was_tearing = k->tearing_down;
+				if (ripe[m] && k->generation != chosen_gen[m])
+					ripe[m] = false;
 				if (was_tearing) {
 					if (k->in_flight == -1 && k->plane_attached) {
 						k->in_flight = -2;
@@ -642,6 +667,7 @@ void compositor(struct wall *v)
 				} else if (m == new_active) {
 					if (ripe[m]) {
 						k->in_flight = chosen[m].index;
+						attach_fb = k->cap[chosen[m].index].fb;
 						emit_attach = true;
 					}
 				} else {
@@ -662,7 +688,7 @@ void compositor(struct wall *v)
 					k->in_flight_arrival_us = chosen[m].arrival_us;
 					n_new++;
 
-					drmModeAtomicAddProperty(req, k->plane_id, k->p_fb, k->cap[chosen[m].index].fb);
+					drmModeAtomicAddProperty(req, k->plane_id, k->p_fb, attach_fb);
 					drmModeAtomicAddProperty(req, k->plane_id, k->p_crtc, v->crtc_id);
 					drmModeAtomicAddProperty(req, k->plane_id, k->p_crtc_x, k->x);
 					drmModeAtomicAddProperty(req, k->plane_id, k->p_crtc_y, k->y);
@@ -718,17 +744,23 @@ void compositor(struct wall *v)
 				 * dropped. A failed detach commit (in_flight == -2)
 				 * has no buffer to hand back — only in_flight is
 				 * reset, so compositor() retries the detach next
-				 * round. */
+				 * round. Whenever in_flight changes, `detached` is
+				 * broadcast: a teardown_stream waiting for
+				 * in_flight == -1 (e.g. on the first frame of a
+				 * connection, plane not attached) can then finish at
+				 * once instead of sleeping TEARDOWN_WAIT_S and giving
+				 * up; one still waiting for plane_attached re-checks
+				 * and keeps waiting. */
 				for (int i = 0; i < v->count; i++) {
 					struct camera *k = &v->cam[i];
 					int p;
 					pthread_mutex_lock(&k->lock);
 					p = k->in_flight;
-					if (p >= 0) {
+					if (p >= 0)
 						ring_push(k, p);
+					if (p != -1) {
 						k->in_flight = -1;
-					} else if (p == -2) {
-						k->in_flight = -1;
+						pthread_cond_broadcast(&k->detached);
 					}
 					pthread_mutex_unlock(&k->lock);
 					if (p >= 0) {

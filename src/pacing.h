@@ -590,4 +590,19 @@ void pacing_filepace_reset(struct pacing_filepace *p);
  * is due; <= now_us means "feed it now". */
 int64_t pacing_filepace_due(struct pacing_filepace *p, int64_t pts_us, int64_t now_us);
 
+/* ------------------------------------------------ unmatched packets (pts) */
+
+enum pacing_unmatched {
+	PACING_UNMATCHED_NONE,      /* every fed packet produced a frame */
+	PACING_UNMATCHED_STARTUP,   /* before the first frame: normal at connect */
+	PACING_UNMATCHED_SKIPPED,   /* after the first frame: decoder skipped one */
+};
+
+/* In pts mode, a decoded frame that matches an arrival-queue entry past
+ * the oldest one means n_unmatched packets never produced a frame. Before
+ * the first decoded frame of a connection that is expected (the decoder
+ * drops packets ahead of the first IDR and before its CAPTURE queue is
+ * set up), so it must not be reported as a corrupt frame. */
+enum pacing_unmatched pacing_unmatched_classify(bool first_frame_seen, unsigned n_unmatched);
+
 #endif
