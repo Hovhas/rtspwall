@@ -57,7 +57,7 @@ UniFi Protect shows an encrypted URL, `rtsps://HOST:7441/TOKEN?enableSrtp`. The 
 
 **What `tls` does not give you.** FFmpeg, which rtspwall uses, does not verify the camera's certificate. The encryption protects against someone who only listens to your network (passive eavesdropping). It does **not** protect against someone who sits between the Pi and the camera and pretends to be the camera (active man-in-the-middle). Keep the cameras on a network you trust either way.
 
-The `tls` path has not been tested on hardware by the project yet (see [Compatibility](docs/compatibility.md)).
+The project tested the `tls` path on hardware with 4 UniFi Protect cameras (see [Compatibility](docs/compatibility.md)). The earlier 6-camera test used the plain rewrite.
 
 All other RTSP in a typical setup is also plain. Treat the camera network as a trusted segment.
 
