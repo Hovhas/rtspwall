@@ -461,6 +461,12 @@ static void camera_leak_push(struct camera *k, uint32_t fb, uint32_t handle, int
 static void teardown_stream(struct wall *v, struct camera *k)
 {
 	pthread_mutex_lock(&k->lock);
+	/* A frame the compositor popped from the fifo (its step A) but has not
+	 * committed yet (step C) belongs to the buffers torn down below: the
+	 * new generation makes step C drop it instead of committing its fb or
+	 * pushing its index into the next connection's ring (see generation
+	 * in struct camera). */
+	k->generation++;
 	pacing_fifo_init(&k->fifo);       /* contents released without QBUF, the queue is torn down anyway */
 	k->ring_head = k->ring_tail = 0;
 

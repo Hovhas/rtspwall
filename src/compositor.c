@@ -571,6 +571,7 @@ void compositor(struct wall *v)
 			bool ripe[PACING_MAX_GROUP_SIZE];
 			bool tearing_arr[PACING_MAX_GROUP_SIZE];
 			struct pacing_frame chosen[PACING_MAX_GROUP_SIZE];
+			unsigned chosen_gen[PACING_MAX_GROUP_SIZE];
 			int n_skipped_arr[PACING_MAX_GROUP_SIZE];
 
 			/* Step A: drain EVERY member's fifo this vblank — idle
@@ -581,7 +582,9 @@ void compositor(struct wall *v)
 			 * BEFORE setting tearing_down) so ripe[] is always false
 			 * for it — no special case needed here. Groups with a
 			 * single (fixed) member go through exactly the same code,
-			 * with grp->count == 1. */
+			 * with grp->count == 1. chosen_gen[m] records which
+			 * connection chosen[m] belongs to, for step C (see
+			 * generation in struct camera). */
 			for (int m = 0; m < grp->count; m++) {
 				struct camera *k = &v->cam[grp->index[m]];
 				struct pacing_frame skipped[PACING_FIFO_MAX];
@@ -589,6 +592,7 @@ void compositor(struct wall *v)
 
 				pthread_mutex_lock(&k->lock);
 				tearing_arr[m] = k->tearing_down;
+				chosen_gen[m] = k->generation;
 				ripe[m] = pacing_fifo_select(&k->fifo, next_vblank_us, &chosen[m],
 							     skipped, &n_skipped);
 				for (int j = 0; j < n_skipped; j++)
@@ -632,15 +636,29 @@ void compositor(struct wall *v)
 			 * configuration (not just FB_ID) — the same code as a
 			 * normal update, which is exactly right: DRM atomic wants
 			 * the whole plane configuration when a plane goes from
-			 * detached to attached. */
+			 * detached to attached.
+			 *
+			 * `lock` was dropped between step A and here, and a
+			 * teardown that does not need to wait (nothing in flight,
+			 * plane not attached) can have run completely in between:
+			 * chosen[m] then refers to a destroyed buffer. A changed
+			 * generation drops the frame — no commit, no ring_push
+			 * (the index means nothing in the next connection), and
+			 * ripe[m] is cleared so the statistics below count
+			 * nothing for it. The fb id is read while `lock` is still
+			 * held, in the same critical section that sets in_flight
+			 * (see generation in struct camera). */
 			for (int m = 0; m < grp->count; m++) {
 				struct camera *k = &v->cam[grp->index[m]];
 				bool emit_attach = false;
 				bool emit_detach = false;
 				bool was_tearing;
+				uint32_t attach_fb = 0;
 
 				pthread_mutex_lock(&k->lock);
 				was_tearing = k->tearing_down;
+				if (ripe[m] && k->generation != chosen_gen[m])
+					ripe[m] = false;
 				if (was_tearing) {
 					if (k->in_flight == -1 && k->plane_attached) {
 						k->in_flight = -2;
@@ -649,6 +667,7 @@ void compositor(struct wall *v)
 				} else if (m == new_active) {
 					if (ripe[m]) {
 						k->in_flight = chosen[m].index;
+						attach_fb = k->cap[chosen[m].index].fb;
 						emit_attach = true;
 					}
 				} else {
@@ -669,7 +688,7 @@ void compositor(struct wall *v)
 					k->in_flight_arrival_us = chosen[m].arrival_us;
 					n_new++;
 
-					drmModeAtomicAddProperty(req, k->plane_id, k->p_fb, k->cap[chosen[m].index].fb);
+					drmModeAtomicAddProperty(req, k->plane_id, k->p_fb, attach_fb);
 					drmModeAtomicAddProperty(req, k->plane_id, k->p_crtc, v->crtc_id);
 					drmModeAtomicAddProperty(req, k->plane_id, k->p_crtc_x, k->x);
 					drmModeAtomicAddProperty(req, k->plane_id, k->p_crtc_y, k->y);
