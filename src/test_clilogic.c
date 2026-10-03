@@ -230,11 +230,57 @@ static void test_gpu_need(void)
 	m = 4 * budget_stream_mbps(1920, 1080, 15);
 	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 4), 256);
 	m = 4 * budget_stream_mbps(640, 360, 25);
-	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 4), 0);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0), 0);
 	m = 5 * budget_stream_mbps(640, 360, 25);   /* demo */
-	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 5), 0);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0), 0);
 	m = 6 * budget_stream_mbps(1024, 576, 30);
-	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 6), 256);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0), 256);
+}
+
+/* Seen on a Pi 4 at the default gpu_mem=76: 4 x 1920x1080 (fps not known
+ * to the budget) wedged the codec until a reboot ("Not enough GPU mem"),
+ * while 4 x 1024x576 at 25-30 fps (~46 % budget) works. Four or more
+ * streams of 1080p or larger need 256 MB whatever the frame rate. */
+static void test_gpu_need_large_streams(void)
+{
+	/* fps unknown: the budget is 0, the stream count still decides */
+	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 4), 256);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 5), 256);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 3), 0);
+	/* the working 4 x 1024x576 setup: 2 at 25 fps, 2 at 30 fps */
+	long m = 2 * budget_stream_mbps(1024, 576, 25) + 2 * budget_stream_mbps(1024, 576, 30);
+	ASSERT(budget_percent(m) < 50.0);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0), 0);
+	/* 3 x 1080p at 10 fps is below half the budget and below 4 streams */
+	ASSERT_EQ_I(doctor_gpu_mem_needed(3 * budget_stream_mbps(1920, 1080, 10), 3), 0);
+
+	ASSERT(gpu_mem_large_stream(1920, 1080));
+	ASSERT(gpu_mem_large_stream(1080, 1920));     /* portrait */
+	ASSERT(gpu_mem_large_stream(2560, 1440));
+	ASSERT(gpu_mem_large_stream(3840, 2160));
+	ASSERT(!gpu_mem_large_stream(1280, 720));
+	ASSERT(!gpu_mem_large_stream(1920, 1072));
+	ASSERT(!gpu_mem_large_stream(0, 0));
+	ASSERT(!gpu_mem_large_stream(-1920, -1080));
+}
+
+static void test_gpu_mem_check(void)
+{
+	/* nothing needed: OK whatever is known */
+	ASSERT_EQ_I(gpu_mem_check(0, -1, -1), GPU_CHECK_OK);
+	ASSERT_EQ_I(gpu_mem_check(0, 76, -1), GPU_CHECK_OK);
+	/* vcgencmd missing: unknown, never a refusal */
+	ASSERT_EQ_I(gpu_mem_check(256, -1, -1), GPU_CHECK_UNKNOWN);
+	ASSERT_EQ_I(gpu_mem_check(256, -1, 256), GPU_CHECK_UNKNOWN);
+	ASSERT_EQ_I(gpu_mem_check(256, 0, 76), GPU_CHECK_UNKNOWN);
+	/* enough */
+	ASSERT_EQ_I(gpu_mem_check(256, 256, 256), GPU_CHECK_OK);
+	ASSERT_EQ_I(gpu_mem_check(256, 512, -1), GPU_CHECK_OK);
+	/* too little */
+	ASSERT_EQ_I(gpu_mem_check(256, 76, -1), GPU_CHECK_LOW);
+	ASSERT_EQ_I(gpu_mem_check(256, 76, 128), GPU_CHECK_LOW);
+	/* config.txt already has enough, not active until a reboot */
+	ASSERT_EQ_I(gpu_mem_check(256, 76, 256), GPU_CHECK_LOW_REBOOT);
 }
 
 static void test_dmesg(void)
@@ -751,6 +797,8 @@ int main(void)
 	test_board();
 	test_configtxt();
 	test_gpu_need();
+	test_gpu_need_large_streams();
+	test_gpu_mem_check();
 	test_dmesg();
 	test_perm();
 	test_cfg_scan();

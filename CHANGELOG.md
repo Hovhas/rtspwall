@@ -51,10 +51,12 @@ Formerly named rpi4-rtsp (renamed before the first release).
 - The per-camera diagnostic line ends with a new field, `bufs=N`: the decoder buffers the camera holds (usually 16 while it plays). It must not grow from one reconnect to the next.
 - New log line when packets arrive before the first picture of a connection: `NAME: pacing: first frame after N packet(s) (normal at connect)`.
 - `doctor` lists kernel 6.18.50+rpt-rpi-v8 as tested.
+- `doctor` and `add` say that 4 or more streams of 1080p or larger need `gpu_mem=256`, even when the frame rate is unknown. Before, only a load above half the decoder budget counted.
 
 ### Fixed
 
 - The issue form `bug.yml` was invalid YAML and is corrected.
+- `add` checked the decoder budget but not `gpu_mem`. Four 1080p streams at the default `gpu_mem=76` passed, and the decoder firmware ran out of memory and stayed locked up until a reboot. `add` now refuses when the new config needs more `gpu_mem` than is active (`rtspwall: not added (gpu_mem: ...)`), and tells you to run `sudo rtspwall doctor --fix` and then reboot, or to use the camera's sub-stream. `--force` adds anyway. If `vcgencmd` is missing, it only warns.
 - Without `CONNECTOR`, the wall follows the HDMI cable to the other port after 10 s instead of waiting on a disconnected one, moves back when the original port returns, and never moves to (or starts on) DSI or composite outputs while an HDMI/DVI/DP output exists.
 - `MODE=auto` no longer stays on a reserve mode (e.g. 1024x768) when the TV was in standby at boot; it switches once the real modes appear.
 - DNS failures are reported as `unreachable` with a hint instead of a generic error.
