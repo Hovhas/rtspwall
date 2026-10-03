@@ -716,6 +716,12 @@ int cmd_add(int argc, char **argv)
 		if (gc == GPU_CHECK_LOW_REBOOT)
 			snprintf(pending, sizeof pending, "; config.txt sets %s=%d, active after a "
 				 "reboot", g.info.key, g.configtxt);
+		/* A gpu_mem line under a filter that cannot be evaluated ([HDMI:0],
+		 * [EDID=...]): the value after a reboot is not certain either. */
+		char uncertain[200] = "";
+		if (g.info.uncertain)
+			snprintf(uncertain, sizeof uncertain, " (config.txt also sets gpu_mem under "
+				 "%s; check with: sudo rtspwall doctor)", g.info.filter);
 		bool refuse = (gc == GPU_CHECK_LOW || gc == GPU_CHECK_LOW_REBOOT) &&
 			      (why_need & GPU_NEED_LARGE);
 		if (gc == GPU_CHECK_OK) {
@@ -732,12 +738,13 @@ int cmd_add(int argc, char **argv)
 					"little gpu_mem the decoder firmware can lock up until a "
 					"reboot.\n", g.live, n_large, need, pending);
 			if (gc == GPU_CHECK_LOW_REBOOT)
-				fprintf(stderr, "Fix: sudo reboot, then run add again. Or use the "
-						"camera's sub-stream, or add it anyway with --force\n");
+				fprintf(stderr, "Fix: sudo reboot, then run add again%s. Or use the "
+						"camera's sub-stream, or add it anyway with --force\n",
+					uncertain);
 			else
 				fprintf(stderr, "Fix: sudo rtspwall doctor --fix, then sudo reboot as "
-						"a separate command. Or use the camera's sub-stream, or "
-						"add it anyway with --force\n");
+						"a separate command%s. Or use the camera's sub-stream, or "
+						"add it anyway with --force\n", uncertain);
 			free(next);
 			goto out;
 		} else if (refuse) {
@@ -746,12 +753,13 @@ int cmd_add(int argc, char **argv)
 		} else {
 			fprintf(stderr, "rtspwall: warning: gpu_mem %d MB active; the new config (%d "
 					"camera%s) uses %.0f %% of the decoder and may need %d MB%s. "
-					"Recommended: %s\n", g.live, n_cams, n_cams == 1 ? "" : "s",
+					"Recommended: %s%s\n", g.live, n_cams, n_cams == 1 ? "" : "s",
 				budget_percent(gpu_total), need, pending,
 				gc == GPU_CHECK_LOW_REBOOT
 					? "sudo reboot"
 					: "sudo rtspwall doctor --fix, then sudo reboot as a "
-					  "separate command");
+					  "separate command",
+				uncertain);
 		}
 	}
 
