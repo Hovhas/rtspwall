@@ -905,8 +905,7 @@ void *camera_thread(void *arg)
 			}
 		}
 
-		if (open_decoder(v->cfg.decoder, k, cp->width ? cp->width : 1024,
-				 cp->height ? cp->height : 576) < 0) {
+		if (open_decoder(v->cfg.decoder, k) < 0) {
 			fault = PACING_FAULT_DECODER;
 			snprintf(what, sizeof what, "the hardware decoder %s could not be set up",
 				 v->cfg.decoder);

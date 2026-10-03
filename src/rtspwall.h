@@ -543,7 +543,7 @@ void release_buffer(int drmfd, uint32_t fb, uint32_t handle, int dmafd);
  * (release_buffer on `drmfd`), except the CAPTURE indices marked in
  * keep[CAPTURE_BUFFERS] (may be NULL), which are left alone. */
 void close_buffers(int drmfd, struct camera *k, const bool *keep);
-int open_decoder(const char *device, struct camera *k, unsigned width, unsigned height);
+int open_decoder(const char *device, struct camera *k);
 /* VIDIOC_QUERYCAP + ENUM_FMT on the decoder before any camera starts.
  * Waits up to 15 s for the device node to appear and up to 30 s (in all)
  * for permission to open it (boot races with the driver and udev).
