@@ -74,7 +74,7 @@ Formerly named rpi4-rtsp (renamed before the first release).
 
 - H.264 only; no H.265/HEVC.
 - Raspberry Pi 4 only (Pi 400 and CM4 untested). Raspberry Pi 5 is not supported.
-- Tested on hardware: Pi 4 (8 GB), Trixie, UniFi Protect. Bookworm and other camera brands are untested. The UniFi test used the plain rewrite; the new `tls` default is not yet tested on hardware.
+- Tested on hardware: Pi 4 (8 GB), Trixie, UniFi Protect. Bookworm and other camera brands are untested. The earlier 6-camera UniFi test used the plain rewrite. The `tls` default was later tested with 4 UniFi Protect cameras on the same Pi (Trixie, kernel 6.18.50+rpt-rpi-v8): all four connected and played. A display at 1920x1080 at 60 Hz on HDMI-A-2 (HDMI1) worked, and `MODE=auto` picked the preferred mode. It ran stably for hours; no long soak test was measured.
 - `gpu_mem=256` is required for 4 or more concurrent 1080p streams.
 
 ### Upgrade notes

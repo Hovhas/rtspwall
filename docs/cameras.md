@@ -34,7 +34,7 @@ The setting `UNIFI_REWRITE` in the config changes this:
 
 `auto` is an older name for `tls`. It still works.
 
-Use `plain` only if `tls` does not play on your setup, and only when the Pi and the cameras sit on an isolated, wired camera network (VLAN). See [SECURITY.md](../SECURITY.md#the-unifi-tls-trade-off) for why. The `tls` path has not been tested on hardware by the project yet, so tell us how it goes with the [camera report form](https://github.com/Hovhas/rtspwall/issues/new?template=camera-report.yml).
+Use `plain` only if `tls` does not play on your setup, and only when the Pi and the cameras sit on an isolated, wired camera network (VLAN). See [SECURITY.md](../SECURITY.md#the-unifi-tls-trade-off) for why. The project tested the `tls` path on hardware with 4 UniFi Protect cameras; all four played. The earlier 6-camera test used the plain rewrite. Tell us how it goes on your setup with the [camera report form](https://github.com/Hovhas/rtspwall/issues/new?template=camera-report.yml).
 
 ## Reolink
 
