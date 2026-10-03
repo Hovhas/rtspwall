@@ -749,7 +749,7 @@ int cmd_add(int argc, char **argv)
 			goto out;
 		} else if (refuse) {
 			printf("--force: adding despite too little gpu_mem (%d MB active, %d MB "
-			       "needed)\n", g.live, need);
+			       "needed%s)\n", g.live, need, pending);
 		} else {
 			fprintf(stderr, "rtspwall: warning: gpu_mem %d MB active; the new config (%d "
 					"camera%s) uses %.0f %% of the decoder and may need %d MB%s. "
