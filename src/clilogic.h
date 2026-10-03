@@ -147,9 +147,17 @@ int configtxt_set_gpu_mem(const char *text, int mb, char *out, size_t outlen);
  * 256 MB when the load is above half the decoder budget, or with 4 or more
  * large streams. Evidence (Pi 4, gpu_mem=76): 4 x 1920x1080 wedged the
  * codec until a reboot ("Not enough GPU mem"); 4 x 1024x576 at 25-30 fps
- * (~46 %) works. */
+ * (~46 %) works.
+ *
+ * `why` (may be NULL) gets the rules that fired, GPU_NEED_* flags. The
+ * large-stream rule matches what wedged the codec on hardware; the budget
+ * rule is an unvalidated heuristic, so add only refuses on GPU_NEED_LARGE
+ * (doctor WARNs on both). */
 #define GPU_MEM_LARGE_COUNT 4
-int doctor_gpu_mem_needed(long total_mbps, int n_large);
+#define GPU_NEED_NONE   0u
+#define GPU_NEED_BUDGET 1u      /* above half the decoder budget */
+#define GPU_NEED_LARGE  2u      /* GPU_MEM_LARGE_COUNT+ streams of >= 1080p */
+int doctor_gpu_mem_needed(long total_mbps, int n_large, unsigned *why);
 
 /* True for a stream of at least 1920x1080 pixels (either orientation). */
 bool gpu_mem_large_stream(int width, int height);

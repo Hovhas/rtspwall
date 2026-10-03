@@ -228,13 +228,13 @@ static void test_gpu_need(void)
 {
 	long m;
 	m = 4 * budget_stream_mbps(1920, 1080, 15);
-	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 4), 256);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 4, NULL), 256);
 	m = 4 * budget_stream_mbps(640, 360, 25);
-	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0), 0);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0, NULL), 0);
 	m = 5 * budget_stream_mbps(640, 360, 25);   /* demo */
-	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0), 0);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0, NULL), 0);
 	m = 6 * budget_stream_mbps(1024, 576, 30);
-	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0), 256);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0, NULL), 256);
 }
 
 /* Seen on a Pi 4 at the default gpu_mem=76: 4 x 1920x1080 (fps not known
@@ -244,15 +244,15 @@ static void test_gpu_need(void)
 static void test_gpu_need_large_streams(void)
 {
 	/* fps unknown: the budget is 0, the stream count still decides */
-	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 4), 256);
-	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 5), 256);
-	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 3), 0);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 4, NULL), 256);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 5, NULL), 256);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 3, NULL), 0);
 	/* the working 4 x 1024x576 setup: 2 at 25 fps, 2 at 30 fps */
 	long m = 2 * budget_stream_mbps(1024, 576, 25) + 2 * budget_stream_mbps(1024, 576, 30);
 	ASSERT(budget_percent(m) < 50.0);
-	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0), 0);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(m, 0, NULL), 0);
 	/* 3 x 1080p at 10 fps is below half the budget and below 4 streams */
-	ASSERT_EQ_I(doctor_gpu_mem_needed(3 * budget_stream_mbps(1920, 1080, 10), 3), 0);
+	ASSERT_EQ_I(doctor_gpu_mem_needed(3 * budget_stream_mbps(1920, 1080, 10), 3, NULL), 0);
 
 	ASSERT(gpu_mem_large_stream(1920, 1080));
 	ASSERT(gpu_mem_large_stream(1080, 1920));     /* portrait */
@@ -262,6 +262,35 @@ static void test_gpu_need_large_streams(void)
 	ASSERT(!gpu_mem_large_stream(1920, 1072));
 	ASSERT(!gpu_mem_large_stream(0, 0));
 	ASSERT(!gpu_mem_large_stream(-1920, -1080));
+}
+
+/* Which rule fired: add refuses only on the large-stream rule (seen
+ * wedging the codec), the budget rule is an unvalidated heuristic. */
+static void test_gpu_need_reasons(void)
+{
+	unsigned why = 99;
+	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 0, &why), 0);
+	ASSERT_EQ_I(why, GPU_NEED_NONE);
+	/* 4 x 1080p, fps unknown: large only */
+	why = 99;
+	ASSERT_EQ_I(doctor_gpu_mem_needed(0, 4, &why), 256);
+	ASSERT_EQ_I(why, GPU_NEED_LARGE);
+	/* 4 x 1024x576 at 30 fps = 52.9 %: budget only */
+	why = 99;
+	ASSERT_EQ_I(doctor_gpu_mem_needed(4 * budget_stream_mbps(1024, 576, 30), 0, &why), 256);
+	ASSERT_EQ_I(why, GPU_NEED_BUDGET);
+	/* 6 x 1024x576 at 30 fps (~79 %): budget only */
+	why = 99;
+	ASSERT_EQ_I(doctor_gpu_mem_needed(6 * budget_stream_mbps(1024, 576, 30), 0, &why), 256);
+	ASSERT_EQ_I(why, GPU_NEED_BUDGET);
+	/* 4 x 1080p at 15 fps (93.8 %): both */
+	why = 99;
+	ASSERT_EQ_I(doctor_gpu_mem_needed(4 * budget_stream_mbps(1920, 1080, 15), 4, &why), 256);
+	ASSERT_EQ_I(why, GPU_NEED_BUDGET | GPU_NEED_LARGE);
+	/* exactly 50 % is not above half */
+	why = 99;
+	ASSERT_EQ_I(doctor_gpu_mem_needed(BUDGET_MAX_MBPS / 2, 3, &why), 0);
+	ASSERT_EQ_I(why, GPU_NEED_NONE);
 }
 
 static void test_gpu_mem_check(void)
@@ -798,6 +827,7 @@ int main(void)
 	test_configtxt();
 	test_gpu_need();
 	test_gpu_need_large_streams();
+	test_gpu_need_reasons();
 	test_gpu_mem_check();
 	test_dmesg();
 	test_perm();

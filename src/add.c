@@ -11,8 +11,9 @@
  *      terminal), checks it can live in a config line;
  *   3. probes it (and the cameras already configured, for the total
  *      decoder budget; as root in unprivileged children, see sandbox.h);
- *      a FAIL is refused unless --force, and so is a config that needs
- *      more gpu_mem than is active (vcgencmd; unknown only warns);
+ *      a FAIL is refused unless --force, and so is a config with 4+
+ *      streams of >= 1080p and less gpu_mem active than they need
+ *      (vcgencmd; the > 50 % budget rule and an unknown value only warn);
  *   4. appends "NAME|URL|CELL" — the first free cell unless CELL is given —
  *      by writing a 0600 temp file (mkostemp, O_NOFOLLOW) in the config's
  *      directory, checking it with `rtspwall --check-config`, copying mode
@@ -59,7 +60,7 @@ static void add_usage(FILE *out)
 		"\n"
 		"  --config PATH   config file (default " CLI_DEFAULT_CONFIG ")\n"
 		"  --force         add the camera even if the probe says FAIL or gpu_mem is\n"
-		"                  too low for the cameras\n"
+		"                  too low for 4 or more 1080p streams\n"
 		"  --no-systemd    only edit the file, do not start/restart the service\n");
 }
 
@@ -694,20 +695,29 @@ int cmd_add(int argc, char **argv)
 	if (v == BUDGET_FAIL)
 		printf("--force: adding despite FAIL\n");
 
-	/* ---- gpu_mem for the resulting config: too little makes the decoder
-	 * firmware run out of memory ("Not enough GPU mem"), and the codec can
-	 * stay wedged until a reboot - refuse before the wall starts with it */
+	/* ---- gpu_mem for the resulting config. 4+ streams of >= 1080p at
+	 * too little gpu_mem made the decoder firmware run out of memory ("Not
+	 * enough GPU mem") and the codec stayed wedged until a reboot: refuse
+	 * that before the wall starts with it. The budget rule (> 50 %) is an
+	 * unvalidated heuristic: only warn. */
 	bool new_h264 = pr.err == PROBE_OK && pr.s.codec == PROBE_CODEC_H264;
 	long gpu_total = others + (new_h264 ? budget_stream_mbps(pr.s.width, pr.s.height,
 								  pr.s.fps) : 0);
 	if (new_h264 && gpu_mem_large_stream(pr.s.width, pr.s.height))
 		n_large++;
-	int need = doctor_gpu_mem_needed(gpu_total, n_large);
+	unsigned why_need = GPU_NEED_NONE;
+	int need = doctor_gpu_mem_needed(gpu_total, n_large, &why_need);
 	int n_cams = others_total + 1;
 	if (need) {
 		struct cli_gpu_mem g;
 		cli_gpu_mem_read(&g);
 		enum gpu_check gc = gpu_mem_check(need, g.live, g.configtxt);
+		char pending[160] = "";
+		if (gc == GPU_CHECK_LOW_REBOOT)
+			snprintf(pending, sizeof pending, "; config.txt sets %s=%d, active after a "
+				 "reboot", g.info.key, g.configtxt);
+		bool refuse = (gc == GPU_CHECK_LOW || gc == GPU_CHECK_LOW_REBOOT) &&
+			      (why_need & GPU_NEED_LARGE);
 		if (gc == GPU_CHECK_OK) {
 			printf("gpu_mem:  %d MB active, enough (the new config, %d camera%s, needs "
 			       "%d MB)\n", g.live, n_cams, n_cams == 1 ? "" : "s", need);
@@ -716,15 +726,11 @@ int cmd_add(int argc, char **argv)
 					"get_mem gpu failed); the new config (%d camera%s) needs %d MB. "
 					"Check with: sudo rtspwall doctor\n", n_cams,
 				n_cams == 1 ? "" : "s", need);
-		} else if (!force) {
-			char pending[160] = "";
-			if (gc == GPU_CHECK_LOW_REBOOT)
-				snprintf(pending, sizeof pending, "; config.txt sets %s=%d, active "
-					 "after a reboot", g.info.key, g.configtxt);
+		} else if (refuse && !force) {
 			fprintf(stderr, "\nrtspwall: not added (gpu_mem: %d MB active, the new config "
-					"(%d camera%s) needs %d MB%s). With too little gpu_mem the "
-					"decoder firmware can lock up until a reboot.\n", g.live, n_cams,
-				n_cams == 1 ? "" : "s", need, pending);
+					"has %d streams of 1080p or larger and needs %d MB%s). With too "
+					"little gpu_mem the decoder firmware can lock up until a "
+					"reboot.\n", g.live, n_large, need, pending);
 			if (gc == GPU_CHECK_LOW_REBOOT)
 				fprintf(stderr, "Fix: sudo reboot, then run add again. Or use the "
 						"camera's sub-stream, or add it anyway with --force\n");
@@ -734,9 +740,18 @@ int cmd_add(int argc, char **argv)
 						"add it anyway with --force\n");
 			free(next);
 			goto out;
-		} else {
+		} else if (refuse) {
 			printf("--force: adding despite too little gpu_mem (%d MB active, %d MB "
 			       "needed)\n", g.live, need);
+		} else {
+			fprintf(stderr, "rtspwall: warning: gpu_mem %d MB active; the new config (%d "
+					"camera%s) uses %.0f %% of the decoder and may need %d MB%s. "
+					"Recommended: %s\n", g.live, n_cams, n_cams == 1 ? "" : "s",
+				budget_percent(gpu_total), need, pending,
+				gc == GPU_CHECK_LOW_REBOOT
+					? "sudo reboot"
+					: "sudo rtspwall doctor --fix, then sudo reboot as a "
+					  "separate command");
 		}
 	}
 

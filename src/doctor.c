@@ -284,7 +284,8 @@ static void check_gpu_mem(struct doctor *d)
 			  have);
 		return;
 	}
-	d->gpu_needed = doctor_gpu_mem_needed(total, n_large);
+	unsigned why = GPU_NEED_NONE;
+	d->gpu_needed = doctor_gpu_mem_needed(total, n_large, &why);
 	if (d->gpu_needed && d->gpu_effective < d->gpu_needed && conf_mb >= d->gpu_needed) {
 		add_check(d, L_WARN, "gpu_mem", "sudo reboot",
 			  "%s; %s=%d is set in config.txt but not active until a reboot",
@@ -300,7 +301,7 @@ static void check_gpu_mem(struct doctor *d)
 		add_check(d, L_WARN, "gpu_mem", fix,
 			  "%s; the cameras use %.0f %% of the decoder%s%s and need %d MB%s%s%s", have,
 			  budget_percent(total), measured < d->cfg.count ? " (lower bound)" : "",
-			  n_large >= GPU_MEM_LARGE_COUNT
+			  (why & GPU_NEED_LARGE)
 				  ? " with 4 or more streams of 1080p or larger" : "",
 			  d->gpu_needed, gi->uncertain ? " (config.txt also sets gpu_mem under " : "",
 			  gi->uncertain ? gi->filter : "",

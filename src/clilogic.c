@@ -643,16 +643,21 @@ int configtxt_set_gpu_mem(const char *text, int mb, char *out, size_t outlen)
 
 #define GPU_MEM_NEED_MB     256
 
-int doctor_gpu_mem_needed(long total_mbps, int n_large)
+int doctor_gpu_mem_needed(long total_mbps, int n_large, unsigned *why)
 {
-	/* Above half the decoder budget the firmware-side codec buffers outgrow
-	 * the 76 MB default ('Not enough GPU mem' in dmesg); 256 MB is the
-	 * value used by the reference setups. Four 1080p streams need it even
-	 * when their frame rate is unknown (budget 0): seen wedging the codec
-	 * at 76 MB. */
-	if (budget_percent(total_mbps) > 50.0 || n_large >= GPU_MEM_LARGE_COUNT)
-		return GPU_MEM_NEED_MB;
-	return 0;
+	/* Above half the decoder budget the firmware-side codec buffers may
+	 * outgrow the 76 MB default ('Not enough GPU mem' in dmesg) - a
+	 * heuristic; 256 MB is the value used by the reference setups. Four
+	 * 1080p streams need it even when their frame rate is unknown (budget
+	 * 0): seen wedging the codec at 76 MB. */
+	unsigned w = GPU_NEED_NONE;
+	if (budget_percent(total_mbps) > 50.0)
+		w |= GPU_NEED_BUDGET;
+	if (n_large >= GPU_MEM_LARGE_COUNT)
+		w |= GPU_NEED_LARGE;
+	if (why)
+		*why = w;
+	return w ? GPU_MEM_NEED_MB : 0;
 }
 
 bool gpu_mem_large_stream(int width, int height)
