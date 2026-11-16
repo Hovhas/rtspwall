@@ -27,14 +27,6 @@ Not sure? Run the demo below first. It needs no cameras.
 
 You need a Pi 4 with Raspberry Pi OS Lite 64-bit, a TV and an SSH login. [Getting started](docs/getting-started.md) covers flashing the card.
 
-> **Testing the release candidate?** v0.1.0 is not out yet. Install v0.1.0-rc3 with:
->
-> ```bash
-> curl -fsSL https://github.com/Hovhas/rtspwall/releases/download/v0.1.0-rc3/get.sh | sudo RTSPWALL_VERSION=v0.1.0-rc3 bash
-> ```
->
-> Reports are welcome through the [issue forms](https://github.com/Hovhas/rtspwall/issues/new/choose), especially the camera report.
-
 1. **Install** (about 2 to 4 minutes). It checks your board and OS, verifies the download, installs the package, and never reboots or changes `gpu_mem`:
 
    ```bash
