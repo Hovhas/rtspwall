@@ -4,9 +4,9 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to follow [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-11-16
 
-First public release. Release candidates (`v0.1.0-rc1` and so on) are published from this section.
+First public release. Release candidates `v0.1.0-rc1` to `v0.1.0-rc3` were published from this section.
 
 Formerly named rpi4-rtsp (renamed before the first release).
 
